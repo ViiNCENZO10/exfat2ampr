@@ -1,0 +1,931 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * AMPRPAK4 / AMPRDAT3 / AMPRCRC1 writer: a C port of the essential parts of
+ * drakmor/ampr_emu tools/ampr_pack.py (single group, mixed layout, 64 KiB blocks,
+ * io-page aware placement, LZ4 raw blocks, raw fallback, auto-loose, block
+ * deduplication), with a read-ahead thread and byte-level checkpoints so a
+ * conversion can be paused and resumed. */
+#include "ampr_pack.h"
+#include "activity.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "lz4.h"
+#include "lz4hc.h"
+
+/* Per-file block size (16 KiB .. 1 MiB, from the profile). The batch buffers have a fixed byte
+ * budget; the number of blocks per batch adapts to the block size of the file being packed. */
+#define POOL_BYTES (8u << 20)
+#define MIN_BLOCK (16u << 10)
+#define MAX_SLOTS (POOL_BYTES / MIN_BLOCK)
+#define CKPT_INTERVAL_S 10.0
+#define MAX_VOLS 1024
+
+static char g_pause_reason[160];
+const char *e2a_pack_pause_reason(void) { return g_pause_reason; }
+void e2a_pack_set_pause_reason(const char *why) { snprintf(g_pause_reason, sizeof g_pause_reason, "%s", why ? why : ""); }
+
+/* write/read errors that mean "the drive is full, gone or read-only": pause (resumable), not fail */
+static bool storage_pause(int err) {
+  if (err == ENOSPC) { e2a_pack_set_pause_reason("destination full: free some space, then resume"); return true; }
+  if (err == EIO || err == ENXIO || err == ENODEV || err == ENOENT || err == EROFS || err == EBADF) {
+    e2a_pack_set_pause_reason("storage disconnected or read-only: plug it back in, then resume");
+    return true;
+  }
+  return false;
+}
+
+/* ------------------------------------------------------------ containers -- */
+typedef struct { uint8_t *p; size_t n, cap; } bytebuf;
+static int bb_reserve(bytebuf *b, size_t extra) {
+  if (b->n + extra <= b->cap) return 0;
+  size_t nc = b->cap ? b->cap * 2 : 4096;
+  while (nc < b->n + extra) nc *= 2;
+  uint8_t *np = realloc(b->p, nc);
+  if (!np) return -1;
+  b->p = np; b->cap = nc;
+  return 0;
+}
+static int bb_push(bytebuf *b, const void *d, size_t n) {
+  if (bb_reserve(b, n)) return -1;
+  memcpy(b->p + b->n, d, n); b->n += n;
+  return 0;
+}
+static int32_t strtab_add(bytebuf *b, const char *s) {
+  int32_t off = (int32_t)b->n;
+  if (bb_push(b, s, strlen(s) + 1)) return -1;
+  return off;
+}
+
+typedef struct {
+  int fd;
+  uint32_t id;
+  char name[64];
+  uint64_t pos;         /* next write position */
+  uint64_t file_size;
+  uint32_t flags;
+} volume;
+
+/* deduplication record (persisted in dedup.bin) */
+typedef struct __attribute__((packed)) {
+  uint8_t fp[16];       /* sha256(raw)[0:16] */
+  uint32_t raw_len;
+  uint32_t want_raw;    /* store-only files never share LZ4 blocks */
+  uint64_t location;
+  uint32_t descriptor;
+} dd_rec;
+
+/* ------------------------------------------------------------ checkpoint -- */
+#define CKPT_MAGIC "E2ACKPT3"
+typedef struct __attribute__((packed)) {
+  char magic[8];
+  uint32_t version;
+  uint32_t level;
+  uint64_t entry_count, total_bytes, entries_hash;
+  uint64_t next_entry;          /* entry being processed (or next to process) */
+  uint64_t cur_offset;          /* bytes of that entry already packed */
+  uint32_t cur_first_chunk, cur_nchunks;
+  uint64_t packed_in;
+  uint64_t files_len, chunks_len, crcs_len, strings_len, dedup_len;
+  e2a_pack_stats st;
+  uint32_t nvols, reserved;
+  uint64_t vol_pos[MAX_VOLS];
+  uint32_t vol_flags[MAX_VOLS];
+} e2a_ckpt;
+
+typedef struct {
+  const e2a_pack_opts *o;
+  uint32_t payload_offset;
+  volume vols[MAX_VOLS];
+  uint32_t nvols;
+  volume *cur;
+  bytebuf files, chunks, packs, strings, crcs, dedup;
+  uint64_t packed_in;
+  e2a_pack_stats *st;
+  uint64_t entries_hash;
+  /* dedup hash table: 1-based indices into dedup (dd_rec array), open addressing */
+  uint32_t *dd_tab; size_t dd_cap, dd_count;
+  /* checkpoint bookkeeping */
+  uint64_t ck_files, ck_chunks, ck_crcs, ck_strings, ck_dedup;
+  double last_ckpt;
+  /* compression batch (double buffered input) */
+  int slots, bound;           /* blocks per batch and LZ4 bound for the current file */
+  uint32_t block;             /* block size of the current file */
+  int layout;                 /* E2A_LAYOUT_* of the current file */
+  bool want_fp;               /* fingerprints only when the current file can be deduplicated */
+  uint8_t *raw[2];
+  uint32_t *raw_len[2];
+  int bcount[2], bstate[2];   /* 0 free, 1 full, 2 last batch of the file */
+  int rd_fd, reader_err, reader_abort;
+  uint64_t rd_remaining;
+  pthread_mutex_t mx;
+  pthread_cond_t cv;
+  /* worker outputs for the batch being processed */
+  const uint8_t *cur_raw;
+  const uint32_t *cur_len;
+  uint8_t *comp;
+  int *comp_len;
+  uint32_t *raw_crc;
+  uint8_t *fp;                /* 16 bytes per slot */
+  bool batch_store;           /* skip LZ4 for store-only files */
+} packer;
+
+static uint64_t entries_hash(const e2a_list *l) {
+  uint64_t h = 0xCBF29CE484222325ull;
+  for (size_t i = 0; i < l->n; i++) {
+    const e2a_entry *e = &l->v[i];
+    const uint8_t *k = (const uint8_t *)e->key;
+    for (size_t j = 0; k[j]; j++) { h ^= k[j]; h *= 0x100000001B3ull; }
+    /* geometry is part of the hash: a changed profile cannot resume a half-packed file */
+    uint64_t v = e->size ^ ((uint64_t)e->mtime << 1) ^ ((uint64_t)e->block_shift << 56) ^ ((uint64_t)e->layout << 52) ^
+                 ((uint64_t)e->hot << 50);
+    for (int j = 0; j < 8; j++) { h ^= (v >> (8 * j)) & 0xFF; h *= 0x100000001B3ull; }
+  }
+  return h;
+}
+
+static int append_tail(const char *dir, const char *name, const bytebuf *b, uint64_t from) {
+  if (b->n < from) return -1;
+  char path[700];
+  snprintf(path, sizeof path, "%s/%s", dir, name);
+  int fd = open(path, O_WRONLY | O_CREAT, 0666);
+  if (fd < 0) return -1;
+  int rc = 0;
+  if (ftruncate(fd, (off_t)from) != 0) rc = -1;
+  if (rc == 0 && b->n > from && e2a_pwrite_all(fd, b->p + from, b->n - from, from) != 0) rc = -1;
+  if (rc == 0 && fsync(fd) != 0) rc = -1;
+  close(fd);
+  return rc;
+}
+
+static int load_whole(const char *dir, const char *name, bytebuf *b, uint64_t len) {
+  char path[700];
+  snprintf(path, sizeof path, "%s/%s", dir, name);
+  b->n = 0;
+  if (len == 0) return 0;
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return -1;
+  int rc = 0;
+  size_t got = 0;
+  if (bb_reserve(b, (size_t)len) || e2a_read_full(fd, b->p, (size_t)len, &got) != 0 || got != len) rc = -1;
+  close(fd);
+  b->n = rc == 0 ? (size_t)len : 0;
+  return rc;
+}
+
+/* Persist everything needed to continue from (entry next_entry, byte cur_offset). */
+static int checkpoint(packer *P, uint64_t next_entry, uint64_t cur_offset, uint32_t cur_first_chunk,
+                      uint32_t cur_nchunks, uint64_t entry_count, uint64_t total_bytes) {
+  const char *dir = P->o->state_dir;
+  if (!dir) return 0;
+  if (e2a_mkdir_p(dir) != 0) return -1;
+  for (uint32_t i = 0; i < P->nvols; i++) if (P->vols[i].fd >= 0 && fsync(P->vols[i].fd) != 0) return -1;
+  if (append_tail(dir, "files.bin", &P->files, P->ck_files) || append_tail(dir, "chunks.bin", &P->chunks, P->ck_chunks) ||
+      append_tail(dir, "crcs.bin", &P->crcs, P->ck_crcs) || append_tail(dir, "strings.bin", &P->strings, P->ck_strings) ||
+      append_tail(dir, "dedup.bin", &P->dedup, P->ck_dedup))
+    return -1;
+
+  e2a_ckpt *c = calloc(1, sizeof *c);
+  if (!c) return -1;
+  memcpy(c->magic, CKPT_MAGIC, 8);
+  c->version = 2; c->level = (uint32_t)P->o->level;
+  c->entry_count = entry_count; c->total_bytes = total_bytes; c->entries_hash = P->entries_hash;
+  c->next_entry = next_entry; c->cur_offset = cur_offset;
+  c->cur_first_chunk = cur_first_chunk; c->cur_nchunks = cur_nchunks;
+  c->packed_in = P->packed_in;
+  c->files_len = P->files.n; c->chunks_len = P->chunks.n; c->crcs_len = P->crcs.n;
+  c->strings_len = P->strings.n; c->dedup_len = P->dedup.n;
+  c->st = *P->st;
+  c->nvols = P->nvols;
+  for (uint32_t i = 0; i < P->nvols; i++) { c->vol_pos[i] = P->vols[i].pos; c->vol_flags[i] = P->vols[i].flags; }
+
+  char final[700];
+  snprintf(final, sizeof final, "%s/state.bin", dir);
+  int rc = e2a_write_file_atomic(final, c, sizeof *c);
+  free(c);
+  if (rc == 0) {
+    P->ck_files = P->files.n; P->ck_chunks = P->chunks.n; P->ck_crcs = P->crcs.n;
+    P->ck_strings = P->strings.n; P->ck_dedup = P->dedup.n;
+    P->last_ckpt = e2a_now();
+  } else {
+    e2a_log("checkpoint failed: %s", strerror(errno));
+  }
+  return rc;
+}
+
+static int ckpt_read(const char *dir, e2a_ckpt *c) {
+  char path[700];
+  snprintf(path, sizeof path, "%s/state.bin", dir);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return -1;
+  size_t got = 0;
+  int rc = e2a_read_full(fd, c, sizeof *c, &got) == 0 && got == sizeof *c ? 0 : -1;
+  close(fd);
+  if (rc == 0 && (memcmp(c->magic, CKPT_MAGIC, 8) != 0 || c->version != 2 || c->nvols > MAX_VOLS)) rc = -1;
+  return rc;
+}
+
+bool e2a_pack_has_checkpoint(const char *state_dir) {
+  e2a_ckpt *c = malloc(sizeof *c);
+  if (!c) return false;
+  bool ok = ckpt_read(state_dir, c) == 0;
+  free(c);
+  return ok;
+}
+
+void e2a_pack_clear_checkpoint(const char *dir) {
+  if (!dir) return;
+  static const char *names[] = {"state.bin", "state.bin.e2a-tmp", "files.bin", "chunks.bin", "crcs.bin", "strings.bin", "dedup.bin", NULL};
+  char path[700];
+  for (int i = 0; names[i]; i++) { snprintf(path, sizeof path, "%s/%s", dir, names[i]); unlink(path); }
+}
+
+/* --------------------------------------------------------------- dedup -- */
+static uint64_t dd_hash(const dd_rec *r) {
+  uint64_t h;
+  memcpy(&h, r->fp, 8);
+  return h ^ ((uint64_t)r->raw_len << 32) ^ (uint64_t)r->want_raw;
+}
+
+static int dd_rehash(packer *P, size_t cap) {
+  uint32_t *tab = calloc(cap, sizeof *tab);
+  if (!tab) return -1;
+  const dd_rec *recs = (const dd_rec *)P->dedup.p;
+  size_t n = P->dedup.n / sizeof(dd_rec);
+  for (size_t i = 0; i < n; i++) {
+    size_t pos = (size_t)(dd_hash(&recs[i]) & (cap - 1));
+    while (tab[pos]) pos = (pos + 1) & (cap - 1);
+    tab[pos] = (uint32_t)(i + 1);
+  }
+  free(P->dd_tab);
+  P->dd_tab = tab; P->dd_cap = cap; P->dd_count = n;
+  return 0;
+}
+
+static const dd_rec *dd_find(packer *P, const uint8_t fp[16], uint32_t raw_len, uint32_t want_raw) {
+  if (!P->dd_tab) return NULL;
+  dd_rec key;
+  memcpy(key.fp, fp, 16); key.raw_len = raw_len; key.want_raw = want_raw;
+  const dd_rec *recs = (const dd_rec *)P->dedup.p;
+  size_t pos = (size_t)(dd_hash(&key) & (P->dd_cap - 1));
+  while (P->dd_tab[pos]) {
+    const dd_rec *r = &recs[P->dd_tab[pos] - 1];
+    if (r->raw_len == raw_len && r->want_raw == want_raw && memcmp(r->fp, fp, 16) == 0) return r;
+    pos = (pos + 1) & (P->dd_cap - 1);
+  }
+  return NULL;
+}
+
+static int dd_insert(packer *P, const uint8_t fp[16], uint32_t raw_len, uint32_t want_raw, uint64_t location, uint32_t descriptor) {
+  if (!P->dd_tab && dd_rehash(P, 1 << 16)) return -1;
+  if ((P->dd_count + 1) * 2 > P->dd_cap && dd_rehash(P, P->dd_cap * 2)) return -1;
+  dd_rec r;
+  memcpy(r.fp, fp, 16); r.raw_len = raw_len; r.want_raw = want_raw; r.location = location; r.descriptor = descriptor;
+  if (bb_push(&P->dedup, &r, sizeof r)) return -1;
+  size_t pos = (size_t)(dd_hash(&r) & (P->dd_cap - 1));
+  while (P->dd_tab[pos]) pos = (pos + 1) & (P->dd_cap - 1);
+  P->dd_tab[pos] = (uint32_t)(P->dedup.n / sizeof(dd_rec));
+  P->dd_count++;
+  return 0;
+}
+
+/* ---------------------------------------------------------------- volumes -- */
+static void vol_path(packer *P, const volume *v, char *out, size_t cap) {
+  snprintf(out, cap, "%s/%s.e2a-tmp", P->o->out_dir, v->name);
+}
+
+static int vol_open(packer *P) {
+  if (P->nvols >= MAX_VOLS) return -1;
+  volume *v = &P->vols[P->nvols];
+  memset(v, 0, sizeof *v);
+  v->id = P->nvols;
+  snprintf(v->name, sizeof v->name, "ampr_assets-%03u.pak", v->id);
+  char path[1100];
+  vol_path(P, v, path, sizeof path);
+  v->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (v->fd < 0) { e2a_log("cannot create %s: %s", path, strerror(errno)); return -1; }
+  v->pos = P->payload_offset;
+  v->flags = AMPR_PACK_IO_PAGE_LAYOUT;
+  P->cur = v;
+  P->nvols++;
+  e2a_log("volume %s opened", v->name);
+  return 0;
+}
+
+static int vol_reopen(packer *P, uint32_t id, uint64_t pos, uint32_t flags) {
+  volume *v = &P->vols[id];
+  memset(v, 0, sizeof *v);
+  v->id = id;
+  snprintf(v->name, sizeof v->name, "ampr_assets-%03u.pak", id);
+  char path[1100];
+  vol_path(P, v, path, sizeof path);
+  v->fd = open(path, O_WRONLY);
+  if (v->fd < 0) { e2a_log("cannot reopen %s: %s", path, strerror(errno)); return -1; }
+  if (ftruncate(v->fd, (off_t)pos) != 0) { close(v->fd); v->fd = -1; return -1; }  /* drop bytes written after the checkpoint */
+  v->pos = pos; v->flags = flags;
+  return 0;
+}
+
+static int vol_finish(packer *P, volume *v, const uint8_t build_id[16]) {
+  v->file_size = e2a_align_up(v->pos, E2A_PAGE);
+  if (v->file_size < P->payload_offset + E2A_PAGE) v->file_size = P->payload_offset + E2A_PAGE;
+  if (ftruncate(v->fd, (off_t)v->file_size) != 0) return -1;
+  ampr_dat_header h;
+  memset(&h, 0, sizeof h);
+  memcpy(h.magic, AMPR_MAGIC_DAT, 8);
+  h.version = 3; h.header_size = 64; h.pack_id = v->id; h.flags = v->flags;
+  memcpy(h.build_id, build_id, 16);
+  h.payload_offset = P->payload_offset;
+  h.payload_bytes = v->file_size - P->payload_offset;
+  h.header_crc = e2a_crc32(0, &h, sizeof h);
+  if (e2a_pwrite_all(v->fd, &h, sizeof h, 0) != 0) return -1;
+  if (fsync(v->fd) != 0) return -1;
+  if (close(v->fd) != 0) return -1;
+  v->fd = -1;
+  return 0;
+}
+
+/* --------------------------------------------------------------- threads -- */
+typedef struct { packer *P; int tid; int count; } wjob;
+
+/* compress + fingerprint + crc of the blocks of the current batch */
+static void *worker(void *arg) {
+  wjob *w = arg;
+  packer *P = w->P;
+  int level = P->o->level;
+  for (int i = w->tid; i < w->count; i += P->o->workers) {
+    const char *src = (const char *)P->cur_raw + (size_t)i * P->block;
+    uint32_t len = P->cur_len[i];
+    char *dst = (char *)P->comp + (size_t)i * (size_t)P->bound;
+    if (P->batch_store) P->comp_len[i] = 0;
+    else if (level <= 4) P->comp_len[i] = LZ4_compress_fast(src, dst, (int)len, P->bound, 5 - level);
+    else P->comp_len[i] = LZ4_compress_HC(src, dst, (int)len, P->bound, level);
+    P->raw_crc[i] = e2a_crc32(0, src, len);
+    if (P->want_fp) {
+      e2a_sha256 c;
+      uint8_t d[32];
+      e2a_sha256_init(&c);
+      e2a_sha256_update(&c, src, len);
+      e2a_sha256_final(&c, d);
+      memcpy(P->fp + (size_t)i * 16, d, 16);
+    }
+  }
+  return NULL;
+}
+
+static int compress_batch(packer *P, int count) {
+  int nt = activity_workers(P->o->workers);   /* 2 while a game is running */
+  if (nt > count) nt = count;
+  pthread_t th[64];
+  wjob jobs[64];
+  for (int t = 0; t < nt; t++) {
+    jobs[t].P = P; jobs[t].tid = t; jobs[t].count = count;
+    if (pthread_create(&th[t], NULL, worker, &jobs[t]) != 0) {
+      for (int k = 0; k < t; k++) pthread_join(th[k], NULL);
+      return -1;
+    }
+  }
+  for (int t = 0; t < nt; t++) pthread_join(th[t], NULL);
+  return 0;
+}
+
+/* read-ahead: fills raw[k] while the main thread compresses and writes raw[k^1] */
+static void *reader_fn(void *arg) {
+  packer *P = arg;
+  int k = 0;
+  for (;;) {
+    pthread_mutex_lock(&P->mx);
+    while (P->bstate[k] != 0 && !P->reader_abort) pthread_cond_wait(&P->cv, &P->mx);
+    if (P->reader_abort) { pthread_mutex_unlock(&P->mx); return NULL; }
+    pthread_mutex_unlock(&P->mx);
+
+    int count = 0;
+    while (count < P->slots && P->rd_remaining) {
+      size_t want = P->rd_remaining < P->block ? (size_t)P->rd_remaining : P->block, got = 0;
+      if (e2a_read_full(P->rd_fd, P->raw[k] + (size_t)count * P->block, want, &got) != 0 || got != want) { P->reader_err = 1; break; }
+      P->raw_len[k][count] = (uint32_t)got;
+      P->rd_remaining -= got;
+      count++;
+    }
+    bool last = P->rd_remaining == 0 || P->reader_err;
+    pthread_mutex_lock(&P->mx);
+    P->bcount[k] = count;
+    P->bstate[k] = last ? 2 : 1;
+    pthread_cond_broadcast(&P->cv);
+    pthread_mutex_unlock(&P->mx);
+    if (last) return NULL;
+    k ^= 1;
+  }
+}
+
+/* ------------------------------------------------------------- placement -- */
+/* placement_for() in ampr_pack.py: streaming extents are dense (64 B aligned, extent start
+ * page aligned); random/mixed chunks never straddle an I/O page, large ones start on a page. */
+static uint64_t place(uint64_t pos, uint32_t stored, int layout, bool extent_start) {
+  if (extent_start) pos = e2a_align_up(pos, E2A_PAGE);
+  if (layout == E2A_LAYOUT_STREAMING) return e2a_align_up(pos, E2A_CHUNK_ALIGN);
+  uint64_t off;
+  if (stored >= E2A_PAGE) off = e2a_align_up(pos, E2A_PAGE);
+  else {
+    off = e2a_align_up(pos, E2A_CHUNK_ALIGN);
+    if (off / E2A_PAGE != (off + stored - 1) / E2A_PAGE) off = e2a_align_up(off, E2A_PAGE);
+  }
+  return off;
+}
+
+/* _compress_block(): the stricter "I/O neutral" thresholds apply to random/mixed only */
+static bool lz4_worth_it(uint32_t raw, int comp, int layout) {
+  if (comp <= 0 || (uint32_t)comp >= raw) return false;
+  uint32_t saved = raw - (uint32_t)comp;
+  double ratio = (double)saved / (double)raw;
+  uint32_t need_bytes = 64;
+  double need_ratio = 0.01;
+  uint32_t pages_raw = (raw + E2A_PAGE - 1) / E2A_PAGE, pages_comp = ((uint32_t)comp + E2A_PAGE - 1) / E2A_PAGE;
+  if (layout != E2A_LAYOUT_STREAMING && pages_comp >= pages_raw) { need_bytes = 8192; need_ratio = 0.125; }
+  return saved >= need_bytes && ratio >= need_ratio;
+}
+
+static void set_geometry(packer *P, const e2a_entry *e) {
+  unsigned shift = e->block_shift ? e->block_shift : E2A_BLOCK_SHIFT;
+  if (shift < 14) shift = 14;
+  if (shift > 20) shift = 20;
+  P->block = 1u << shift;
+  P->bound = LZ4_compressBound((int)P->block);
+  int slots = (int)(POOL_BYTES / P->block);
+  int cap = P->o->workers * 16;
+  if (slots > cap) slots = cap;
+  if (slots < 2) slots = 2;
+  P->slots = slots;
+  P->layout = e->layout;
+}
+
+/* Sample the first blocks of a big file: keep it loose when LZ4 barely helps. */
+static int auto_loose_check(packer *P, int fd, uint64_t size, bool *loose) {
+  *loose = false;
+  if (size < E2A_AUTO_LOOSE_MIN) return 0;
+  int count = 0;
+  uint64_t raw_total = 0, comp_total = 0;
+  while (count < P->slots && (uint64_t)count * P->block < (2u << 20)) {   /* sample about 2 MiB */
+    size_t got = 0;
+    if (e2a_read_full(fd, P->raw[0] + (size_t)count * P->block, P->block, &got) != 0) return -1;
+    if (got == 0) break;
+    P->raw_len[0][count] = (uint32_t)got;
+    count++;
+  }
+  if (count == 0) return 0;
+  P->cur_raw = P->raw[0]; P->cur_len = P->raw_len[0]; P->batch_store = false;
+  if (compress_batch(P, count) != 0) return -1;
+  for (int i = 0; i < count; i++) {
+    raw_total += P->raw_len[0][i];
+    comp_total += (P->comp_len[i] > 0 && (uint32_t)P->comp_len[i] < P->raw_len[0][i]) ? (uint64_t)P->comp_len[i] : P->raw_len[0][i];
+  }
+  double saved = raw_total ? 1.0 - (double)comp_total / (double)raw_total : 0.0;
+  if (saved < 0.05) *loose = true;
+  if (lseek(fd, 0, SEEK_SET) < 0) return -1;
+  return 0;
+}
+
+/* ------------------------------------------------------------- pack file -- */
+/* Returns E2A_PACK_OK, 1 (left loose), E2A_PACK_PAUSED (checkpoint saved) or E2A_PACK_ERROR. */
+static int pack_one(packer *P, size_t index, uint64_t entry_count, uint64_t total_bytes, e2a_entry *e,
+                    ampr_file_record *fr, uint64_t start_offset, uint32_t first_chunk0, uint32_t nchunks0) {
+  e2a_pack_stats *st = P->st;
+  const e2a_pack_opts *o = P->o;
+  char path[1100];
+  snprintf(path, sizeof path, "%s/%s", o->src_root, e->rel);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) { e2a_log("cannot open %s: %s", e->rel, strerror(errno)); return E2A_PACK_ERROR; }
+  bool store = e->action == E2A_STORE;
+  set_geometry(P, e);
+  int layout = P->layout;
+  bool dedup = o->dedup && layout != E2A_LAYOUT_STREAMING;   /* dense extents are not shared (ampr_pack.py) */
+  P->want_fp = false;   /* auto-loose sampling does not need fingerprints */
+
+  uint32_t first_chunk, nchunks;
+  uint64_t file_done;
+  if (start_offset == 0) {
+    bool loose = false;
+    /* hot files are never auto-loosed (auto_loose_hot_files = false) */
+    if (!store && !e->hot && auto_loose_check(P, fd, e->size, &loose) != 0) { close(fd); return E2A_PACK_ERROR; }
+    if (loose) {
+      close(fd);
+      e->action = E2A_LOOSE;
+      e2a_log("auto-loose (incompressible): %s", e->rel);
+      return 1;
+    }
+    first_chunk = (uint32_t)(P->chunks.n / sizeof(ampr_chunk_record));
+    nchunks = 0;
+    file_done = 0;
+  } else {
+    first_chunk = first_chunk0; nchunks = nchunks0; file_done = start_offset;
+    if (lseek(fd, (off_t)start_offset, SEEK_SET) < 0) { close(fd); return E2A_PACK_ERROR; }
+    e2a_log("resuming %s at %llu MiB", e->rel, (unsigned long long)(start_offset >> 20));
+  }
+
+  int rc = E2A_PACK_OK;
+  P->want_fp = dedup;
+  /* rd_remaining belongs to the reader once it runs: a small file can be read entirely before
+   * this thread looks at it again, so the loop condition is taken from this local copy */
+  const uint64_t to_read = e->size - file_done;
+  P->rd_fd = fd; P->rd_remaining = to_read; P->reader_err = 0; P->reader_abort = 0;
+  P->bstate[0] = P->bstate[1] = 0; P->bcount[0] = P->bcount[1] = 0;
+  pthread_t reader;
+  bool have_reader = false;
+  if (to_read) {
+    if (pthread_create(&reader, NULL, reader_fn, P) != 0) { close(fd); return E2A_PACK_ERROR; }
+    have_reader = true;
+  }
+
+  int k = 0;
+  bool last = to_read == 0;
+  while (!last) {
+    pthread_mutex_lock(&P->mx);
+    while (P->bstate[k] == 0) pthread_cond_wait(&P->cv, &P->mx);
+    int count = P->bcount[k];
+    last = P->bstate[k] == 2;
+    pthread_mutex_unlock(&P->mx);
+    if (P->reader_err) {
+      e2a_log("read error: %s", e->rel);
+      /* the source drive was removed: stop cleanly, the checkpoint lets the conversion resume */
+      if (!e2a_is_dir(o->src_root)) { e2a_pack_set_pause_reason("source disconnected: plug it back in, then resume"); rc = E2A_PACK_PAUSED; }
+      else rc = E2A_PACK_ERROR;
+      break;
+    }
+
+    if (count > 0) {
+      P->cur_raw = P->raw[k]; P->cur_len = P->raw_len[k]; P->batch_store = store;
+      if (compress_batch(P, count) != 0) { rc = E2A_PACK_ERROR; break; }
+      for (int i = 0; i < count; i++) {
+        uint32_t raw = P->cur_len[i];
+        const uint8_t *fp = P->fp + (size_t)i * 16;
+        const dd_rec *dup = dedup ? dd_find(P, fp, raw, store) : NULL;
+        ampr_chunk_record cr = {0, 0};
+        if (dup) {
+          cr.location = dup->location;
+          cr.descriptor = dup->descriptor | ((uint32_t)AMPR_CHUNK_SHARED << 22);
+          st->chunks_shared++;
+          st->shared_bytes += raw;
+        } else {
+          const uint8_t *data;
+          uint32_t stored, codec;
+          if (!store && lz4_worth_it(raw, P->comp_len[i], layout)) { data = P->comp + (size_t)i * (size_t)P->bound; stored = (uint32_t)P->comp_len[i]; codec = AMPR_CODEC_LZ4; }
+          else { data = P->cur_raw + (size_t)i * P->block; stored = raw; codec = AMPR_CODEC_RAW; }
+          bool extent_start = layout == E2A_LAYOUT_STREAMING && nchunks == 0;
+
+          /* a full volume is left open and finalized with the build id at the end */
+          if (!P->cur || e2a_align_up(P->cur->pos, E2A_PAGE) + stored > o->max_pack_size) {
+            if (vol_open(P) != 0) { rc = E2A_PACK_ERROR; break; }
+            extent_start = layout == E2A_LAYOUT_STREAMING;
+          }
+          volume *v = P->cur;
+          uint64_t off = place(v->pos, stored, layout, extent_start);
+          if (e2a_pwrite_all(v->fd, data, stored, off) != 0) {
+            int err = errno;
+            e2a_log("write failed on %s: %s", v->name, strerror(err));
+            rc = storage_pause(err) ? E2A_PACK_PAUSED : E2A_PACK_ERROR;
+            break;
+          }
+          v->pos = off + stored;
+          uint32_t cflags = layout == E2A_LAYOUT_STREAMING ? AMPR_CHUNK_STREAMING : 0;
+          if (stored <= E2A_PAGE && off / E2A_PAGE == (off + stored - 1) / E2A_PAGE) cflags |= AMPR_CHUNK_PAGE_CONTAINED;
+          if (off % E2A_PAGE == 0) cflags |= AMPR_CHUNK_PAGE_ALIGNED;
+          cr.location = off | ((uint64_t)v->id << 48);
+          cr.descriptor = (stored - 1) | (codec << 20) | (cflags << 22);
+          if (codec == AMPR_CODEC_LZ4) st->chunks_lz4++; else st->chunks_raw++;
+          st->stored_bytes += stored;
+          if (dedup && dd_insert(P, fp, raw, store, cr.location, cr.descriptor) != 0) { rc = E2A_PACK_ERROR; break; }
+        }
+        if (bb_push(&P->chunks, &cr, sizeof cr) || bb_push(&P->crcs, &P->raw_crc[i], 4)) { rc = E2A_PACK_ERROR; break; }
+        nchunks++;
+        st->chunks++;
+        file_done += raw;
+      }
+      if (rc == E2A_PACK_ERROR) break;
+      if (o->progress) o->progress(o->ctx, P->packed_in + file_done, e->rel);
+      {
+        uint64_t batch = 0;
+        for (int i = 0; i < count; i++) batch += P->cur_len[i];
+        activity_throttle(batch);   /* paces the disks while a game is running */
+      }
+      if (o->test_pause_after && o->pause && P->packed_in + file_done >= o->test_pause_after) *o->pause = 1;
+    }
+
+    pthread_mutex_lock(&P->mx);
+    P->bstate[k] = 0;
+    pthread_cond_broadcast(&P->cv);
+    pthread_mutex_unlock(&P->mx);
+    k ^= 1;
+
+    if (rc == E2A_PACK_PAUSED) break;
+    if (o->cancel && *o->cancel) { rc = E2A_PACK_ERROR; break; }
+    if (o->pause && *o->pause) { rc = E2A_PACK_PAUSED; break; }
+    if (e2a_now() - P->last_ckpt > CKPT_INTERVAL_S)
+      checkpoint(P, index, file_done, first_chunk, nchunks, entry_count, total_bytes);  /* best effort */
+  }
+
+  if (have_reader) {
+    pthread_mutex_lock(&P->mx);
+    P->reader_abort = 1;
+    pthread_cond_broadcast(&P->cv);
+    pthread_mutex_unlock(&P->mx);
+    pthread_join(reader, NULL);
+  }
+  close(fd);
+
+  if (rc == E2A_PACK_PAUSED) {
+    if (checkpoint(P, index, file_done, first_chunk, nchunks, entry_count, total_bytes) != 0) return E2A_PACK_ERROR;
+    return E2A_PACK_PAUSED;
+  }
+  if (rc != E2A_PACK_OK) return rc;
+  if (file_done != e->size) {   /* never publish a packed file whose chunks do not cover it */
+    e2a_log("internal: %s packed %llu of %llu bytes (%u chunks, block %u, slots %d, last %d, err %d, state %d/%d)", e->rel,
+            (unsigned long long)file_done, (unsigned long long)e->size, nchunks, P->block, P->slots, (int)last,
+            (int)P->reader_err, P->bstate[0], P->bstate[1]);
+    return E2A_PACK_ERROR;
+  }
+
+  fr->logical_size = e->size;
+  fr->first_chunk = first_chunk;
+  fr->chunk_count = nchunks;
+  fr->flags = AMPR_FILE_PACKED | (store ? AMPR_FILE_STORE_ONLY : 0) |
+              (layout == E2A_LAYOUT_STREAMING ? AMPR_FILE_STREAMING : layout == E2A_LAYOUT_RANDOM ? AMPR_FILE_RANDOM_ACCESS : 0) |
+              (e->hot ? AMPR_FILE_HOT : 0);
+  fr->block_shift = (uint8_t)__builtin_ctz(P->block);
+  fr->packing_class = 0;
+  st->files_packed++;
+  st->logical_bytes += e->size;
+  return E2A_PACK_OK;
+}
+
+/* ------------------------------------------------------------------ main -- */
+static int write_out(const char *dir, const char *name, const void *a, size_t na, const void *b, size_t nb) {
+  char final[1100];
+  snprintf(final, sizeof final, "%s/%s", dir, name);
+  if (nb == 0) return e2a_write_file_atomic(final, a, na);
+  uint8_t *buf = malloc(na + nb);
+  if (!buf) return -1;
+  memcpy(buf, a, na); memcpy(buf + na, b, nb);
+  int rc = e2a_write_file_atomic(final, buf, na + nb);
+  free(buf);
+  return rc;
+}
+
+int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
+  memset(st, 0, sizeof *st);
+  packer *P = calloc(1, sizeof *P);
+  if (!P) return E2A_PACK_ERROR;
+  P->o = o;
+  P->st = st;
+  P->payload_offset = (uint32_t)e2a_align_up(sizeof(ampr_dat_header), E2A_PAGE);
+  /* fixed budget: 2 x 8 MiB input + 8 MiB (+LZ4 bound overhead) output, whatever the block size */
+  for (int k = 0; k < 2; k++) { P->raw[k] = malloc(POOL_BYTES); P->raw_len[k] = calloc(MAX_SLOTS, sizeof(uint32_t)); }
+  P->comp = malloc((size_t)POOL_BYTES + POOL_BYTES / 255 + (size_t)MAX_SLOTS * 16 + 4096);
+  P->comp_len = calloc(MAX_SLOTS, sizeof(int));
+  P->raw_crc = calloc(MAX_SLOTS, sizeof(uint32_t));
+  P->fp = calloc(MAX_SLOTS, 16);
+  P->entries_hash = entries_hash(entries);
+  P->last_ckpt = e2a_now();
+  pthread_mutex_init(&P->mx, NULL);
+  pthread_cond_init(&P->cv, NULL);
+  for (uint32_t i = 0; i < MAX_VOLS; i++) P->vols[i].fd = -1;
+  int rc = E2A_PACK_ERROR;
+  bytebuf payload = {0};
+  if (!P->raw[0] || !P->raw[1] || !P->raw_len[0] || !P->raw_len[1] || !P->comp || !P->comp_len || !P->raw_crc || !P->fp) goto out;
+
+  size_t start = 0;
+  uint64_t cur_offset = 0;
+  uint32_t cur_first_chunk = 0, cur_nchunks = 0;
+  if (o->resume) {
+    e2a_ckpt *c = malloc(sizeof *c);
+    if (!c || ckpt_read(o->state_dir, c) != 0) { e2a_log("no usable checkpoint in %s", o->state_dir ? o->state_dir : "?"); free(c); goto out; }
+    if (c->entry_count != entries->n || c->total_bytes != entries->total_bytes || c->entries_hash != P->entries_hash) {
+      e2a_log("source changed since the checkpoint (files, sizes or dates differ): cannot resume");
+      free(c); goto out;
+    }
+    if (load_whole(o->state_dir, "files.bin", &P->files, c->files_len) || load_whole(o->state_dir, "chunks.bin", &P->chunks, c->chunks_len) ||
+        load_whole(o->state_dir, "crcs.bin", &P->crcs, c->crcs_len) || load_whole(o->state_dir, "strings.bin", &P->strings, c->strings_len) ||
+        load_whole(o->state_dir, "dedup.bin", &P->dedup, c->dedup_len)) {
+      e2a_log("checkpoint buffers unreadable"); free(c); goto out;
+    }
+    if (P->dedup.n) {
+      size_t cap = 1 << 16;
+      while (cap < (P->dedup.n / sizeof(dd_rec)) * 2) cap *= 2;
+      if (dd_rehash(P, cap) != 0) { free(c); goto out; }
+    }
+    P->nvols = c->nvols;  /* before the loop, so the cleanup closes what was reopened on failure */
+    for (uint32_t i = 0; i < c->nvols; i++) {
+      if (vol_reopen(P, i, c->vol_pos[i], c->vol_flags[i]) != 0) { free(c); goto out; }
+    }
+    P->cur = c->nvols ? &P->vols[c->nvols - 1] : NULL;
+    P->packed_in = c->packed_in;
+    *st = c->st;
+    start = (size_t)c->next_entry;
+    cur_offset = c->cur_offset; cur_first_chunk = c->cur_first_chunk; cur_nchunks = c->cur_nchunks;
+    P->ck_files = P->files.n; P->ck_chunks = P->chunks.n; P->ck_crcs = P->crcs.n; P->ck_strings = P->strings.n; P->ck_dedup = P->dedup.n;
+    /* entries already finished are loose or packed according to their saved record */
+    const ampr_file_record *recs = (const ampr_file_record *)P->files.p;
+    for (size_t i = 0; i < start && i < entries->n; i++) {
+      if (!(recs[i].flags & AMPR_FILE_PACKED)) entries->v[i].action = E2A_LOOSE;
+      else entries->v[i].action = (recs[i].flags & AMPR_FILE_STORE_ONLY) ? E2A_STORE : E2A_COMPRESS;
+    }
+    e2a_log("resumed at entry %zu/%zu, %u volumes, %llu MiB already packed", start, entries->n, P->nvols,
+            (unsigned long long)(P->packed_in >> 20));
+    free(c);
+  }
+
+  /* file records, in index order */
+  for (size_t i = start; i < entries->n; i++) {
+    e2a_entry *e = &entries->v[i];
+    ampr_file_record fr;
+    memset(&fr, 0, sizeof fr);
+    char canon[1100];
+    snprintf(canon, sizeof canon, "/app0/%s", e->rel);
+    fr.path_hash = e2a_fnv1a64_fold(canon, strlen(canon));
+    fr.mtime = e->mtime;
+    fr.logical_size = e->size;
+    /* the resume position only applies to the first entry of this run */
+    uint64_t so = cur_offset;
+    uint32_t fc = cur_first_chunk, nc = cur_nchunks;
+    cur_offset = 0; cur_first_chunk = 0; cur_nchunks = 0;
+    if (e->action != E2A_LOOSE) {
+      int r = pack_one(P, i, entries->n, entries->total_bytes, e, &fr, so, fc, nc);
+      if (r == E2A_PACK_PAUSED) { rc = E2A_PACK_PAUSED; goto out; }
+      if (r < 0) goto out;
+      if (r == 1) { fr.flags = 0; fr.chunk_count = 0; fr.first_chunk = 0; fr.block_shift = 0; st->files_loose++; }
+      else P->packed_in += e->size;
+    } else {
+      st->files_loose++;
+    }
+    int32_t off = strtab_add(&P->strings, canon);
+    if (off < 0) goto out;
+    fr.path_offset = (uint32_t)off;
+    fr.path_length = (uint32_t)strlen(canon);
+    if (bb_push(&P->files, &fr, sizeof fr)) goto out;
+    if (o->cancel && *o->cancel) { e2a_log("cancelled"); goto out; }
+    if (o->pause && *o->pause) {
+      if (checkpoint(P, i + 1, 0, 0, 0, entries->n, entries->total_bytes) != 0) goto out;
+      rc = E2A_PACK_PAUSED; goto out;
+    }
+    if (e2a_now() - P->last_ckpt > CKPT_INTERVAL_S) checkpoint(P, i + 1, 0, 0, 0, entries->n, entries->total_bytes);
+  }
+  if (P->nvols == 0 && vol_open(P) != 0) goto out;  /* nothing compressible: still emit a valid empty volume */
+
+  /* pack records (names into the string table) */
+  for (uint32_t i = 0; i < P->nvols; i++) {
+    volume *v = &P->vols[i];
+    v->file_size = e2a_align_up(v->pos, E2A_PAGE);
+    if (v->file_size < P->payload_offset + E2A_PAGE) v->file_size = P->payload_offset + E2A_PAGE;
+    ampr_pack_record pr;
+    memset(&pr, 0, sizeof pr);
+    pr.payload_bytes = v->file_size - P->payload_offset;
+    pr.file_size = v->file_size;
+    int32_t off = strtab_add(&P->strings, v->name);
+    if (off < 0) goto out;
+    pr.name_offset = (uint32_t)off;
+    pr.name_length = (uint32_t)strlen(v->name);
+    pr.flags = v->flags;
+    pr.io_page_size = E2A_PAGE;
+    if (bb_push(&P->packs, &pr, sizeof pr)) goto out;
+  }
+
+  /* build id: sha256("AMPRPACK4\0" + len/bytes of each part), first 16 bytes */
+  uint8_t build_id[16];
+  {
+    e2a_sha256 c;
+    uint8_t digest[32];
+    e2a_sha256_init(&c);
+    e2a_sha256_update(&c, "AMPRPACK4\0", 10);
+    const bytebuf *parts[] = {&P->files, &P->chunks, &P->crcs, &P->packs, &P->strings};
+    for (size_t i = 0; i < 5; i++) {
+      uint64_t len = parts[i]->n;
+      e2a_sha256_update(&c, &len, 8);
+      if (parts[i]->n) e2a_sha256_update(&c, parts[i]->p, parts[i]->n);
+    }
+    e2a_sha256_final(&c, digest);
+    memcpy(build_id, digest, 16);
+  }
+
+  /* finalize volumes */
+  for (uint32_t i = 0; i < P->nvols; i++) {
+    if (vol_finish(P, &P->vols[i], build_id) != 0) { e2a_log("finalize %s failed: %s", P->vols[i].name, strerror(errno)); goto out; }
+  }
+
+  /* manifest */
+  ampr_pak_header h;
+  memset(&h, 0, sizeof h);
+  memcpy(h.magic, AMPR_MAGIC_PAK, 8);
+  h.version = 4; h.header_size = 128; h.flags = 0; h.endian = AMPR_ENDIAN_MARK;
+  memcpy(h.build_id, build_id, 16);
+  h.file_count = P->files.n / sizeof(ampr_file_record);
+  h.chunk_count = P->chunks.n / sizeof(ampr_chunk_record);
+  h.pack_count = P->nvols;
+  h.file_record_size = 48; h.chunk_record_size = 12; h.pack_record_size = 32;
+  h.files_offset = 128;
+  h.chunks_offset = h.files_offset + P->files.n;
+  h.packs_offset = h.chunks_offset + P->chunks.n;
+  h.strings_offset = h.packs_offset + P->packs.n;
+  h.strings_size = P->strings.n;
+  if (bb_push(&payload, P->files.p, P->files.n) || bb_push(&payload, P->chunks.p, P->chunks.n) ||
+      bb_push(&payload, P->packs.p, P->packs.n) || bb_push(&payload, P->strings.p, P->strings.n)) goto out;
+  h.payload_crc = e2a_crc32(0, payload.p, payload.n);
+  h.header_crc = e2a_crc32(0, &h, sizeof h);
+
+  /* crc sidecar */
+  ampr_crc_header ch;
+  memset(&ch, 0, sizeof ch);
+  memcpy(ch.magic, AMPR_MAGIC_CRC, 8);
+  ch.version = 1; ch.header_size = 48;
+  memcpy(ch.build_id, build_id, 16);
+  ch.chunk_count = P->crcs.n / 4;
+  ch.payload_crc = e2a_crc32(0, P->crcs.p, P->crcs.n);
+  ch.header_crc = e2a_crc32(0, &ch, sizeof ch);
+
+  /* runtime settings (same values Lazy_AMPR uses by default) */
+  ampr_cfg_record cfg;
+  memset(&cfg, 0, sizeof cfg);
+  memcpy(cfg.magic, AMPR_MAGIC_CFG, 8);
+  cfg.version = 1; cfg.size = 64;
+  memcpy(cfg.build_id, build_id, 16);
+  /* defaults = Lazy_AMPR / ampr_pack example; overridable by the UI or the profile [runtime] */
+  cfg.decoded_cache_bytes = o->rt_decoded ? o->rt_decoded : 128ull << 20;
+  cfg.physical_cache_bytes = o->rt_physical ? o->rt_physical : 32ull << 20;
+  cfg.workers = o->rt_workers ? o->rt_workers : 4;
+  cfg.latency_reserve_workers = o->rt_workers ? o->rt_reserve : 1;
+  cfg.checksum = e2a_crc32(0, &cfg, sizeof cfg);
+
+  /* publish: volumes, crc, runtime, index last */
+  for (uint32_t i = 0; i < P->nvols; i++) {
+    char tmp[1100], final[1100];
+    snprintf(final, sizeof final, "%s/%s", o->out_dir, P->vols[i].name);
+    vol_path(P, &P->vols[i], tmp, sizeof tmp);
+    if (rename(tmp, final) != 0) { e2a_log("rename %s failed", P->vols[i].name); goto out; }
+  }
+  if (write_out(o->out_dir, "ampr_assets.index.crc", &ch, sizeof ch, P->crcs.p, P->crcs.n) ||
+      write_out(o->out_dir, "ampr_assets.index.runtime", &cfg, sizeof cfg, NULL, 0) ||
+      write_out(o->out_dir, "ampr_assets.index", &h, sizeof h, payload.p, payload.n)) {
+    e2a_log("writing manifest failed: %s", strerror(errno));
+    goto out;
+  }
+  st->packs = P->nvols;
+  e2a_log("pack: %llu files packed, %llu loose, %llu chunks (%llu lz4 / %llu raw / %llu shared), %u volumes",
+          (unsigned long long)st->files_packed, (unsigned long long)st->files_loose, (unsigned long long)st->chunks,
+          (unsigned long long)st->chunks_lz4, (unsigned long long)st->chunks_raw, (unsigned long long)st->chunks_shared, P->nvols);
+  rc = E2A_PACK_OK;
+
+out:
+  free(payload.p);
+  for (uint32_t i = 0; i < P->nvols; i++) {
+    if (P->vols[i].fd >= 0) {
+      if (rc == E2A_PACK_PAUSED) fsync(P->vols[i].fd);
+      close(P->vols[i].fd);
+      if (rc == E2A_PACK_ERROR && o->cancel && *o->cancel) {
+        char tmp[1100];
+        vol_path(P, &P->vols[i], tmp, sizeof tmp);
+        unlink(tmp);
+      }
+    }
+  }
+  pthread_mutex_destroy(&P->mx);
+  pthread_cond_destroy(&P->cv);
+  for (int k = 0; k < 2; k++) { free(P->raw[k]); free(P->raw_len[k]); }
+  free(P->comp); free(P->comp_len); free(P->raw_crc); free(P->fp); free(P->dd_tab);
+  free(P->files.p); free(P->chunks.p); free(P->packs.p); free(P->strings.p); free(P->crcs.p); free(P->dedup.p);
+  free(P);
+  return rc;
+}
+
+/* ---------------------------------------------------------------- loose -- */
+int e2a_copy_loose(const e2a_list *l, const e2a_pack_opts *o) {
+  uint64_t done = 0;
+  for (size_t i = 0; i < l->n; i++) {
+    const e2a_entry *e = &l->v[i];
+    if (e->action != E2A_LOOSE || e->synthetic) continue;
+    if (o->cancel && *o->cancel) return E2A_PACK_ERROR;
+    if (o->pause && *o->pause) return E2A_PACK_PAUSED;
+    char src[1100], dst[1100];
+    snprintf(src, sizeof src, "%s/%s", o->src_root, e->rel);
+    snprintf(dst, sizeof dst, "%s/%s", o->out_dir, e->rel);
+    struct stat st;
+    if (stat(dst, &st) == 0 && S_ISREG(st.st_mode) && (uint64_t)st.st_size == e->size) {
+      done += e->size;  /* already copied by a previous run */
+      continue;
+    }
+    char *slash = strrchr(dst, '/');
+    if (slash) { *slash = 0; if (e2a_mkdir_p(dst) != 0) { e2a_log("mkdir failed: %s", dst); return E2A_PACK_ERROR; } *slash = '/'; }
+    if (e2a_copy_file(src, dst, e->mtime) != 0) {
+      int err = errno;
+      e2a_log("copy failed: %s (%s)", e->rel, strerror(err));
+      if (storage_pause(err)) return E2A_PACK_PAUSED;
+      return E2A_PACK_ERROR;
+    }
+    done += e->size;
+    if (o->progress) o->progress(o->ctx, done, e->rel);
+  }
+  return E2A_PACK_OK;
+}

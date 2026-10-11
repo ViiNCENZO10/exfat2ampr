@@ -1,0 +1,75 @@
+# Public presentation video: the real app recorded on the CI (host build + mock engine, made-up games),
+# an English voice-over (Kokoro-82M, Apache-2.0), subtitles in the app's nine languages (French burned in).
+# Runs when presentation/ changes, or by hand (Actions > presentation > Run workflow).
+name: presentation
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]   # a release: the video goes with it
+    paths:
+      - "presentation/**"
+      - ".github/workflows/presentation.yml"
+
+jobs:
+  video:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attaching the video to a release
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the version number counts the commits
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fonts-dejavu-core fonts-noto-core fonts-noto-cjk curl unzip ffmpeg espeak-ng
+          python -m pip install --quiet pillow soundfile kokoro-onnx
+      - name: Voice model (Kokoro-82M v1.0, Apache-2.0)
+        run: |
+          mkdir -p .deps/kokoro
+          base=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+          curl -fsSL --retry 3 -o .deps/kokoro/kokoro-v1.0.onnx "$base/kokoro-v1.0.onnx" || echo "no Kokoro model: espeak-ng will speak"
+          curl -fsSL --retry 3 -o .deps/kokoro/voices-v1.0.bin "$base/voices-v1.0.bin" || true
+          ls -la .deps/kokoro
+      - name: Fonts and stb_image
+        run: bash app/tools/fetch-deps.sh
+      - name: Build the app for Linux
+        run: |
+          gcc -std=c11 -D_GNU_SOURCE -DE2A_APP_HOST -O2 -Wall -Wextra -Werror -Iapp/src \
+            app/src/*.c app/host/platform_host.c -pthread -lm -o e2a-app-host
+      - name: Record the scenes and assemble the video
+        run: python presentation/make_video.py
+      - name: Check the result
+        run: |
+          ls -la presentation/out presentation/out/subtitles
+          for f in presentation/out/*.mp4; do
+            ffprobe -v error -show_entries format=duration:stream=index,codec_type,codec_name,width,height:stream_tags=language -of compact "$f"
+          done
+          cat presentation/out/LISEZMOI.txt
+      - name: Attach the video to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            presentation/out/exfat2ampr-presentation-sous-titres-fr.mp4
+            presentation/out/exfat2ampr-presentation.mp4
+            presentation/out/subtitles/*.srt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: presentation-video
+          path: presentation/out/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: presentation-work
+          path: |
+            presentation/work/*.png
+            presentation/work/*_voice.wav
+          if-no-files-found: ignore

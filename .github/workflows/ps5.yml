@@ -1,0 +1,522 @@
+name: build and validate
+
+on:
+  push:
+    branches: ["**", "!updates"]   # "updates" holds update.json only
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. Host build + round trip through the reference Python tools (drakmor/ampr_emu):
+  #    pack with a forced pause, resume, then `ampr_pack.py verify` reconstructs every
+  #    packed file and compares it with the source byte for byte.
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout ampr_emu (reference tools)
+        uses: actions/checkout@v4
+        with:
+          repository: drakmor/ampr_emu
+          path: ampr_emu
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential xxd curl python3 python3-pip
+          python3 -m pip install --user -r ampr_emu/tools/requirements-pack.txt || python3 -m pip install --user lz4
+      - name: Fetch third-party sources
+        run: make deps
+      - name: Build host binary
+        run: make host
+      - name: Unit tests (storage detection on simulated mount tables, AMPR compatibility)
+        run: |
+          gcc -std=gnu11 -D_GNU_SOURCE -DE2A_HOST -O1 -Wall -Wextra -Werror -Isrc \
+            src/util.c src/sha256.c src/scan.c src/storage.c src/bench.c tests/unit_test.c -lpthread -lm -o unit_test
+          ./unit_test
+      - name: Generate a synthetic game
+        run: python3 tests/make_game.py testgame
+      - name: Pack (forced pause after 48 MiB)
+        run: |
+          set +e
+          ./exfat2ampr-host --workers 4 --level 6 --pause-after-mb 48 testgame homebrew PPSA00001
+          rc=$?
+          set -e
+          test "$rc" = "3" || (echo "expected a pause (3), got $rc"; exit 1)
+          test -f homebrew/PPSA00001/.e2a-state/state.bin
+      - name: Resume and finish (includes on-console style verification)
+        run: ./exfat2ampr-host --resume homebrew/PPSA00001
+      - name: Validate with the reference tools
+        run: |
+          ls -la homebrew/PPSA00001
+          python3 ampr_emu/tools/ampr_pack.py inspect --index homebrew/PPSA00001/ampr_assets.index
+          python3 ampr_emu/tools/ampr_pack.py verify --index homebrew/PPSA00001/ampr_assets.index --root testgame
+          python3 ampr_emu/tools/ampr_pack.py list --index homebrew/PPSA00001/ampr_assets.index --json > list.json
+          python3 - <<'PY'
+          import json
+          files = json.load(open("list.json"))
+          by = {f["path"].lower(): f for f in files}
+          def chk(path, **want):
+              f = by["/app0/" + path.lower()]
+              bad = {k: (f[k], v) for k, v in want.items() if f[k] != v}
+              print(path, {k: f[k] for k in ("layout", "block_size", "hot", "codecs", "packed")})
+              if bad: raise SystemExit(f"geometry mismatch for {path}: {bad}")
+          chk("data/level0/world_0.dat2", layout="streaming", block_size=1 << 20, hot=False, packed=True)
+          chk("data/level2/world_2.dat2", layout="random", block_size=16 << 10, hot=True, packed=True)
+          chk("data/random_small.dat2", layout="random", block_size=32 << 10, codecs=["raw"], packed=True)
+          chk("Data/Textures/Env_Castle.ktx2", layout="mixed", block_size=256 << 10, packed=True)
+          chk("data/level3/world_3.dat2", layout="mixed", block_size=64 << 10, packed=True)
+          chk("audio/bank.wem", packed=False)
+          chk("eboot.bin", packed=False)
+          rt = open("homebrew/PPSA00001/ampr_assets.index.runtime", "rb").read()
+          import struct
+          dec, phys, workers, reserve = struct.unpack_from("<QQII", rt, 32)
+          print("runtime", dec >> 20, phys >> 20, workers, reserve)
+          assert (dec, phys, workers, reserve) == (96 << 20, 16 << 20, 3, 1), "runtime record does not follow the profile"
+          PY
+          cat homebrew/PPSA00001.exfat2ampr.json
+      - name: Trace profile (synthetic AMPRCMD1 journal, cross-checked with ampr_pack_profile.py)
+        run: |
+          IDX=homebrew/PPSA00001/ampr_emu.index
+          test -f "$IDX"
+          python3 tests/make_trace.py "$IDX" trace.bin
+          python3 ampr_emu/tools/parse_ampr_command_log.py trace.bin "$IDX" --json trace.json --text trace.txt
+          python3 ampr_emu/tools/ampr_pack_profile.py generate --trace trace.bin "$IDX" --output ref.toml
+          ./exfat2ampr-host --trace-profile ours.toml trace.bin "$IDX"
+          cat ours.toml
+          python3 - <<'PY'
+          import json, re, tomllib
+          doc = json.load(open("trace.json"))
+          assert not doc.get("warnings"), f"reference parser warnings: {doc['warnings'][:3]}"
+          def size(v):
+              if isinstance(v, int): return v
+              m = re.fullmatch(r"([0-9.]+)\s*([KMG]?)i?B?", str(v).strip())
+              return int(float(m.group(1)) * {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30}[m.group(2)])
+          def rules(path):
+              out = {}
+              for r in tomllib.load(open(path, "rb")).get("rule", []):
+                  if r.get("action") == "loose": continue   # protection rules: our safety list covers them
+                  for inc in r.get("include", []):
+                      out[inc.lower().removeprefix("/app0/")] = (size(r.get("block_size", "64KiB")), r.get("layout"), bool(r.get("hot", False)))
+              return out
+          ref, ours = rules("ref.toml"), rules("ours.toml")
+          print("reference:", ref)
+          print("ours:     ", ours)
+          for path, want in ref.items():
+              assert ours.get(path) == want, f"{path}: ours {ours.get(path)} != reference {want}"
+          rr = tomllib.load(open("ref.toml", "rb"))["runtime"]
+          ro = tomllib.load(open("ours.toml", "rb"))["runtime"]
+          keys = ("decoded_cache_bytes", "physical_cache_bytes", "workers", "latency_reserve_workers")
+          a = tuple(size(rr[k]) for k in keys); b = tuple(size(ro[k]) for k in keys)
+          print("runtime reference", a, "ours", b)
+          assert a == b, "runtime recommendation differs from the reference"
+          PY
+      - name: Convert again with the trace profile (geometry only, safety list kept)
+        run: |
+          rm -rf testgame2 homebrew2
+          cp -r testgame testgame2
+          cp ours.toml testgame2/exfat2ampr.toml
+          ./exfat2ampr-host --workers 4 --level 6 testgame2 homebrew2 PPSA00001
+          python3 ampr_emu/tools/ampr_pack.py verify --index homebrew2/PPSA00001/ampr_assets.index --root testgame2
+          python3 ampr_emu/tools/ampr_pack.py list --index homebrew2/PPSA00001/ampr_assets.index --json > list2.json
+          python3 - <<'PY'
+          import json, struct
+          by = {f["path"].lower(): f for f in json.load(open("list2.json"))}
+          def chk(path, **want):
+              f = by["/app0/" + path.lower()]
+              bad = {k: (f[k], v) for k, v in want.items() if f[k] != v}
+              print(path, {k: f[k] for k in ("layout", "block_size", "hot", "packed")})
+              if bad: raise SystemExit(f"geometry mismatch for {path}: {bad}")
+          chk("data/level4/world_4.dat2", layout="streaming", block_size=512 << 10, hot=False, packed=True)
+          chk("data/level5/world_5.dat2", layout="random", block_size=16 << 10, hot=True, packed=True)
+          chk("data/level3/world_3.dat2", layout="mixed", block_size=64 << 10, packed=True)
+          chk("audio/bank.wem", packed=False)
+          dec, phys, workers, reserve = struct.unpack_from("<QQII", open("homebrew2/PPSA00001/ampr_assets.index.runtime", "rb").read(), 32)
+          print("runtime", dec >> 20, phys >> 20, workers, reserve)
+          assert (dec, phys, workers, reserve) == (64 << 20, 32 << 20, 2, 1)
+          PY
+      - name: Second run must refuse to overwrite, then overwrite without pause
+        run: |
+          set +e
+          ./exfat2ampr-host --workers 4 --level 3 testgame homebrew PPSA00001
+          rc=$?
+          set -e
+          test "$rc" = "1" || (echo "expected refusal (1), got $rc"; exit 1)
+          ./exfat2ampr-host --workers 4 --level 3 --overwrite --no-dedup testgame homebrew PPSA00001
+          python3 ampr_emu/tools/ampr_pack.py verify --index homebrew/PPSA00001/ampr_assets.index --root testgame
+
+  # 2. PS5 payload
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bash clang-18 lld-18 wget unzip xxd curl zip
+
+      - name: Install ps5-payload-sdk (binary distribution)
+        run: |
+          wget -q https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
+          sudo unzip -q -d /opt ps5-payload-sdk.zip
+          ls /opt/ps5-payload-sdk/toolchain
+
+      - name: Fetch third-party sources (lz4, libSceAmpr.sprx)
+        run: make deps
+
+      - name: Build payload
+        env:
+          PS5_PAYLOAD_SDK: /opt/ps5-payload-sdk
+        run: make clean all
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          tag="$(git describe --abbrev=6 --dirty --always --tags 2>/dev/null || echo "${GITHUB_SHA::7}")"
+          name="exfat2ampr_${tag}.zip"
+          zip -9 "$name" exfat2ampr.elf README.md LICENSE
+          echo "archive_name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive_name }}
+          path: ${{ steps.package.outputs.archive_name }}
+          if-no-files-found: error
+
+      - name: Engine for the app
+        run: |
+          mkdir -p engine
+          cp exfat2ampr.elf engine/
+          make -s version > engine/engine_version.txt
+          cat engine/engine_version.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine
+          path: engine/
+          if-no-files-found: error
+
+  # 3. Home-screen app: the same UI code built for Linux against a fake engine, with screenshots
+  app-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the version number counts the commits
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3-pil fonts-dejavu-core fonts-noto-core fonts-noto-cjk curl unzip ffmpeg
+      - name: Fonts and stb_image
+        run: bash app/tools/fetch-deps.sh
+      - name: Web page script parses (node --check)
+        run: |
+          python3 - <<'PY2'
+          import pathlib, re
+          html = pathlib.Path("web/index.html").read_text(encoding="utf-8")
+          pathlib.Path("page.js").write_text("\n".join(re.findall(r"<script>(.*?)</script>", html, re.S)), encoding="utf-8")
+          PY2
+          node --check page.js
+      - name: Build the app for Linux (warnings are errors)
+        run: |
+          gcc -std=c11 -D_GNU_SOURCE -DE2A_APP_HOST -O2 -Wall -Wextra -Werror -Iapp/src \
+            app/src/*.c app/host/platform_host.c -pthread -lm -o e2a-app-host
+      - name: Screenshots (no USB, one USB, several USB, unplug, game running, pauses, motion)
+        run: |
+          set -euo pipefail
+          mkdir -p assets shots
+          V=$(make -s version)   # the app and its mock engine carry the real version number
+          echo "$V" > assets/engine_version.txt
+          cp .deps/glyphs_cjk.bin assets/
+          # run NAME LANG PORT SCRIPT [MOCK_VAR=value ...]   (port 1 = no engine at all)
+          # "!button" presses without the usual 250 ms pause: shots in the middle of a motion
+          run() {
+            local name=$1 lang=$2 port=$3 script=$4
+            shift 4
+            rm -f /tmp/e2a_app_settings.txt
+            mkdir -p "shots/$name"
+            local mp=""
+            if [ "$port" != 1 ]; then
+              env "$@" python3 app/host/mock_engine.py "$port" "$V" &
+              mp=$!
+              sleep 1
+            fi
+            E2A_LANG=$lang E2A_ENGINE_PORT=$port E2A_ASSETS=assets E2A_SHOTS="shots/$name" E2A_SCRIPT="$script" timeout 240 ./e2a-app-host
+            if [ -n "$mp" ]; then kill "$mp"; fi
+          }
+          MAIN="wait:3000 shot:01_games down wait:1500 shot:02_second square down square down down down down square shot:03_marked
+                cross wait:600 shot:04_options down cross wait:800 shot:05_destinations options wait:500 shot:06_destination_info
+                options down cross wait:700 shot:07_options_usb0 up cross wait:1500 shot:08_check cross wait:1000 shot:09_progress
+                triangle wait:700 shot:10_paused r1 wait:700 shot:11_interrupted r1 wait:700 shot:12_settings
+                down down down down cross wait:900 shot:13_pair circle"
+          run fr 2 18001 "$MAIN" MOCK_STORAGE=several
+          run en 1 18002 "$MAIN" MOCK_STORAGE=several
+          run ru 8 18003 "wait:3000 shot:01_games cross wait:600 down cross wait:800 shot:02_destinations" MOCK_STORAGE=several
+          run usb_none 2 18004 "wait:2600 cross wait:600 down cross wait:800 shot:01_destinations circle up cross wait:1500 shot:02_check" MOCK_STORAGE=none
+          run usb_one 2 18005 "wait:2600 cross wait:600 down cross wait:800 shot:01_destinations" MOCK_STORAGE=one
+          run usb_unplug 2 18006 "wait:2600 cross wait:600 down cross wait:600 down down cross wait:600 shot:01_usb1_chosen
+                                  wait:9000 shot:02_after_unplug cross wait:800 shot:03_destinations_after" MOCK_STORAGE=several MOCK_UNPLUG_AFTER=9
+          run game_running 2 18007 "wait:2800 shot:01_progress_game_mode l1 wait:800 shot:02_games_running cross wait:400 shot:03_blocked" \
+              MOCK_GAME=PPSA01342 MOCK_RUNNING=1
+          run paused_game 2 18008 "wait:2800 shot:01_paused_game" "MOCK_PAUSED_REASON=game launched: its conversion is paused and resumes when the game is closed"
+          run paused_unplug 2 18009 "wait:2800 shot:01_paused_unplugged" "MOCK_PAUSED_REASON=destination storage disconnected: plug it back in, then resume"
+          run boot 2 1 "wait:4000 shot:00_engine_missing"
+          # motion: wallpapers (key art, blurred cover), and frames in the middle of the animations
+          run motion 2 18010 "wait:600 shot:00_splash wait:2600 shot:01_wallpaper_key_art down wait:1800 shot:02_wallpaper_cover
+                              down down wait:1800 shot:03_wallpaper_key_art_2 !down wait:60 shot:04_focus_gliding wait:400
+                              !r1 wait:100 shot:05_tab_sliding wait:700 r1 r1 wait:800 shot:06_settings
+                              down down !cross wait:60 shot:07_toggle_moving wait:500 l1 l1 l1 wait:900 !cross wait:120 shot:08_screen_sliding
+                              wait:800 shot:09_options circle wait:500 down wait:400 !cross wait:120 shot:10_toast_rising" MOCK_STORAGE=several
+          run done 2 18011 "wait:3000 shot:01_running wait:4500 shot:02_finished_check_mark" MOCK_RUNNING=1 MOCK_RATE=25 MOCK_FINISH_AFTER=6
+          # an image while the app is open: ShadowMountPlus refuses to mount it, the conversion waits (explained, never an error)
+          run waiting 2 18012 "wait:3000 down wait:300 cross wait:700 cross wait:1800 shot:01_check_image_note cross wait:1800 shot:02_waiting_smp" \
+              MOCK_STORAGE=several MOCK_SMP_WAIT=600
+          # a failed conversion: explained in the chosen language, and it can be started again or cleared
+          run failed 2 18013 "wait:3000 r1 wait:1000 shot:01_error_explained cross wait:1200 shot:02_retried" MOCK_START_ERROR=pack_failed
+          run failed_clear 2 18014 "wait:3000 r1 wait:1000 square wait:1200 shot:01_cleared" MOCK_START_ERROR=verify_failed
+          run failed_en 1 18015 "wait:3000 r1 wait:1000 shot:01_error_explained_en" MOCK_START_ERROR=smp_unreachable
+          # duplicates: OPTIONS on a copy, delete it (confirmed with its path), the list follows
+          run delete 2 18016 "wait:3000 down down down down down wait:500 shot:01_duplicates options wait:500 shot:02_game_menu
+                               cross wait:700 shot:03_delete_confirm cross wait:500 shot:04_deleting wait:2800 shot:05_deleted"
+          # the other languages (system language ids): Chinese 11 (with game titles in Chinese, Japanese and Korean),
+          # Thai 27, Vietnamese 28, Portuguese 17. Long explanations show the line breaks of each script
+          LANGS="wait:3000 shot:01_games cross wait:700 shot:02_options cross wait:1600 shot:03_check circle wait:500 circle wait:500
+                 r1 wait:1000 shot:04_error_explained r1 r1 wait:900 shot:05_settings"
+          run zh 11 18017 "$LANGS" MOCK_STORAGE=several MOCK_START_ERROR=verify_failed MOCK_CJK=1
+          run th 27 18018 "$LANGS" MOCK_STORAGE=several MOCK_START_ERROR=smp_unreachable
+          run vi 28 18019 "$LANGS" MOCK_STORAGE=several MOCK_START_ERROR=verify_failed
+          run pt 17 18021 "$LANGS" MOCK_STORAGE=several MOCK_START_ERROR=pack_failed
+          # a game with no picture anywhere: the tile drawn from its title; the storage of each game
+          run tile 2 18022 "wait:3000 down down down wait:900 shot:01_generated_cover down wait:900 shot:02_location_usb"
+          # the game menu: optimize a game (trace steps), convert everything
+          run optimize 2 18023 "wait:3000 options wait:600 shot:01_game_menu cross wait:900 shot:02_optimize_steps
+                                 cross wait:900 shot:03_collected circle wait:600 options down cross wait:1200 shot:04_convert_all" \
+              MOCK_TRACE_STATE=trace_mode=1,pending=1
+          # the speed of each storage: measured ones, the fastest recommended; a test run from the list
+          run speed 2 18024 "wait:2600 cross wait:600 down cross wait:900 shot:01_destinations_speed down down square wait:2600 shot:02_tested" \
+              MOCK_STORAGE=several MOCK_SPEED=1
+          # the app's update: told at start, shown in Settings, downloaded, handed to the engine, installed
+          run update 2 18025 "wait:3600 shot:01_toast_new_version r1 r1 r1 wait:800 down down down down down wait:700 shot:02_settings_available
+                              cross wait:700 shot:03_confirm cross wait:5000 shot:04_installed" MOCK_UPDATE=9.999
+          python3 - <<'PY2'
+          import pathlib
+          from PIL import Image
+          shots = sorted(pathlib.Path("shots").rglob("*.ppm"))
+          for p in shots:
+              Image.open(p).save(p.with_suffix(".png"), optimize=True)
+              p.unlink()
+          print("\n".join(sorted(str(p) for p in pathlib.Path("shots").rglob("*.png"))))
+          assert len(shots) >= 96, f"expected every screenshot, got {len(shots)}"
+          PY2
+      - name: Demo video with its sound (what the app looks and sounds like, recorded on the CI)
+        run: |
+          set -euo pipefail
+          rm -f /tmp/e2a_app_settings.txt
+          MOCK_STORAGE=several MOCK_START_PCT=6 MOCK_RATE=7 MOCK_FINISH_AFTER=13 python3 app/host/mock_engine.py 18020 "$(make -s version)" &
+          mp=$!
+          sleep 1
+          DEMO="wait:3400
+                down wait:1500 down wait:1500 down wait:1500 up wait:800 up wait:800 up wait:1500
+                square wait:600 down wait:500 square wait:1000 up wait:900
+                r1 wait:1400 r1 wait:1100 down wait:500 up wait:700 r1 wait:1200
+                down wait:450 down wait:450 cross wait:700 cross wait:900 up wait:450 up wait:450 right wait:900 left wait:1100
+                r1 wait:1600
+                cross wait:1300 up wait:450 up wait:450 cross wait:700 cross wait:700
+                up wait:300 up wait:300 up wait:300 up wait:300 up wait:500 right wait:600 right wait:600 left wait:800
+                up wait:500 cross wait:1400 down wait:600 down wait:700 options wait:1400 options wait:700 cross wait:1300
+                up wait:800 cross wait:2400 cross wait:4200 triangle wait:1600 triangle wait:11500
+                r1 wait:1200 r1 wait:1200 r1 wait:1500"
+          E2A_LANG=2 E2A_ENGINE_PORT=18020 E2A_ASSETS=assets E2A_SHOTS=shots E2A_SCRIPT="$DEMO" \
+            E2A_VIDEO=demo_video.mp4 E2A_AUDIO_WAV=demo.wav timeout 300 ./e2a-app-host
+          kill "$mp"
+          mkdir -p demo
+          ffmpeg -loglevel error -y -i demo_video.mp4 -i demo.wav -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart demo/exfat2ampr-demo.mp4
+          ffprobe -v error -show_entries format=duration:stream=codec_name,width,height -of compact demo/exfat2ampr-demo.mp4
+          python3 - <<'PY2'
+          import struct, wave
+          w = wave.open("demo.wav")
+          frames = w.readframes(w.getnframes())
+          samples = struct.unpack("<%dh" % (len(frames) // 2), frames)
+          loud = sum(1 for s in samples if abs(s) > 600)
+          print(f"audio: {w.getnframes() / 48000:.1f} s, {loud} samples above the silence threshold, peak {max(map(abs, samples))}")
+          assert loud > 48000, "the navigation sounds are missing from the demo"
+          PY2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-screenshots
+          path: shots/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-demo
+          path: demo/
+          if-no-files-found: error
+
+  # 4. Home-screen app for the PS5 (native eboot.bin built with ps5-native-app-boilerplate)
+  app:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl git make ninja-build ccache pkg-config python3 python3-pip python3-venv python3-pil \
+            tar wget unzip zip clang-18 lld-18 fonts-dejavu-core fonts-noto-core fonts-noto-cjk
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine
+          path: engine
+      - name: Fonts and stb_image
+        run: bash app/tools/fetch-deps.sh
+      - name: Build eboot.bin (ps5-native-app-boilerplate, pinned)
+        run: |
+          set -euo pipefail
+          git clone -q https://github.com/blackbearreloaded/ps5-native-app-boilerplate bp
+          git -C bp checkout -q 38c68b4645ab6a1470c7598df1a3fc10d3e0cae0
+          # the template's pinned zlib, fetched first from the GitHub release (zlib.net sometimes answers the CI
+          # with something else); the template checks the same SHA-256 again before building it
+          zlib=bp/.deps/native/zlib/zlib-1.3.2.tar.gz
+          mkdir -p "$(dirname "$zlib")"
+          for url in https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz https://zlib.net/fossils/zlib-1.3.2.tar.gz; do
+            if curl -fsSL --retry 3 -o "$zlib" "$url" &&
+               echo "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16  $zlib" | sha256sum --check --strict; then
+              break
+            fi
+            rm -f "$zlib"
+          done
+          mkdir -p bp/e2a/assets
+          # the app's updates: the manifest this repository publishes with each release (branch "updates")
+          echo "#define E2A_UPDATE_URL \"https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/updates/update.json\"" > app/src/update_config.h
+          cp -r app/src bp/e2a/src
+          cp -r app/sce_sys bp/e2a/sce_sys
+          cp engine/exfat2ampr.elf engine/engine_version.txt .deps/glyphs_cjk.bin bp/e2a/assets/
+          # contentVersion grows with every commit: NN.NNN.NNN, the same number as the version (1.N)
+          n=$(make -s version | cut -d. -f2)
+          ver=$(printf '01.%03d.%03d' $((n / 1000)) $((n % 1000)))
+          python3 - "$ver" <<'PY'
+          import json, sys
+          p = "bp/e2a/sce_sys/param.json"
+          d = json.load(open(p))
+          d["contentVersion"] = sys.argv[1]
+          json.dump(d, open(p, "w"), indent=2)
+          PY
+          echo "app version $ver, engine $(cat engine/engine_version.txt)"
+          cd bp
+          USE_CCACHE=0 APP_SOURCE_DIR=e2a/src APP_PARAM=e2a/sce_sys/param.json APP_SCE_SYS=e2a/sce_sys APP_ASSETS=e2a/assets \
+            bash tools/build.sh Folder
+          ls -la dist dist/PPSA99272
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-folder
+          path: bp/dist/PPSA99272/
+          if-no-files-found: error
+
+  # 5. PPSA99272.ffpkg: UFS2 image made by ShadowMountPlus' own mkufs2.sh on FreeBSD (newfs)
+  ffpkg:
+    needs: app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-folder
+          path: PPSA99272
+      - name: Fetch mkufs2.sh (ShadowMountPlus, pinned)
+        run: |
+          curl -fsSL -o mkufs2.sh https://raw.githubusercontent.com/drakmor/ShadowMountPlus/c2e605581f1185392d88d9ce01573bdf131c2296/mkufs2.sh
+          chmod -R a+rwX PPSA99272
+          ls -la PPSA99272
+      - name: Build the UFS2 image on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          run: |
+            sh mkufs2.sh PPSA99272 PPSA99272.ffpkg
+            ls -la PPSA99272.ffpkg
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          tag="$(git describe --abbrev=6 --always --tags)"
+          name="exfat2ampr-app_${tag}"
+          mkdir "$name"
+          mv PPSA99272.ffpkg "$name/"
+          (cd PPSA99272/.. && zip -qr "$name/PPSA99272-folder.zip" PPSA99272)
+          (cd "$name" && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}/
+          if-no-files-found: error
+
+  # 6. A tag v*: the GitHub release (package, engine, notes) and update.json, which the app reads to offer the
+  #    update (branch "updates", served as is by raw.githubusercontent.com)
+  release:
+    needs: [build, validate, ffpkg]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Release files and the update manifest
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          pkg=$(find dist -name PPSA99272.ffpkg | head -1)
+          elf=$(find dist -name exfat2ampr.elf | head -1)
+          cp "$pkg" "$elf" out/
+          ver=$(make -s version)
+          tag="${GITHUB_REF_NAME}"
+          python3 - "$ver" "$tag" <<'PY'
+          import hashlib, json, os, sys
+          ver, tag = sys.argv[1], sys.argv[2]
+          data = open("out/PPSA99272.ffpkg", "rb").read()
+          repo = os.environ["GITHUB_REPOSITORY"]
+          json.dump({"version": ver, "tag": tag, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                     "package": f"https://github.com/{repo}/releases/download/{tag}/PPSA99272.ffpkg"}, open("out/update.json", "w"), indent=1)
+          PY
+          cat out/update.json
+          (cd out && sha256sum PPSA99272.ffpkg exfat2ampr.elf > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: exFAT2AMPR ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            out/PPSA99272.ffpkg
+            out/exfat2ampr.elf
+            out/SHA256SUMS
+            dist/**/*.zip
+      - name: Publish update.json (branch updates)
+        run: |
+          set -euo pipefail
+          cp out/update.json /tmp/update.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan updates-new
+          git rm -rq --cached . || true
+          cp /tmp/update.json update.json
+          git add update.json
+          git commit -qm "update.json for ${GITHUB_REF_NAME}"
+          git push -f origin HEAD:updates

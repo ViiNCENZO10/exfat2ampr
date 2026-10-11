@@ -1,0 +1,14 @@
+exfat2ampr is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details:
+https://www.gnu.org/licenses/gpl-3.0.html
+
+Third-party components fetched at build time:
+- LZ4 1.10.0 (lz4.c, lz4hc.c) - BSD 2-Clause, Copyright (c) Yann Collet
+- libSceAmpr.sprx - drakmor/ampr_emu, GPL-3.0
+- ps5-payload-sdk - GPL-3.0 (BSD-licensed FreeBSD headers)

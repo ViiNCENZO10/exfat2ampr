@@ -1,0 +1,17 @@
+*.elf
+*.o
+gen/
+third_party/
+dist/
+build/
+exfat2ampr-host
+homebrew/
+testgame/
+e2a-state/
+app/src/font_data.c
+shots/
+.deps/
+presentation/out/
+presentation/work/
+app/src/update_config.h
+__pycache__/
