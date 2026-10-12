@@ -283,7 +283,10 @@ int plat_https_get(const char *url0, int (*sink)(void *ctx, const uint8_t *data,
   if (rc >= 0) rc = ssl = sceSslInit(SSL_POOL);
   if (rc >= 0) rc = http = sceHttpInit(pool, ssl, HTTP_POOL);
   if (rc >= 0) rc = tmpl = sceHttpCreateTemplate(http, "exFAT2AMPR", HTTP_1_1, 0);
-  if (rc >= 0) (void)sceHttpSetAutoRedirect(tmpl, follow ? 1 : 0);   /* optional: the loop below follows by hand */
+  /* the library's own redirect following fails on GitHub's signed download addresses (a 302 to
+   * release-assets.githubusercontent.com with a 900-byte query): it is switched off and the loop below
+   * follows by hand, one plain request per hop */
+  if (rc >= 0) (void)sceHttpSetAutoRedirect(tmpl, 0);
   if (rc >= 0) rc = sceHttpSetResolveTimeOut(tmpl, 8000000u);
   if (rc >= 0) rc = sceHttpSetConnectTimeOut(tmpl, 8000000u);
   if (rc >= 0) rc = sceHttpSetSendTimeOut(tmpl, 8000000u);

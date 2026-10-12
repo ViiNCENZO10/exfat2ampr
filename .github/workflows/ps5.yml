@@ -500,8 +500,17 @@ jobs:
           ver, tag = sys.argv[1], sys.argv[2]
           data = open("out/PPSA99272.ffpkg", "rb").read()
           repo = os.environ["GITHUB_REPOSITORY"]
+          # the package is also published in pieces under 100 MB on the "updates" branch: the console's HTTP
+          # library fails on the redirect of the release download, raw.githubusercontent.com answers directly
+          PART = 90 << 20
+          parts = []
+          for i in range(0, len(data), PART):
+              name = f"PPSA99272.ffpkg.part{len(parts)}"
+              open(f"out/{name}", "wb").write(data[i:i + PART])
+              parts.append(f"https://raw.githubusercontent.com/{repo}/updates/{name}")
           json.dump({"version": ver, "tag": tag, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-                     "package": f"https://github.com/{repo}/releases/download/{tag}/PPSA99272.ffpkg"}, open("out/update.json", "w"), indent=1)
+                     "package": f"https://github.com/{repo}/releases/download/{tag}/PPSA99272.ffpkg",
+                     "parts": parts}, open("out/update.json", "w"), indent=1)
           PY
           cat out/update.json
           (cd out && sha256sum PPSA99272.ffpkg exfat2ampr.elf > SHA256SUMS)
@@ -518,12 +527,13 @@ jobs:
       - name: Publish update.json (branch updates)
         run: |
           set -euo pipefail
-          cp out/update.json /tmp/update.json
+          mkdir -p /tmp/upd
+          cp out/update.json out/PPSA99272.ffpkg.part* /tmp/upd/
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout --orphan updates-new
           git rm -rq --cached . || true
-          cp /tmp/update.json update.json
-          git add update.json
-          git commit -qm "update.json for ${GITHUB_REF_NAME}"
-          git push -f origin HEAD:updates
+          cp /tmp/upd/* .
+          git add update.json PPSA99272.ffpkg.part*
+          git commit -qm "update.json and package pieces for ${GITHUB_REF_NAME}"
+          git push -f origin HEAD:updates   # one orphan commit: the branch only ever holds the latest release

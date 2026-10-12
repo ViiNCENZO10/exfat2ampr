@@ -18,7 +18,9 @@ Made by **V-10** · LZ4 format: **DLPSGAME** · AMPR emulator: drakmor/ampr_emu 
   next conversion (faster loading, fewer stutters).
 - **Speed test** of each storage, the fastest one recommended, slow ones flagged.
 - **Automatic updates**: the app tells you when a new version is out and installs it (the previous package
-  is kept as `.old`).
+  is kept as `.old`). The console's HTTP library does not manage the redirect of a GitHub release download:
+  the app now follows it by hand and, if that still fails, fetches the package in pieces from a plain address
+  (the `updates` branch). Being validated on a console with this version.
 - **Game plugins kept up to date**: drakmor's PlayGo stub (pgo_stub) and DLC modules (dlc_emu) are embedded.
   Every conversion gets what the game needs, every game folder is checked at start-up and from the app (the
   game's menu, or Settings › Game plugins for all of them), older releases are replaced (the old copy stays as
@@ -68,7 +70,9 @@ exFAT2AMPR convertit les dumps de jeux PS5 au format AMPR LZ4, directement sur l
 format LZ4 : **DLPSGAME**. ✅ **Testé et fonctionnel sur PlayStation 5** par l'auteur (firmware 12.xx & 13.xx,
 kstuff, ShadowMountPlus 1.7). Installation : copier `PPSA99272.ffpkg` dans `homebrew/` (clé USB exFAT) ou dans
 `/data/homebrew/` par FTP, en un seul exemplaire, redémarrer, lancer le jailbreak puis l'app. Les mises à jour
-suivantes s'installent depuis l'app (Réglages › Mises à jour). Les plugins pgo_stub (PlayGo) et dlc_emu (DLC)
+suivantes s'installent depuis l'app (Réglages › Mises à jour) : la redirection du téléchargement GitHub est
+maintenant suivie par l'app elle-même, avec en secours le package en morceaux depuis une adresse directe
+(en cours de validation sur console avec cette version). Les plugins pgo_stub (PlayGo) et dlc_emu (DLC)
 de drakmor sont intégrés et maintenus à jour dans le dossier `fakelib` des jeux : à chaque conversion, au
 démarrage, depuis le menu du jeu ou Réglages › Plugins des jeux (nouveau, pas encore validé sur console).
 Conversions plus rapides à packs identiques (sonde LZ4 rapide, CRC plus rapide, vérification sur plusieurs
