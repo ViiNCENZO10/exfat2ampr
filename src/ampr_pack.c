@@ -366,7 +366,16 @@ static void *worker(void *arg) {
     char *dst = (char *)P->comp + (size_t)i * (size_t)P->bound;
     if (P->batch_store) P->comp_len[i] = 0;
     else if (level <= 4) P->comp_len[i] = LZ4_compress_fast(src, dst, (int)len, P->bound, 5 - level);
-    else P->comp_len[i] = LZ4_compress_HC(src, dst, (int)len, P->bound, level);
+    else {
+      /* a fast probe first (~0.1 ms): data LZ4 barely shrinks (textures, audio, archives) never reaches the
+       * I/O-neutral thresholds with the slow HC pass either, so the block is stored as it is. The margin
+       * follows what lz4_worth_it asks later: 1.5 % where a block must save 12.5 % (random/mixed), 0.4 %
+       * where 1 % is enough (streaming), so no block HC would have kept is lost. */
+      int fast = LZ4_compress_default(src, dst, (int)len, P->bound);
+      uint32_t margin = P->layout == E2A_LAYOUT_STREAMING ? (len >> 8) : (len >> 6);
+      if (fast <= 0 || (uint32_t)fast > len - margin) P->comp_len[i] = 0;
+      else P->comp_len[i] = LZ4_compress_HC(src, dst, (int)len, P->bound, level);
+    }
     P->raw_crc[i] = e2a_crc32(0, src, len);
     if (P->want_fp) {
       e2a_sha256 c;
@@ -466,28 +475,32 @@ static void set_geometry(packer *P, const e2a_entry *e) {
   P->layout = e->layout;
 }
 
-/* Sample the first blocks of a big file: keep it loose when LZ4 barely helps. */
+/* Sample blocks spread over a big file: keep it loose when LZ4 barely helps. The first blocks alone would
+ * judge a compressible header and pack gigabytes of incompressible data behind it. */
 static int auto_loose_check(packer *P, int fd, uint64_t size, bool *loose) {
   *loose = false;
   if (size < E2A_AUTO_LOOSE_MIN) return 0;
-  int count = 0;
-  uint64_t raw_total = 0, comp_total = 0;
-  while (count < P->slots && (uint64_t)count * P->block < (2u << 20)) {   /* sample about 2 MiB */
-    size_t got = 0;
-    if (e2a_read_full(fd, P->raw[0] + (size_t)count * P->block, P->block, &got) != 0) return -1;
-    if (got == 0) break;
-    P->raw_len[0][count] = (uint32_t)got;
+  int count = 0, want = P->slots < 32 ? P->slots : 32;
+  uint64_t raw_total = 0, comp_total = 0, step = size / (uint64_t)want;
+  if (step < P->block) step = P->block;
+  step &= ~((uint64_t)P->block - 1);
+  for (uint64_t off = 0; count < want && off + P->block <= size; off += step) {
+    if (e2a_pread_all(fd, P->raw[0] + (size_t)count * P->block, P->block, off) != 0) return -1;
+    P->raw_len[0][count] = P->block;
     count++;
   }
   if (count == 0) return 0;
   P->cur_raw = P->raw[0]; P->cur_len = P->raw_len[0]; P->batch_store = false;
   if (compress_batch(P, count) != 0) return -1;
+  int raw_blocks = 0;
   for (int i = 0; i < count; i++) {
+    bool worth = lz4_worth_it(P->raw_len[0][i], P->comp_len[i], P->layout);
     raw_total += P->raw_len[0][i];
-    comp_total += (P->comp_len[i] > 0 && (uint32_t)P->comp_len[i] < P->raw_len[0][i]) ? (uint64_t)P->comp_len[i] : P->raw_len[0][i];
+    comp_total += worth ? (uint64_t)P->comp_len[i] : P->raw_len[0][i];
+    if (!worth) raw_blocks++;
   }
   double saved = raw_total ? 1.0 - (double)comp_total / (double)raw_total : 0.0;
-  if (saved < 0.05) *loose = true;
+  if (saved < 0.05 || raw_blocks * 10 >= count * 9) *loose = true;   /* little gained, or 90 % of it stays raw */
   if (lseek(fd, 0, SEEK_SET) < 0) return -1;
   return 0;
 }
@@ -858,6 +871,22 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
   cfg.physical_cache_bytes = o->rt_physical ? o->rt_physical : 32ull << 20;
   cfg.workers = o->rt_workers ? o->rt_workers : 4;
   cfg.latency_reserve_workers = o->rt_workers ? o->rt_reserve : 1;
+  /* the emulator's pool is 384 MiB: 32 windows of 2 MiB, 1 MiB per worker and 32 MiB of reserve, then this
+   * manifest, its own index and the two caches; a cache that does not fit is halved until it does (down to
+   * 16 MiB), so on a big game a "large" setting would end up smaller than the standard one: bounded here */
+  {
+    uint64_t pool = 384ull << 20, fixed = (64ull << 20) + ((uint64_t)cfg.workers << 20) + (32ull << 20);
+    uint64_t manifest = sizeof h + payload.n, index = 16ull * (uint64_t)h.chunk_count + 64ull * (uint64_t)h.file_count;
+    uint64_t used = fixed + manifest + index + cfg.physical_cache_bytes + (16ull << 20);
+    uint64_t room = pool > used ? (pool - used) & ~((1ull << 20) - 1) : 0;
+    if (room < (16ull << 20)) room = 16ull << 20;
+    if (cfg.decoded_cache_bytes > room) {
+      e2a_log("runtime: decoded cache %llu MiB -> %llu MiB (the emulator's pool: manifest %llu MiB, index %llu MiB, physical cache %llu MiB)",
+              (unsigned long long)(cfg.decoded_cache_bytes >> 20), (unsigned long long)(room >> 20), (unsigned long long)(manifest >> 20),
+              (unsigned long long)(index >> 20), (unsigned long long)(cfg.physical_cache_bytes >> 20));
+      cfg.decoded_cache_bytes = room;
+    }
+  }
   cfg.checksum = e2a_crc32(0, &cfg, sizeof cfg);
 
   /* publish: volumes, crc, runtime, index last */

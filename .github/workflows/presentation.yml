@@ -1,10 +1,17 @@
 # Public presentation video: the real app recorded on the CI (host build + mock engine, made-up games),
-# an English voice-over (Kokoro-82M, Apache-2.0), subtitles in the app's nine languages (French burned in).
+# an English voice-over (Kokoro-82M, Apache-2.0), French subtitles drawn in. One video per release.
 # Runs when presentation/ changes, or by hand (Actions > presentation > Run workflow).
 name: presentation
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Attach the video to this existing release (for example v1.45); empty: no release"
+        default: ""
+      version:
+        description: "Version shown on the title card (empty: this commit's)"
+        default: ""
   push:
     tags: ["v*"]   # a release: the video goes with it
     paths:
@@ -44,26 +51,26 @@ jobs:
             app/src/*.c app/host/platform_host.c -pthread -lm -o e2a-app-host
       - name: Record the scenes and assemble the video
         run: python presentation/make_video.py
+        env:
+          E2A_VIDEO_VERSION: ${{ inputs.version }}
       - name: Check the result
         run: |
-          ls -la presentation/out presentation/out/subtitles
-          for f in presentation/out/*.mp4; do
-            ffprobe -v error -show_entries format=duration:stream=index,codec_type,codec_name,width,height:stream_tags=language -of compact "$f"
-          done
-          cat presentation/out/LISEZMOI.txt
+          ls -la presentation/out
+          test "$(ls presentation/out | wc -l)" -eq 1   # the one video
+          ffprobe -v error -show_entries format=duration:stream=index,codec_type,codec_name,width,height:stream_tags=language -of compact presentation/out/exfat2ampr-presentation.mp4
+      - name: Check the release tag
+        if: inputs.tag != ''
+        run: git tag -l | grep -qx "${{ inputs.tag }}"   # an existing release only: a typo would create one
       - name: Attach the video to the release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            presentation/out/exfat2ampr-presentation-sous-titres-fr.mp4
-            presentation/out/exfat2ampr-presentation.mp4
-            presentation/out/subtitles/*.srt
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: presentation/out/exfat2ampr-presentation.mp4
       - uses: actions/upload-artifact@v4
         with:
           name: presentation-video
-          path: presentation/out/
+          path: presentation/out/exfat2ampr-presentation.mp4
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()

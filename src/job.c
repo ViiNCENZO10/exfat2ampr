@@ -10,6 +10,7 @@
 #include "verify.h"
 #include "storage.h"
 #include "activity.h"
+#include "plugins.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -396,6 +397,29 @@ static void run_job(job_request req) {
       }
     }
     if (!found) e2a_list_add(&entries, "fakelib/libSceAmpr.sprx", (uint64_t)sst.st_size, (int64_t)sst.st_mtime, true);
+  }
+  /* the game plugins (PlayGo stub, DLC modules): what this game needs, at their current release, written to the
+   * destination's fakelib and listed with their real size like the runtime (the copy of loose files skips them) */
+  {
+    char rep[400];
+    unsigned written = 0;
+    set_phase("fakelib", 0, "installing the game plugins");
+    if (plugins_apply_to(src, dest, &written, rep, sizeof rep) < 0) e2a_log("plugins of %s: %s", dest, rep);
+    for (int k = 0; k < PLUGINS_N; k++) {
+      if (!(written & (1u << k))) continue;
+      char rel[80], full[800];
+      struct stat pst;
+      snprintf(rel, sizeof rel, "fakelib/%s", plugins_name(k));
+      snprintf(full, sizeof full, "%s/%s", dest, rel);
+      if (stat(full, &pst) != 0) continue;
+      bool had = false;
+      for (size_t i = 0; i < entries.n; i++)
+        if (strcasecmp(entries.v[i].rel, rel) == 0) {
+          had = true; entries.v[i].synthetic = true; entries.v[i].action = E2A_LOOSE;
+          entries.v[i].size = (uint64_t)pst.st_size; entries.v[i].mtime = (int64_t)pst.st_mtime;
+        }
+      if (!had) e2a_list_add(&entries, rel, (uint64_t)pst.st_size, (int64_t)pst.st_mtime, true);
+    }
   }
   e2a_list_sort(&entries);
 
@@ -980,9 +1004,11 @@ static void emit_folder(scan_ctx *c, const char *path, const e2a_game *g) {
   e2a_json_escape(g->title, t, sizeof t);
   snprintf(ampr, sizeof ampr, "%s/ampr_assets.index", path);
   snprintf(st, sizeof st, "%s/.e2a-state", path);
+  char pl[16];
+  plugins_state(path, pl);
   int n = snprintf(c->json + c->pos, c->cap - c->pos,
-                   "%s{\"type\":\"folder\",\"path\":\"%s\",\"title_id\":\"%s\",\"title\":\"%s\",\"version\":\"%s\",\"ampr\":%s,\"partial\":%s,\"selectable\":true}",
-                   c->first ? "" : ",", p, g->title_id, t, g->version, e2a_is_file(ampr) ? "true" : "false", e2a_is_dir(st) ? "true" : "false");
+                   "%s{\"type\":\"folder\",\"path\":\"%s\",\"title_id\":\"%s\",\"title\":\"%s\",\"version\":\"%s\",\"ampr\":%s,\"partial\":%s,\"selectable\":true,\"plugins\":\"%s\"}",
+                   c->first ? "" : ",", p, g->title_id, t, g->version, e2a_is_file(ampr) ? "true" : "false", e2a_is_dir(st) ? "true" : "false", pl);
   if (n < 0 || (size_t)n >= c->cap - c->pos) { c->full = true; return; }
   c->pos += (size_t)n;
   c->first = false;
@@ -1014,13 +1040,14 @@ static void scan_entry(scan_ctx *c, const char *path, const char *name, int dept
     if (image_mounted(name, mnt, sizeof mnt)) {
       e2a_game g;
       if (e2a_read_game(mnt, &g) == 0) {
-        char t[256], m[1300], p[1300];
+        char t[256], m[1300], p[1300], pl[16];
         e2a_json_escape(g.title, t, sizeof t);
         e2a_json_escape(mnt, m, sizeof m);
         e2a_json_escape(path, p, sizeof p);
+        plugins_state(mnt, pl);
         int n = snprintf(c->json + c->pos, c->cap - c->pos,
-                         "%s{\"type\":\"folder\",\"path\":\"%s\",\"title_id\":\"%s\",\"title\":\"%s\",\"version\":\"%s\",\"ampr\":false,\"partial\":false,\"selectable\":true,\"image\":\"%s\"}",
-                         c->first ? "" : ",", m, g.title_id, t, g.version, p);
+                         "%s{\"type\":\"folder\",\"path\":\"%s\",\"title_id\":\"%s\",\"title\":\"%s\",\"version\":\"%s\",\"ampr\":false,\"partial\":false,\"selectable\":true,\"image\":\"%s\",\"plugins\":\"%s\"}",
+                         c->first ? "" : ",", m, g.title_id, t, g.version, p, pl);
         if (n > 0 && (size_t)n < c->cap - c->pos) { c->pos += (size_t)n; c->first = false; }
         return;
       }

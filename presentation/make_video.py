@@ -7,10 +7,10 @@
     the mock engine's made-up catalogue (MOCK_DEMO: invented titles and drawn covers only);
   - an English voice-over: Kokoro-82M (Apache-2.0, kokoro-onnx); espeak-ng when it is not available;
   - the app's own navigation sounds under the voice;
-  - subtitles in the app's nine languages: French burned into one copy, all of them as tracks of the other.
+  - French subtitles drawn into the picture.
 
 Inputs: ./e2a-app-host, .deps/glyphs_cjk.bin, .deps/kokoro/{kokoro-v1.0.onnx,voices-v1.0.bin} (optional),
-DejaVu fonts (.deps/dejavu). Outputs in presentation/out/."""
+DejaVu fonts (.deps/dejavu). Output: presentation/out/exfat2ampr-presentation.mp4, the one video of the release."""
 import os
 import re
 import shutil
@@ -24,9 +24,11 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-from scenes import ISO639_2, LANGS, SCENES  # noqa: E402
+from scenes import SCENES  # noqa: E402
 
 OUT, WORK = os.path.join(HERE, "out"), os.path.join(HERE, "work")
+VIDEO = "exfat2ampr-presentation.mp4"
+SUBS = "fr"   # the language of the subtitles drawn into the video
 FPS, W, H = 30, 1920, 1080
 LEAD, TAIL, FADE = 0.45, 0.9, 0.3      # voice starts LEAD s into a scene, the scene lasts TAIL s after it
 VOICE = os.environ.get("E2A_VOICE", "af_heart")
@@ -186,9 +188,11 @@ def write_srt(lang, timings, path):
 # ------------------------------------------------------------------ main
 def main():
     shutil.rmtree(WORK, ignore_errors=True)
+    shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(WORK)
-    os.makedirs(os.path.join(OUT, "subtitles"), exist_ok=True)
-    version = subprocess.run(["make", "-s", "version"], cwd=ROOT, capture_output=True, text=True).stdout.strip() or "dev"
+    os.makedirs(OUT)
+    version = (os.environ.get("E2A_VIDEO_VERSION")   # the CI, when the video goes to an older release
+               or subprocess.run(["make", "-s", "version"], cwd=ROOT, capture_output=True, text=True).stdout.strip() or "dev")
     assets = os.path.join(WORK, "assets")
     os.makedirs(assets)
     with open(os.path.join(assets, "engine_version.txt"), "w") as f:
@@ -223,54 +227,25 @@ def main():
     base = os.path.join(WORK, "presentation.mp4")
     run(["ffmpeg", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", "-movflags", "+faststart", base])
 
-    srts = {}
-    for lang in LANGS:
-        srts[lang] = os.path.join(OUT, "subtitles", f"exfat2ampr-presentation.{lang}.srt")
-        write_srt(lang, timings, srts[lang])
-
-    # one file, English voice, the nine subtitle tracks (French first, shown by default)
-    order = ["fr"] + [lg for lg in LANGS if lg != "fr"]
-    args = ["ffmpeg", "-loglevel", "error", "-y", "-i", base]
-    for lang in order:
-        args += ["-i", srts[lang]]
-    args += ["-map", "0:v", "-map", "0:a"]
-    for k in range(len(order)):
-        args += ["-map", f"{k + 1}:s"]
-    args += ["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text", "-metadata:s:a:0", "language=eng"]
-    for k, lang in enumerate(order):
-        args += [f"-metadata:s:s:{k}", f"language={ISO639_2[lang]}"]
-    args += ["-disposition:s:0", "default", "-movflags", "+faststart", os.path.join(OUT, "exfat2ampr-presentation.mp4")]
-    run(args)
-
-    # the same with the French subtitles drawn into the picture (any player, any site)
-    shutil.copy(srts["fr"], os.path.join(WORK, "fr.srt"))
-    style = "FontName=DejaVu Sans,FontSize=17,PrimaryColour=&H00FFFFFF,OutlineColour=&H00101010,BorderStyle=1,Outline=1.6,Shadow=0,MarginV=26"
-    run(["ffmpeg", "-loglevel", "error", "-y", "-i", base, "-vf", f"subtitles=fr.srt:force_style='{style}'", "-c:v", "libx264",
-         "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
-         os.path.join(OUT, "exfat2ampr-presentation-sous-titres-fr.mp4")], cwd=WORK)
+    # English voice, French subtitles drawn into the picture (any player, any site)
+    write_srt(SUBS, timings, os.path.join(WORK, "subs.srt"))
+    style = ("FontName=DejaVu Sans,FontSize=17,PrimaryColour=&H00FFFFFF,OutlineColour=&H00101010,BorderStyle=1,"
+             "Outline=1.6,Shadow=0,MarginV=26")
+    video = os.path.join(OUT, VIDEO)
+    run(["ffmpeg", "-loglevel", "error", "-y", "-i", base, "-vf", f"subtitles=subs.srt:force_style='{style}'", "-c:v", "libx264",
+         "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "copy", "-metadata", "title=exFAT2AMPR",
+         "-metadata:s:a:0", "language=eng", "-movflags", "+faststart", video], cwd=WORK)
 
     # for review (work artifact): every 3 s on one sheet, and the middle of each scene at full size
-    burned = os.path.join(OUT, "exfat2ampr-presentation-sous-titres-fr.mp4")
-    run(["ffmpeg", "-loglevel", "error", "-y", "-i", burned, "-vf", "fps=1/3,scale=480:-1,tile=4x8", "-frames:v", "1",
+    run(["ffmpeg", "-loglevel", "error", "-y", "-i", video, "-vf", "fps=1/3,scale=480:-1,tile=4x8", "-frames:v", "1",
          os.path.join(WORK, "review_sheet.png")])
     for k, (sc, start, vlen, dur) in enumerate(timings):
         for tag, at in (("a", start + min(dur - 0.4, LEAD + vlen * 0.3)), ("b", start + min(dur - 0.4, LEAD + vlen * 0.8))):
-            run(["ffmpeg", "-loglevel", "error", "-y", "-ss", f"{at:.2f}", "-i", burned, "-frames:v", "1",
+            run(["ffmpeg", "-loglevel", "error", "-y", "-ss", f"{at:.2f}", "-i", video, "-frames:v", "1",
                  os.path.join(WORK, f"review_{k:02d}{tag}_{sc['id']}.png")])
 
     total = sum(t[3] for t in timings)
-    with open(os.path.join(OUT, "LISEZMOI.txt"), "w", encoding="utf-8", newline="\n") as f:
-        f.write(f"exFAT2AMPR — vidéo de présentation (version {version}), {total:.0f} s, 1920x1080, 30 i/s\n\n"
-                "exfat2ampr-presentation-sous-titres-fr.mp4 : voix anglaise, sous-titres français incrustés.\n"
-                "exfat2ampr-presentation.mp4 : voix anglaise, 9 pistes de sous-titres à choisir dans le lecteur "
-                "(français par défaut ; anglais, espagnol, italien, russe, portugais, chinois, thaï, vietnamien).\n"
-                "subtitles/ : les mêmes sous-titres en .srt (YouTube, etc.).\n\n"
-                f"Voix : synthèse vocale, {', '.join(sorted(engines))}. Kokoro-82M est sous licence Apache-2.0.\n"
-                "Images : l'app réelle enregistrée sur le simulateur de la CI, avec un catalogue de jeux inventés "
-                "(titres et jaquettes dessinés, aucun jeu réel).\n\nTexte dit (anglais) et sous-titres français :\n\n")
-        for sc, start, vlen, dur in timings:
-            f.write(f"[{stamp(start)[:8]}] {sc['text']['en']}\n           {sc['text']['fr']}\n\n")
-    print(f"done: {total:.1f} s, voice: {', '.join(sorted(engines))}")
+    print(f"done: {VIDEO}, {total:.1f} s, voice: {', '.join(sorted(engines))}")
 
 
 if __name__ == "__main__":

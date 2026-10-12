@@ -44,7 +44,7 @@
 #define MAX_RESUME 32
 
 typedef struct {
-  char path[600], smp[16], title_id[16], title[160], version[32], reason[32];
+  char path[600], smp[16], title_id[16], title[160], version[32], reason[32], plugins[12];
   bool image, selectable, ampr, partial, marked;
   bool dup;                 /* another copy of the same title is in the list */
   long long size;
@@ -83,7 +83,7 @@ typedef struct {
 
 enum { TAB_GAMES, TAB_PROGRESS, TAB_RESUME, TAB_SETTINGS, TAB_COUNT };
 enum { SCR_BOOT, SCR_MAIN, SCR_OPTIONS, SCR_PAIR, SCR_DEST, SCR_CHECK, SCR_OPTIMIZE };
-enum { SET_LANG, SET_GAME_MODE, SET_SOUNDS, SET_ANIMS, SET_PAIR, SET_UPDATE, SET_QUIT, SET_COUNT };
+enum { SET_LANG, SET_GAME_MODE, SET_SOUNDS, SET_ANIMS, SET_PAIR, SET_PLUGINS, SET_UPDATE, SET_QUIT, SET_COUNT };
 enum { TOAST_INFO, TOAST_OK, TOAST_ERR };
 
 static game_t g_games[MAX_GAMES];
@@ -106,6 +106,8 @@ static int g_toast_kind;
 static bool g_dirty = true;
 static char g_pin[16], g_ip[64];
 static int g_pair_devices;
+/* the game plugins (pgo_stub, dlc_emu) the engine keeps up to date: /api/plugins */
+static struct { char pgo[16], dlc[16]; int games, updated; bool running, ok; } g_plug;
 static uint64_t g_app_started_at;   /* last conversion started from this app (remote ones get a toast) */
 static bool run_checks_later;        /* storages changed while the check screen is open */
 
@@ -131,7 +133,7 @@ static char g_confirm_text[300], g_confirm_detail[700];
 static char g_delete_path[600];     /* the copy the confirm dialog is about */
 
 /* OPTIONS on a game: a small menu, like on the PS5 home screen */
-enum { MENU_OPTIMIZE, MENU_CONVERT_ALL, MENU_DELETE, MENU_SETTINGS, MENU_COUNT };
+enum { MENU_OPTIMIZE, MENU_PLUGINS, MENU_CONVERT_ALL, MENU_DELETE, MENU_SETTINGS, MENU_COUNT };
 static bool g_menu;
 static int g_menu_sel;
 static uint64_t g_menu_at;
@@ -258,6 +260,7 @@ static void load_games(void) {
     g->selectable = json_bool(n, "selectable", true);
     g->ampr = json_bool(n, "ampr", false);
     g->partial = json_bool(n, "partial", false);
+    scopy(g->plugins, sizeof g->plugins, json_str(n, "plugins", ""));   /* ok, update, missing, unknown, none */
     g->size = (long long)json_num(n, "size", 0);
     for (int k = 0; k < nmarked; k++)
       if (!strcmp(marked_path[k], g->path)) g->marked = g->selectable;
@@ -311,6 +314,12 @@ static void load_dests(bool announce) {
     bool was_listed = false;
     for (int i = 0; i < nold; i++) was_listed |= !strcmp(old[i].path, g_dest_path);
     if (announce && g_dest_path[0] && was_listed) { toast(T(S_DEST_GONE)); snd_cue_frame(SND_NOTIFY); }
+    /* the fastest storage measured by the speed test (the recommended one), else the first writable */
+    int best_speed = 0;
+    for (int i = 0; i < g_ndests; i++) {
+      int s = g_dests[i].read_mbps >= 0 ? g_dests[i].read_mbps : g_dests[i].write_mbps;
+      if (g_dests[i].writable && s > best_speed) { chosen = i; best_speed = s; }
+    }
     for (int i = 0; i < g_ndests && chosen < 0; i++)
       if (g_dests[i].writable) chosen = i;
   }
@@ -449,6 +458,47 @@ static void load_pair(void) {
     g_pair_devices = n;
   }
   json_free(&d);
+}
+
+/* the embedded plugin releases and the engine's last pass over the games (Settings) */
+static void load_plugins_info(void) {
+  jdoc d;
+  if (api_call("/api/plugins", NULL, &d) == 200 && d.root) {
+    const jnode *emb = json_get(d.root, "embedded");
+    for (const jnode *n = emb ? emb->child : NULL; n; n = n->next) {
+      const char *p = json_str(n, "project", "");
+      if (!strcmp(p, "pgo_stub")) scopy(g_plug.pgo, sizeof g_plug.pgo, json_str(n, "version", "?"));
+      else if (!strcmp(p, "dlc_emu")) scopy(g_plug.dlc, sizeof g_plug.dlc, json_str(n, "version", "?"));
+    }
+    const jnode *last = json_get(d.root, "last");
+    g_plug.games = last ? (int)json_num(last, "games", 0) : 0;
+    g_plug.updated = last ? (int)json_num(last, "updated", 0) : 0;
+    g_plug.running = last && json_bool(last, "running", false);
+    g_plug.ok = true;
+    g_dirty = true;
+  }
+  json_free(&d);
+}
+
+/* one game's plugins brought up to date now: the engine adds what the game needs, replaces older releases */
+static void plugins_refresh_game(const game_t *g) {
+  if (g->image) { toast(T(S_PLUG_SMP)); return; }
+  char form[700] = "", msg[300];
+  form_add(form, sizeof form, "path", g->path);
+  jdoc d;
+  int st = api_call("/api/plugins/refresh", form, &d);
+  if (st == 200 && d.root) {
+    int n = (int)json_num(d.root, "written", 0);
+    if (n > 0) snprintf(msg, sizeof msg, T(S_PLUG_DONE), n);
+    else scopy(msg, sizeof msg, T(S_PLUG_NOTHING));
+    toast(msg);
+    snd_cue_frame(SND_SELECT);
+  } else {
+    snprintf(msg, sizeof msg, T(S_PLUG_FAILED), st == 409 ? T(S_E_GAME_RUNNING) : d.root ? json_str(d.root, "report", "?") : "?");
+    toast_err(msg);
+  }
+  json_free(&d);
+  load_games();
 }
 
 /* ------------------------------------------------------- covers, wallpaper -- */
@@ -1057,9 +1107,9 @@ static void draw_resume(void) {
 }
 
 static void draw_settings(void) {
-  const int x = 80, y = 230, w = 1060, h = 730, row = 100;
+  const int x = 80, y = 230, w = 1060, h = 730, row = 88;
   panel(x, y, w, h);
-  const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_GAME_MODE), T(S_SOUNDS), T(S_ANIMS), T(S_PAIR), T(S_UPDATES), T(S_QUIT_APP)};
+  const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_GAME_MODE), T(S_SOUNDS), T(S_ANIMS), T(S_PAIR), T(S_PLUGINS), T(S_UPDATES), T(S_QUIT_APP)};
   static anim_val sel_v, tog[3];
   float sv = anim_track(&sel_v, (float)g_set_sel, 22.0f, 0.002f);
   row_push(g_set_sel);
@@ -1080,7 +1130,13 @@ static void draw_settings(void) {
     else if (i == SET_SOUNDS) draw_toggle(x + w - 140, ry + 20, snd_enabled(), C_ACCENT, &tog[1]);
     else if (i == SET_ANIMS) draw_toggle(x + w - 140, ry + 20, g_anim_enabled, C_ACCENT, &tog[2]);
     else if (i == SET_PAIR) gfx_text_right(&FONT_HEAD, x + w - 44, ry + 25, "›", C_DIM);
-    else if (i == SET_UPDATE) {   /* where the app's own update stands */
+    else if (i == SET_PLUGINS) {   /* the embedded releases and the last pass over the games */
+      char v[160];
+      if (!g_plug.ok) scopy(v, sizeof v, "…");
+      else if (g_plug.running) scopy(v, sizeof v, T(S_PLUG_RUNNING));
+      else snprintf(v, sizeof v, T(S_PLUG_STATUS), g_plug.pgo, g_plug.dlc, g_plug.games, g_plug.updated);
+      gfx_text_right(&FONT_BODY, x + w - 40, ry + 30, v, g_plug.running ? C_ACCENT : C_DIM);
+    } else if (i == SET_UPDATE) {   /* where the app's own update stands */
       int pct = 0;
       char ver[32], v[96];
       upd_state us = update_state(&pct, ver, sizeof ver, NULL, NULL, 0);
@@ -1130,6 +1186,27 @@ static void draw_settings(void) {
 
 enum { OPT_DEST, OPT_LEVEL, OPT_CACHE, OPT_VERIFY, OPT_DEDUP, OPT_CLEAN, OPT_OVERWRITE, OPT_REMOVE, OPT_START, OPT_COUNT };
 
+/* the author's advice on each option, shown next to its value with the reason below the list; the defaults
+ * are the recommended values, the user keeps the last word */
+enum { RECO_NONE, RECO_YES, RECO_LESS };
+static int opt_reco(int i, str_id *why) {
+  switch (i) {
+    case OPT_LEVEL:
+      if (g_opt.level == 9) { *why = S_R_LEVEL_9; return RECO_YES; }
+      if (g_opt.level >= 10) { *why = S_R_LEVEL_HI; return RECO_LESS; }
+      if (g_opt.level <= 4) { *why = S_R_LEVEL_LOW; return RECO_LESS; }
+      *why = S_R_LEVEL_MID;
+      return RECO_NONE;
+    case OPT_CACHE: *why = g_opt.cache ? S_R_CACHE_LARGE : S_R_CACHE_STD; return g_opt.cache ? RECO_NONE : RECO_YES;
+    case OPT_VERIFY: *why = g_opt.verify ? S_R_VERIFY_ON : S_R_VERIFY_OFF; return g_opt.verify ? RECO_YES : RECO_LESS;
+    case OPT_DEDUP: *why = g_opt.dedup ? S_R_DEDUP_ON : S_R_DEDUP_OFF; return g_opt.dedup ? RECO_YES : RECO_LESS;
+    case OPT_CLEAN: *why = g_opt.clean ? S_R_CLEAN_ON : S_R_CLEAN_OFF; return g_opt.clean ? RECO_YES : RECO_LESS;
+    case OPT_OVERWRITE: *why = g_opt.overwrite ? S_R_OVERWRITE_ON : S_R_OVERWRITE_OFF; return g_opt.overwrite ? RECO_LESS : RECO_YES;
+    case OPT_REMOVE: *why = g_opt.remove ? S_R_REMOVE_ON : S_R_REMOVE_OFF; return g_opt.remove ? RECO_LESS : RECO_YES;
+    default: *why = S_R_DEST; return RECO_NONE;
+  }
+}
+
 static void draw_options(void) {
   static const str_id labels[OPT_COUNT] = {S_DESTINATION, S_LEVEL, S_CACHE, S_VERIFY, S_DEDUP, S_CLEAN, S_OVERWRITE, S_REMOVE, S_START};
   const int x = 80, y = 150, w = 1180, row = 84;
@@ -1176,9 +1253,20 @@ static void draw_options(void) {
       bool on = i == OPT_VERIFY ? g_opt.verify : i == OPT_DEDUP ? g_opt.dedup : i == OPT_CLEAN ? g_opt.clean : i == OPT_OVERWRITE ? g_opt.overwrite : g_opt.remove;
       draw_toggle(x + w - 140, ry + 16, on, i == OPT_REMOVE ? C_WARN : C_ACCENT, &tog_v[i]);
     } else gfx_text_right(&FONT_BODY, x + w - 40, ry + 22, v, C_ACCENT);
+    {   /* the advice: a small green or amber word next to the value */
+      str_id why;
+      int r = opt_reco(i, &why);
+      if (r != RECO_NONE)
+        gfx_text_right(&FONT_SMALL, x + w - (i >= OPT_VERIFY ? 164 : 40), ry + (i >= OPT_VERIFY ? 24 : 50),
+                       T(r == RECO_YES ? S_RECO : S_LESS_RECO), r == RECO_YES ? C_OK : C_WARN);
+    }
     gfx_pop();
   }
-  if (g_opt_sel == OPT_LEVEL) gfx_text(&FONT_SMALL, x + 40, y + 34 + OPT_COUNT * row + 24, T(S_LEVEL_HINT), C_DIM, w - 80);
+  if (g_opt_sel < OPT_START) {   /* why, for the focused option */
+    str_id why;
+    opt_reco(g_opt_sel, &why);
+    gfx_text(&FONT_SMALL, x + 40, y + 34 + OPT_COUNT * row + 24, T(why), C_DIM, w - 80);
+  }
   /* right: what will be converted */
   const int dx = 1300, dw = 540;
   panel(dx, y + 20, dw, row * OPT_COUNT + 30);
@@ -1292,9 +1380,20 @@ static void draw_confirm(void) {
   gfx_pop();
 }
 
+/* the game's plugins line of the menu: what the engine found in its fakelib (an image: ShadowMountPlus
+ * applies the engine's emulator folder to it at launch) */
+static str_id plugins_label(const game_t *g) {
+  if (g->image) return S_PLUG_SMP;
+  if (!strcmp(g->plugins, "update")) return S_PLUG_UPDATE;
+  if (!strcmp(g->plugins, "missing")) return S_PLUG_MISSING;
+  if (!strcmp(g->plugins, "unknown")) return S_PLUG_UNKNOWN;
+  if (!g->plugins[0] || !strcmp(g->plugins, "none")) return S_PLUG_NONE;
+  return S_PLUG_OK;
+}
+
 /* the menu OPTIONS opens on a game: rises from the bottom right corner */
 static void draw_game_menu(void) {
-  static const str_id items[MENU_COUNT] = {S_OPTIMIZE, S_CONVERT_ALL, S_DELETE_COPY, S_SETTINGS};
+  static const str_id items[MENU_COUNT] = {S_OPTIMIZE, S_PLUG_OK, S_CONVERT_ALL, S_DELETE_COPY, S_SETTINGS};
   static anim_val sel_v;
   float e = ease_out(anim_t(g_menu_at, 200));
   const int w = 560, row = 76, h = row * MENU_COUNT + 92, x = 1840 - w, y = 980 - h;
@@ -1306,9 +1405,12 @@ static void draw_game_menu(void) {
   gfx_text(&FONT_SMALL, x + 32, y + 24, g->title, C_DIM, w - 64);
   float sv = anim_track(&sel_v, (float)g_menu_sel, 22.0f, 0.002f);
   draw_focus(x + 14, y + 66 + (int)(sv * (float)row), w - 28, row - 10, 18);
-  for (int i = 0; i < MENU_COUNT; i++)
-    gfx_text(&FONT_HEAD, x + 40, y + 66 + i * row + (row - 10) / 2 - FONT_HEAD.line / 2, T(items[i]),
-             i == MENU_DELETE ? RGB(255, 170, 170) : C_TEXT, w - 80);
+  for (int i = 0; i < MENU_COUNT; i++) {
+    str_id id = i == MENU_PLUGINS ? plugins_label(g) : items[i];
+    uint32_t c = i == MENU_DELETE ? RGB(255, 170, 170) : C_TEXT;
+    if (i == MENU_PLUGINS && (id == S_PLUG_SMP || id == S_PLUG_NONE || id == S_PLUG_OK)) c = C_DIM;   /* nothing to do */
+    gfx_text(&FONT_HEAD, x + 40, y + 66 + i * row + (row - 10) / 2 - FONT_HEAD.line / 2, T(id), c, w - 80);
+  }
   gfx_pop();
 }
 
@@ -1452,6 +1554,7 @@ static void enter_tab(int tab) {
   g_tab = (tab + TAB_COUNT) % TAB_COUNT;
   if (g_tab == TAB_RESUME) load_resumable();
   if (g_tab == TAB_PROGRESS) poll_status();
+  if (g_tab == TAB_SETTINGS) load_plugins_info();
   g_dirty = true;
 }
 
@@ -1641,6 +1744,7 @@ static void handle_input(uint32_t p) {
       if (g_menu_sel == MENU_SETTINGS) { enter_tab(TAB_SETTINGS); snd_cue_frame(SND_TAB); return; }
       if (g_menu_sel == MENU_CONVERT_ALL) { convert_all(); return; }
       if (g_menu_sel == MENU_OPTIMIZE) { open_optimize(&g_games[g_sel]); return; }
+      if (g_menu_sel == MENU_PLUGINS) { plugins_refresh_game(&g_games[g_sel]); return; }
       const game_t *g = &g_games[g_sel];
       scopy(g_delete_path, sizeof g_delete_path, g->path);
       char size[32] = "";
@@ -1782,6 +1886,13 @@ static void handle_input(uint32_t p) {
         settings_save();
       }
       if (g_set_sel == SET_PAIR && (p & BTN_CROSS)) { load_pair(); g_screen = SCR_PAIR; snd_cue_frame(SND_SELECT); }
+      if (g_set_sel == SET_PLUGINS && (p & BTN_CROSS)) {   /* every game and ShadowMountPlus' emulator folder, in the background */
+        jdoc d;
+        if (api_call("/api/plugins/refresh", "all=1", &d) == 200) { toast(T(S_PLUG_STARTED)); g_plug.running = true; g_plug.ok = true; }
+        else { char m[200]; snprintf(m, sizeof m, T(S_PLUG_FAILED), T(S_ENGINE)); toast_err(m); }
+        json_free(&d);
+        snd_cue_frame(SND_SELECT);
+      }
       if (g_set_sel == SET_UPDATE && (p & BTN_CROSS)) {
         char ver[32], sz[32], q[300];
         uint64_t size = 0;
@@ -1864,6 +1975,7 @@ int main(void) {
     if (g_screen != SCR_BOOT && now >= next_poll) {
       poll_status();
       if (g_screen == SCR_PAIR || g_tab == TAB_SETTINGS || !g_pin[0]) load_pair();
+      if (g_tab == TAB_SETTINGS && g_plug.running) load_plugins_info();   /* until the pass over the games ends */
       next_poll = now + (!strcmp(g_st.state, "running") ? 1000 : 2500);
     }
     if (g_screen == SCR_MAIN && g_tab == TAB_GAMES && !g_games_loaded) { anim_frame(now); draw(); gfx_present(); load_games(); }

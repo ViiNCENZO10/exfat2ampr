@@ -13,6 +13,7 @@
 #include "storage.h"
 #include "profile.h"
 #include "scan.h"
+#include "plugins.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -102,6 +103,7 @@ int main(int argc, char **argv) {
   clean_stray_mount_dirs();
   e2a_copy_hook = activity_throttle;   /* loose-file copies are paced too while a game runs */
   activity_init();
+  plugins_start_background();   /* ShadowMountPlus' emulator folder, then every game's fakelib */
   e2a_profile_import_usb();
 
   pair_init();

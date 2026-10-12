@@ -29,9 +29,19 @@ SPRX         := third_party/libSceAmpr.sprx
 # debug build with the APR command journal (/app0/ampr_commands.bin), used by the trace mode
 SPRX_DEBUG_URL := https://github.com/drakmor/ampr_emu/releases/download/$(SPRX_VERSION)/libSceAmpr.sprx-$(SPRX_VERSION)-test-debug-pack
 SPRX_DEBUG     := third_party/libSceAmpr_debug.sprx
+# game plugins the engine keeps up to date in the games' fakelib (drakmor's replacement modules, GPL-3.0):
+#   pgo_stub -> libScePlayGo.sprx (PlayGo: every chunk reported installed)
+#   dlc_emu  -> libSceAppContent.sprx, libSceGameUpdate.sprx, libSceNpEntitlementAccess.sprx (DLC listed in dlc_emu.ini)
+# pinned releases, "nolog" builds, checked against tools/plugins.sha256 (src/plugins.c also knows the older releases)
+PGO_VERSION := 0.6
+PGO_URL     := https://github.com/drakmor/pgo_stub/releases/download/$(PGO_VERSION)/libScePlayGo.sprx
+DLC_VERSION := 0.3
+DLC_URL     := https://github.com/drakmor/dlc_emu/releases/download/$(DLC_VERSION)/dlc_emu_$(DLC_VERSION).zip
+PLUGIN_DIR  := third_party/plugins
+PLUGINS     := $(PLUGIN_DIR)/libScePlayGo.sprx $(PLUGIN_DIR)/dlc_emu.ok
 
-CORE_SRCS := src/util.c src/sha256.c src/scan.c src/profile.c src/ampr_index.c src/ampr_pack.c src/verify.c src/smp.c src/trace.c src/pair.c src/storage.c src/bench.c src/selfupdate.c src/activity.c src/job.c src/httpd.c
-GEN       := gen/index_html.c gen/libSceAmpr_sprx.c gen/libSceAmpr_debug_sprx.c
+CORE_SRCS := src/util.c src/sha256.c src/scan.c src/profile.c src/ampr_index.c src/ampr_pack.c src/verify.c src/smp.c src/trace.c src/pair.c src/storage.c src/bench.c src/selfupdate.c src/activity.c src/plugins.c src/job.c src/httpd.c
+GEN       := gen/index_html.c gen/libSceAmpr_sprx.c gen/libSceAmpr_debug_sprx.c gen/plugin_playgo.c gen/plugin_appcontent.c gen/plugin_gameupdate.c gen/plugin_entitlement.c
 COMMON_CFLAGS := -O2 -g -Wall -Wextra -std=gnu11 -Isrc -I$(LZ4_DIR) -DE2A_VERSION=\"$(VERSION)\" -DLOG_JSON_CAP=20000
 
 # ---------------------------------------------------------------- PS5 build --
@@ -97,6 +107,22 @@ gen/libSceAmpr_debug_sprx.c: $(SPRX_DEBUG)
 	@mkdir -p gen
 	cd third_party && xxd -i libSceAmpr_debug.sprx > ../$@
 
+gen/plugin_playgo.c: $(PLUGIN_DIR)/libScePlayGo.sprx
+	@mkdir -p gen
+	cd $(PLUGIN_DIR) && xxd -i libScePlayGo.sprx > ../../$@
+
+gen/plugin_appcontent.c: $(PLUGIN_DIR)/dlc_emu.ok
+	@mkdir -p gen
+	cd $(PLUGIN_DIR) && xxd -i libSceAppContent.sprx > ../../$@
+
+gen/plugin_gameupdate.c: $(PLUGIN_DIR)/dlc_emu.ok
+	@mkdir -p gen
+	cd $(PLUGIN_DIR) && xxd -i libSceGameUpdate.sprx > ../../$@
+
+gen/plugin_entitlement.c: $(PLUGIN_DIR)/dlc_emu.ok
+	@mkdir -p gen
+	cd $(PLUGIN_DIR) && xxd -i libSceNpEntitlementAccess.sprx > ../../$@
+
 # ---- third party downloads (done once; BSD / GPL compatible) ----
 $(LZ4_DIR)/%.c:
 	@mkdir -p $(LZ4_DIR)
@@ -114,13 +140,26 @@ $(SPRX_DEBUG):
 	@mkdir -p third_party
 	curl -fsSL -o $@ $(SPRX_DEBUG_URL)
 
-deps: $(LZ4_SRCS) $(LZ4_HDRS) $(SPRX) $(SPRX_DEBUG)
+# the plugins: every file checked against tools/plugins.sha256 before it is embedded
+$(PLUGIN_DIR)/libScePlayGo.sprx:
+	@mkdir -p $(PLUGIN_DIR)
+	curl -fsSL -o $@ $(PGO_URL)
+	cd $(PLUGIN_DIR) && sha256sum --check --strict --ignore-missing ../../tools/plugins.sha256
+
+$(PLUGIN_DIR)/dlc_emu.ok:
+	@mkdir -p $(PLUGIN_DIR)
+	curl -fsSL -o $(PLUGIN_DIR)/dlc_emu.zip $(DLC_URL)
+	cd $(PLUGIN_DIR) && rm -rf nolog && unzip -qo dlc_emu.zip 'nolog/*' && mv -f nolog/*.sprx . && rmdir nolog
+	cd $(PLUGIN_DIR) && sha256sum --check --strict --ignore-missing ../../tools/plugins.sha256
+	touch $@
+
+deps: $(LZ4_SRCS) $(LZ4_HDRS) $(SPRX) $(SPRX_DEBUG) $(PLUGINS)
 
 clean:
 	rm -rf $(ELF) $(HOSTBIN) build gen/*.c
 
 distclean: clean
-	rm -rf $(LZ4_DIR) $(SPRX) $(SPRX_DEBUG) gen
+	rm -rf $(LZ4_DIR) $(SPRX) $(SPRX_DEBUG) $(PLUGIN_DIR) gen
 
 version:
 	@echo $(VERSION)

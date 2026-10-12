@@ -17,7 +17,7 @@
 #endif
 #endif
 #ifndef E2A_UPDATE_URL
-#define E2A_UPDATE_URL "https://raw.githubusercontent.com/ViiNCENZO10/exfat2ampr/updates/update.json"
+#define E2A_UPDATE_URL "https://raw.githubusercontent.com/exFAT2AMPR/exfat2ampr/updates/update.json"
 #endif
 
 #define PIECE (1u << 20)   /* what goes to the engine at a time (its requests stop at 2 MiB) */

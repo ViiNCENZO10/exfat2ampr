@@ -89,20 +89,42 @@ if os.environ.get("MOCK_DEMO"):   # invented titles only: nothing that belongs t
         if kind == "image":
             g.update(smp_title=tid, image_type="exfat", mounted=False, mount="", selectable=True, reason="", fakelib=True)
         else:
-            g.update(ampr=False, partial=False, selectable=True)
+            g.update(ampr=False, partial=False, selectable=True, plugins="ok")
         g.update(kw)
         return g
     GAMES[:] = [
-        _demo("folder", "/data/homebrew/PPSA90101", "PPSA90101", "Starfall Odyssey", 38 * GB),
+        _demo("folder", "/data/homebrew/PPSA90101", "PPSA90101", "Starfall Odyssey", 38 * GB, plugins="update"),
         _demo("image", "/mnt/usb0/homebrew/PPSA90102.exfat", "PPSA90102", "Neon Drift Racing", 46 * GB),
         _demo("image", "/mnt/ext0/homebrew/PPSA90103.exfat", "PPSA90103", "Kingdom of Ash", 72 * GB),
         _demo("folder", "/mnt/usb0/homebrew/PPSA90104", "PPSA90104", "Echoes of the Deep", 29 * GB, ampr=True),
-        _demo("folder", "/data/homebrew/PPSA90105", "PPSA90105", "Skyline Tactics", 21 * GB),
+        _demo("folder", "/data/homebrew/PPSA90105", "PPSA90105", "Skyline Tactics", 21 * GB, plugins="missing"),
         _demo("image", "/mnt/usb1/backup/PPSA90102.exfat", "PPSA90102", "Neon Drift Racing", 46 * GB,
               smp_title="", selectable=False, reason="not_managed"),
-        _demo("folder", "/mnt/ext0/homebrew/PPSA90106", "PPSA90106", "Moonlit Harbor", 33 * GB),
-        _demo("folder", "/data/homebrew/PPSA90107", "PPSA90107", "Pixel Garden", 2 * GB),
+        _demo("folder", "/mnt/ext0/homebrew/PPSA90106", "PPSA90106", "Moonlit Harbor", 33 * GB, plugins="unknown"),
+        _demo("folder", "/data/homebrew/PPSA90107", "PPSA90107", "Pixel Garden", 2 * GB, plugins="none"),
     ]
+
+# the game plugins (pgo_stub, dlc_emu) the engine keeps up to date: what /api/plugins answers
+PLUGIN_FILES = [("libScePlayGo.sprx", "pgo_stub", "0.6"), ("libSceAppContent.sprx", "dlc_emu", "0.3"),
+                ("libSceGameUpdate.sprx", "dlc_emu", "0.3"), ("libSceNpEntitlementAccess.sprx", "dlc_emu", "0.3")]
+PLUGIN_LAST = {"at": int(time.time()) - 900, "running": False, "games": 5, "updated": 1, "failed": 0}
+
+
+def plugins_info():
+    return {"embedded": [{"name": n, "project": p, "version": v, "size": 20000} for n, p, v in PLUGIN_FILES],
+            "emus": {"dir": "/data/shadowmount/emus", "written": 0, "report": ""}, "last": PLUGIN_LAST}
+
+
+def plugins_detail(path):
+    g = next((x for x in GAMES if x["path"] == path), None)
+    state = (g or {}).get("plugins", "none")
+    per = {"ok": "current", "update": "old", "missing": "absent", "unknown": "unknown", "none": "absent"}[state]
+    files = []
+    for i, (n, p, v) in enumerate(PLUGIN_FILES):
+        st = per if i == 0 or state != "missing" else "current"   # "missing": the PlayGo stub is the absent one
+        files.append({"name": n, "project": p, "state": st, "version": "0.5" if st == "old" else v if st == "current" else "",
+                      "latest": v, "needed": state != "none"})
+    return {"state": state, "files": files}
     RESUME[:] = []
 
 TRACES = {}   # path -> {trace_mode, pending, collected, profile}: the optimization of a folder game
@@ -386,6 +408,9 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, UPDATE_PKG, "application/octet-stream")
         if u.path == "/api/traces":
             return self.send(200, traces_json())
+        if u.path == "/api/plugins":
+            path = q.get("path", [""])[0]
+            return self.send(200, plugins_detail(path) if path else plugins_info())
         if u.path == "/api/destinations":
             return self.send(200, [with_speed(s) for s in storages()])
         if u.path == "/api/resumable":
@@ -410,6 +435,19 @@ class H(BaseHTTPRequestHandler):
         raw = self.rfile.read(n)
         u = urllib.parse.urlparse(self.path)
         path = u.path
+        if path == "/api/plugins/refresh":
+            form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+            p = form.get("path", [""])[0]
+            if not p:   # every game, in the background
+                PLUGIN_LAST.update(at=int(time.time()), running=False, games=5, updated=2)
+                return self.send(200, {"ok": True, "started": True})
+            g = next((x for x in GAMES if x["path"] == p), None)
+            if not g:
+                return self.send(400, {"error": "bad game folder"})
+            written = 1 if g.get("plugins") in ("update", "missing") else 0
+            if written:
+                g["plugins"] = "ok"
+            return self.send(200, {"ok": True, "written": written, "report": "libScePlayGo.sprx 0.5 -> 0.6" if written else ""})
         if path == "/api/update/chunk":   # binary pieces of the package, in order
             off = int(urllib.parse.parse_qs(u.query).get("off", ["-1"])[0])
             if off != len(UPDATE["got"]):

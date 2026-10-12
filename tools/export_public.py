@@ -6,15 +6,15 @@
 usage: export_public.py PUBLIC_CLONE
 
 PUBLIC_CLONE is a clone of the public repository (or an empty folder for the first export). The tracked files
-of HEAD replace its content and become one new commit, signed with the author's public GitHub identity (no
-private e-mail). VERSION_OFFSET is written so that the public version number (1.<offset + commits>) equals
+of HEAD replace its content and become one new commit, signed "V-10" with an address that belongs to no GitHub
+account (.invalid can never exist): the commits show the name only, linked to nobody's profile. VERSION_OFFSET is written so that the public version number (1.<offset + commits>) equals
 this repository's: the app's version keeps growing across the switch, and its updates compare correctly."""
 import os
 import shutil
 import subprocess
 import sys
 
-AUTHOR = "V-10 <48408514+ViiNCENZO10@users.noreply.github.com>"   # GitHub's private address of the account
+AUTHOR = "V-10 <v-10@exfat2ampr.invalid>"
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 dst = os.path.abspath(sys.argv[1])
 

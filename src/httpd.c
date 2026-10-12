@@ -12,6 +12,7 @@
 #include "bench.h"
 #include "selfupdate.h"
 #include "scan.h"
+#include "plugins.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -336,6 +337,31 @@ static void api_speedtest(int fd, const char *body) {
   send_json(fd, 200, out);
 }
 
+/* /api/plugins: the embedded releases and the last pass; ?path=<game folder>: that game's files in detail */
+static void api_plugins(int fd, const char *args) {
+  char path[600] = "", out[4000];
+  form_get(args, "path", path, sizeof path);
+  if (path[0] && !plugins_path_allowed(path)) { send_json(fd, 400, "{\"error\":\"bad game folder\"}"); return; }
+  int rc = path[0] ? plugins_status_json(path, out, sizeof out) : plugins_info_json(out, sizeof out);
+  if (rc != 0) send_json(fd, 500, "{\"error\":\"too long\"}");
+  else send_json(fd, 200, out);
+}
+
+/* /api/plugins/refresh: path=<game folder> brings that game up to date now; without a path, every game and
+ * ShadowMountPlus' emulator folder, in the background */
+static void api_plugins_refresh(int fd, const char *body) {
+  char path[600] = "", rep[400], er[600], out[800];
+  form_get(body, "path", path, sizeof path);
+  if (!path[0]) { plugins_start_background(); send_json(fd, 200, "{\"ok\":true,\"started\":true}"); return; }
+  if (!plugins_path_allowed(path)) { send_json(fd, 400, "{\"error\":\"bad game folder\"}"); return; }
+  e2a_game g;
+  if (e2a_read_game(path, &g) == 0 && activity_title_running(g.title_id)) { send_json(fd, 409, "{\"error\":\"game_running\"}"); return; }
+  int n = plugins_apply(path, rep, sizeof rep);
+  e2a_json_escape(rep, er, sizeof er);
+  snprintf(out, sizeof out, "{\"ok\":%s,\"written\":%d,\"report\":\"%s\"}", n >= 0 ? "true" : "false", n < 0 ? 0 : n, er);
+  send_json(fd, n >= 0 ? 200 : 500, out);
+}
+
 static void api_trace(int fd, const char *op, const char *body) {
   char path[600] = "", err[300] = "", out[1400];
   if (strcmp(op, "generate") != 0) {
@@ -513,6 +539,8 @@ static void handle(int fd) {
   else if (strcmp(path, "/api/profiles") == 0) api_list(fd, job_list_profiles);
   else if (strcmp(path, "/api/icon") == 0) api_icon(fd, args);
   else if (strcmp(path, "/api/traces") == 0) api_list(fd, trace_list_json);
+  else if (strcmp(path, "/api/plugins") == 0) api_plugins(fd, args);
+  else if (strcmp(path, "/api/plugins/refresh") == 0 && post) api_plugins_refresh(fd, args);
   else if (strncmp(path, "/api/trace/", 11) == 0 && post) api_trace(fd, path + 11, args);
   else if (strcmp(path, "/api/start") == 0 && post) api_start(fd, args, false);
   else if (strcmp(path, "/api/queue") == 0 && post) api_start(fd, args, true);

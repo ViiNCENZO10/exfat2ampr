@@ -251,12 +251,12 @@ static int file_has(const char *path, const char *needle, const char *witness, b
   return found;
 }
 
-int e2a_ampr_compat(const char *root, char *detail, size_t cap) {
+static int imports(const char *root, const char *lib, char *detail, size_t cap) {
   char path[1100];
   bool plain = false;   /* "libkernel" is imported by every executable: seen = strings are readable */
   snprintf(path, sizeof path, "%s/eboot.bin", root);
-  int r = file_has(path, "libSceAmpr", "libkernel", &plain);
-  if (r == 1) { snprintf(detail, cap, "eboot.bin imports libSceAmpr"); return 1; }
+  int r = file_has(path, lib, "libkernel", &plain);
+  if (r == 1) { snprintf(detail, cap, "eboot.bin imports %s", lib); return 1; }
   snprintf(path, sizeof path, "%s/sce_module", root);
   DIR *d = opendir(path);
   if (d) {
@@ -264,8 +264,8 @@ int e2a_ampr_compat(const char *root, char *detail, size_t cap) {
     while ((de = readdir(d)) != NULL) {
       if (!ends_with_ci(de->d_name, ".prx") && !ends_with_ci(de->d_name, ".sprx")) continue;
       snprintf(path, sizeof path, "%s/sce_module/%s", root, de->d_name);
-      if (file_has(path, "libSceAmpr", "libkernel", &plain) == 1) {
-        snprintf(detail, cap, "sce_module/%s imports libSceAmpr", de->d_name);
+      if (file_has(path, lib, "libkernel", &plain) == 1) {
+        snprintf(detail, cap, "sce_module/%s imports %s", de->d_name, lib);
         closedir(d);
         return 1;
       }
@@ -273,8 +273,15 @@ int e2a_ampr_compat(const char *root, char *detail, size_t cap) {
     closedir(d);
   }
   if (!plain) { snprintf(detail, cap, "eboot.bin is encrypted or unreadable: cannot tell"); return -1; }
-  snprintf(detail, cap, "no libSceAmpr import in eboot.bin or sce_module");
+  snprintf(detail, cap, "no %s import in eboot.bin or sce_module", lib);
   return 0;
+}
+
+int e2a_ampr_compat(const char *root, char *detail, size_t cap) { return imports(root, "libSceAmpr", detail, cap); }
+
+int e2a_game_imports(const char *root, const char *lib) {
+  char detail[200];
+  return imports(root, lib, detail, sizeof detail);
 }
 
 bool e2a_title_from_name(const char *name, char out[16]) {

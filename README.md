@@ -1,6 +1,8 @@
 # ps5-exfat2ampr
 
-✅ **Testé et fonctionnel sur PlayStation 5** par l'auteur, V-10 (firmware 12.40, kstuff, ShadowMountPlus 1.7).
+![Testé et fonctionnel sur PlayStation 5](docs/tested-on-ps5.svg)
+
+✅ **Testé et fonctionnel sur PlayStation 5** par l'auteur, V-10 (firmware 12.xx & 13.xx, kstuff, ShadowMountPlus 1.7).
 
 Payload PS5 (jailbreak + chargeur d'ELF) qui convertit **sur la console** un jeu
 en pack **AMPR LZ4** (format d'ampr_emu / Lazy_AMPR) et le dépose dans le dossier
@@ -193,6 +195,28 @@ Port C de `ampr_pack_profile.py` (drakmor/ampr_emu) : au lieu de deviner, on mes
 Les règles générées utilisent `action = "keep"`. Elles ne règlent que la géométrie des fichiers déjà packés et ne
 font jamais packer un fichier que la liste de sécurité garde en clair. La CI compare le résultat à
 `ampr_pack_profile.py` sur un journal synthétique validé par `parse_ampr_command_log.py`.
+
+## Plugins des jeux (pgo_stub, dlc_emu)
+
+Le moteur embarque les modules de remplacement de drakmor : `libScePlayGo.sprx`
+([pgo_stub](https://github.com/drakmor/pgo_stub) : PlayGo voit tous les morceaux installés) et
+`libSceAppContent.sprx`, `libSceGameUpdate.sprx`, `libSceNpEntitlementAccess.sprx`
+([dlc_emu](https://github.com/drakmor/dlc_emu) : les DLC listés dans le `dlc_emu.ini` du jeu). Versions
+épinglées par le Makefile et vérifiées par SHA-256 (`tools/plugins.sha256`) ; `src/plugins.c` connaît
+l'empreinte de chaque version publiée, donc sait dire si un fichier d'un jeu est à jour, ancien (remplacé,
+l'ancienne copie reste en `.old`) ou inconnu (laissé tel quel).
+
+- À chaque conversion, la destination reçoit ce dont le jeu a besoin : PlayGo quand le jeu l'importe, les
+  modules DLC quand le jeu a un `dlc_emu.ini` (sans ce fichier ils cacheraient les vrais DLC : jamais ajoutés
+  seuls).
+- Au démarrage puis toutes les 6 heures (et quand un support est branché), chaque dossier de jeu des racines
+  connues est vérifié, sauf un jeu en cours d'exécution.
+- Le dossier d'émulateurs de ShadowMountPlus (`/data/shadowmount/emus`, `update_emulators=1`) reçoit les mêmes
+  fichiers : les jeux montés depuis une image suivent aussi.
+- App : menu du jeu › « Plugins : … » (un jeu), Réglages › Plugins des jeux (tous) ; page web : état par jeu et
+  bouton « Mettre à jour les plugins » ; API : `GET /api/plugins[?path=]`, `POST /api/plugins/refresh [path=]`.
+
+Nouveau, pas encore validé sur console.
 
 ## Limites
 

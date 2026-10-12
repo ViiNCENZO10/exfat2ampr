@@ -49,5 +49,7 @@ bool e2a_title_from_name(const char *name, char out[16]);
  * reads its files any other way cannot load packed files. Looks for the libSceAmpr import in
  * eboot.bin and the .prx / .sprx modules of sce_module. 1 = uses AMPR, 0 = does not, -1 = cannot tell (encrypted). */
 int e2a_ampr_compat(const char *root, char *detail, size_t cap);
+/* the same test for any system library (e.g. "libScePlayGo"): 1 = imported, 0 = not, -1 = cannot tell */
+int e2a_game_imports(const char *root, const char *lib);
 
 #endif

@@ -1,8 +1,10 @@
 ## exFAT2AMPR — convert PS5 game dumps to AMPR LZ4, right on the console
 
+![Tested and working on PlayStation 5](https://raw.githubusercontent.com/exFAT2AMPR/exfat2ampr/main/docs/tested-on-ps5.svg)
+
 Made by **V-10** · LZ4 format: **DLPSGAME** · AMPR emulator: drakmor/ampr_emu · free software (GPL-3.0)
 
-✅ **Tested and working on a PlayStation 5** by the author (firmware 12.40, kstuff, ShadowMountPlus 1.7).
+✅ **Tested and working on a PlayStation 5** by the author (firmware 12.xx & 13.xx, kstuff, ShadowMountPlus 1.7).
 
 ### What it does
 
@@ -17,6 +19,16 @@ Made by **V-10** · LZ4 format: **DLPSGAME** · AMPR emulator: drakmor/ampr_emu 
 - **Speed test** of each storage, the fastest one recommended, slow ones flagged.
 - **Automatic updates**: the app tells you when a new version is out and installs it (the previous package
   is kept as `.old`).
+- **Game plugins kept up to date**: drakmor's PlayGo stub (pgo_stub) and DLC modules (dlc_emu) are embedded.
+  Every conversion gets what the game needs, every game folder is checked at start-up and from the app (the
+  game's menu, or Settings › Game plugins for all of them), older releases are replaced (the old copy stays as
+  `.old`), and ShadowMountPlus' emulator folder receives the same files, so the games it mounts follow too.
+- **Faster conversions, packs as good**: a fast LZ4 probe skips the slow pass on incompressible data, a CRC
+  four times faster, the verification on several threads; the emulator's memory budget is checked before
+  the cache settings are written (a large cache no longer ends up smaller than the standard one on a big
+  game).
+- **Advice on every option**: "Recommended" or "Less recommended" next to each setting, with the reason in
+  one line; the defaults are the recommended values.
 - Nine languages: English, French, Spanish, Italian, Russian, Portuguese, Chinese, Thai, Vietnamese; the
   web page for a PC or a phone (pairing with a 6-digit code or a QR code) adds Arabic.
 
@@ -30,16 +42,24 @@ Requirements: a jailbroken PS5 with kstuff, an ELF loader on port 9021 (elfldr, 
 2. Restart the console, start the jailbreak; ShadowMountPlus adds **exFAT2AMPR** to the home screen.
 3. Open it: the app starts its engine itself. `exfat2ampr.elf` is only needed to run the engine by hand.
 
-Tested and working on a PlayStation 5 by the author (firmware 12.40, kstuff, ShadowMountPlus 1.7). Other
-firmwares and setups: reports are welcome.
+Tested and working on a PlayStation 5 by the author (firmware 12.xx & 13.xx, kstuff, ShadowMountPlus 1.7).
+Other firmwares and setups: reports are welcome. New in this version and not yet validated on a console: the
+game plugin updates.
+
+**Presentation video**: `exfat2ampr-presentation.mp4` — English voice, French subtitles.
 
 ---
 
 ### En français
 
 exFAT2AMPR convertit les dumps de jeux PS5 au format AMPR LZ4, directement sur la console. Créé par **V-10**,
-format LZ4 : **DLPSGAME**. ✅ **Testé et fonctionnel sur PlayStation 5** par l'auteur (firmware 12.40, kstuff,
-ShadowMountPlus 1.7). Installation : copier `PPSA99272.ffpkg` dans `homebrew/` (clé USB exFAT) ou dans
+format LZ4 : **DLPSGAME**. ✅ **Testé et fonctionnel sur PlayStation 5** par l'auteur (firmware 12.xx & 13.xx,
+kstuff, ShadowMountPlus 1.7). Installation : copier `PPSA99272.ffpkg` dans `homebrew/` (clé USB exFAT) ou dans
 `/data/homebrew/` par FTP, en un seul exemplaire, redémarrer, lancer le jailbreak puis l'app. Les mises à jour
-suivantes s'installent depuis l'app (Réglages › Mises à jour). La vidéo de présentation (voix anglaise,
-sous-titres français) est jointe à la release.
+suivantes s'installent depuis l'app (Réglages › Mises à jour). Les plugins pgo_stub (PlayGo) et dlc_emu (DLC)
+de drakmor sont intégrés et maintenus à jour dans le dossier `fakelib` des jeux : à chaque conversion, au
+démarrage, depuis le menu du jeu ou Réglages › Plugins des jeux (nouveau, pas encore validé sur console).
+Conversions plus rapides à packs identiques (sonde LZ4 rapide, CRC plus rapide, vérification sur plusieurs
+cœurs, budget mémoire de l'émulateur respecté), et chaque option indique « Recommandé » ou « Moins
+recommandé » avec la raison. La vidéo de présentation
+(`exfat2ampr-presentation.mp4`, voix anglaise, sous-titres français) est jointe à la release.

@@ -18,12 +18,14 @@
 #define E2A_HOMEBREW_DIR "homebrew"
 #define E2A_STATE_DIR "e2a-state"
 #define E2A_SPRX_SMP "e2a-state/libSceAmpr.sprx"
+#define E2A_EMUS_DIR "e2a-state/emus"
 #define E2A_SMP_MOUNT_DIR "e2a-state/shadowmnt"
 #define E2A_APPMETA_DIR "e2a-state/appmeta"
 #else
 #define E2A_HOMEBREW_DIR "/data/homebrew"
 #define E2A_STATE_DIR "/data/exfat2ampr"
 #define E2A_SPRX_SMP "/data/shadowmount/emus/libSceAmpr.sprx"
+#define E2A_EMUS_DIR "/data/shadowmount/emus"   /* ShadowMountPlus' emulator folder (emulators_path) */
 #define E2A_SMP_MOUNT_DIR "/mnt/shadowmnt"
 #define E2A_APPMETA_DIR "/user/appmeta"   /* the system's copy of every registered title's icon0.png / pic0.png */
 #endif
