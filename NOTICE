@@ -1,0 +1,45 @@
+exFAT2AMPR
+Copyright (C) 2026 V-10
+
+exFAT2AMPR is free software: you can redistribute it and/or modify it under the terms of the GNU General
+Public License as published by the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version (see COPYING), with the additional terms below.
+
+ADDITIONAL TERMS (GNU GPL version 3, section 7)
+
+These terms apply to the parts of exFAT2AMPR written by V-10. They do not restrict anything the GPL grants
+for the third-party material listed under "Credits", which stays under its own license.
+
+1. Attribution (section 7(b)). Every copy and every modified version must keep the notice
+   "exFAT2AMPR - Copyright (C) 2026 V-10" in its source files and this NOTICE file, and must keep showing the
+   credit "Made by V-10" (or its translation) where the program shows its credits: the app's start screen
+   and Settings, and the web page.
+
+2. Modified versions (section 7(c)). A modified version must say clearly, where it shows its name and in
+   its documentation, that it is modified and by whom, and must not be presented as the original work or
+   as made or endorsed by V-10.
+
+3. Name and logo (section 7(e)). No right is granted to use the name "exFAT2AMPR" or its icon and logo.
+   A modified version that is distributed must use another name and another icon. Saying that it is
+   "based on exFAT2AMPR by V-10" is allowed, and required by term 1.
+
+Removing the author's name, or distributing the program or a copy under another person's name, breaks
+these terms and ends the rights the GPL grants (section 8).
+
+Credits
+- V-10: author of exFAT2AMPR (engine, PS5 app, web page).
+- DLPSGAME: the LZ4 format of PS5 games.
+- drakmor: ampr_emu (the AMPR emulator and the formats ported here, GPL-3.0) and ShadowMountPlus.
+- BlackBearReloaded: ps5-native-app-boilerplate (GPL-3.0-or-later), parts of the PS5 app's platform layer
+  and its HTTPS sequence.
+- Yann Collet: LZ4 (BSD-2-Clause). Sean Barrett: stb_image (public domain). Project Nayuki: QR Code
+  generator (MIT). DejaVu fonts (Bitstream Vera license), Noto Sans Thai and Noto Sans CJK (SIL OFL 1.1).
+- Kokoro-82M (Apache-2.0): the voice of the presentation video.
+
+---
+
+exFAT2AMPR - Copyright (C) 2026 V-10. Logiciel libre sous licence GNU GPL version 3 ou ultérieure (COPYING),
+avec ces conditions supplémentaires (article 7) : toute copie ou version modifiée doit garder ce copyright et
+le crédit « Créé par V-10 » ; une version modifiée doit se présenter comme modifiée et ne pas se faire passer
+pour l'originale ; le nom « exFAT2AMPR » et son logo ne sont pas cédés : une version modifiée diffusée doit
+porter un autre nom et une autre icône. Retirer le nom de l'auteur met fin aux droits accordés par la licence.

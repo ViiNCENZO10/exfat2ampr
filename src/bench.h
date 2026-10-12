@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Speed of a destination storage, measured on demand (the app: Destinations > square; the page):
  *  - read: random 256 KiB reads spread over the largest file kept there (a game image or pack of at least
  *    256 MiB), which is what a game does while it streams; the reads land on cold data, the cache does

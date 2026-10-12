@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
 """Draw the home-screen icon (sce_sys/icon0.png, 512x512): a hard drive seen from the inside,
 its platter shining like a CD, and a blue embossed lightning bolt driving the spindle, on white.
 

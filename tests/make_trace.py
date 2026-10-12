@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
 """Write a synthetic AMPRCMD1 command journal (what the debug AMPR emulator records in
 /app0/ampr_commands.bin) for a converted test game, using its ampr_emu.index:
 

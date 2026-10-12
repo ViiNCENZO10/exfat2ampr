@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Talks to the exfat2ampr engine (the privileged payload) on 127.0.0.1:6972, and starts it
  * through the local ELF loader (port 9021) when it is not running. */
 #ifndef E2A_APP_API_H

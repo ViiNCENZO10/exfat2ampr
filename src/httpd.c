@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Tiny HTTP/1.0 server: serves the embedded web page and a JSON API. */
 #include "common.h"
 #include "job.h"

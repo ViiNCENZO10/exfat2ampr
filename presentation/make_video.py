@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
 """Builds the public presentation video on the CI (run from anywhere, after the host app is built):
 
   - every scene of scenes.py: a title card, or the real app (host build, 1080p) driven by a script against

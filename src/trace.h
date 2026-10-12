@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Trace-driven pack profiles, a C port of drakmor/ampr_emu tools/ampr_pack_profile.py:
  *  1. trace mode: the debug AMPR emulator is placed in <game>/fakelib2 (ShadowMountPlus mounts
  *     fakelib2 exclusively, so its emulator updater cannot replace it); the game then writes

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * AMPRPAK4 / AMPRDAT3 / AMPRCRC1 writer: a C port of the essential parts of
  * drakmor/ampr_emu tools/ampr_pack.py (single group, mixed layout, 64 KiB blocks,
  * io-page aware placement, LZ4 raw blocks, raw fallback, auto-loose, block

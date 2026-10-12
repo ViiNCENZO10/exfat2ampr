@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
 """Fake exfat2ampr engine API for the app's host screenshots (CI).
 
 usage: mock_engine.py PORT VERSION

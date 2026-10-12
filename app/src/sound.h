@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Navigation sounds, synthesized at start (no sound files): soft ticks and chimes, mixed on the
  * platform's audio thread (48 kHz stereo). */
 #ifndef E2A_APP_SOUND_H

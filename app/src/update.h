@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * The app's own updates. The project publishes update.json (version, package URL, size, SHA-256) with each
  * release; the app reads it at start and from Settings. Installing downloads the package over HTTPS (the
  * console's sceHttp, on a thread), hands it to the engine 1 MiB at a time (/api/update/...), and the engine

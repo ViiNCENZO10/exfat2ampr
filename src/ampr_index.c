@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * AMPRIDX3 writer (port of drakmor/ampr_emu tools/build_ampr_index.py). */
 #include "ampr_pack.h"
 

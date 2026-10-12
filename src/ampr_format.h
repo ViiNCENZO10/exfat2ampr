@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * On-disk structures of the AMPR emulator asset packs (drakmor/ampr_emu tools/ampr_pack_format.py).
  * All little-endian, packed. */
 #ifndef E2A_AMPR_FORMAT_H

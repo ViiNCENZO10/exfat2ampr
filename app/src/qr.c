@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Pairing QR code, drawn with qrcodegen (Project Nayuki, MIT). */
 #define NDEBUG   /* the app runtime has no __assert */
 #if defined(__clang__)

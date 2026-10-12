@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Destination list and conversion check screens. Included by main.c (shares its state); kept
  * apart so main.c stays readable. Not compiled on its own (.inc). */
 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Host (Linux) command line around the same job engine, used by the CI to validate the
  * produced packs with drakmor/ampr_emu's Python tools and to exercise pause / resume.
  *

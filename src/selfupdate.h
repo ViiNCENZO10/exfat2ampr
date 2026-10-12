@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * The app's own update, installed by the engine. The home-screen app downloads the new PPSA99272.ffpkg
  * over HTTPS (the console's sceHttp: the engine has no TLS) and hands it over 1 MiB at a time, from the
  * console only (/api/update/...). The engine checks its size and SHA-256 against the published manifest,

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Destination storages, from the kernel's real mount table (getfsstat):
  *  - the internal storage is /data/homebrew, the homebrew data area (never the system partitions);
  *  - an external drive is listed only when /mnt/usbN or /mnt/extN is a real mount point (an empty

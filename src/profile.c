@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Minimal TOML reader for ampr_pack-style profiles: [[rule]] tables with
  * action / include / exclude, and [pack] compression_level. Everything else is ignored. */
 #include "profile.h"

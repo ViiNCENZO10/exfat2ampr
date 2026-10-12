@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * CPU drawing into a linear 1920x1080 frame (0xAABBGGRR), shown by plat_present(). */
 #ifndef E2A_APP_GFX_H
 #define E2A_APP_GFX_H

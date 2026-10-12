@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Console side of platform.h. The VideoOut setup and the tiled framebuffer layout are adapted
  * from blackbearreloaded/ps5-native-app-boilerplate (src/demo_renderer.cpp, GPL-3.0-or-later,
  * hardware-validated on firmware 6.02 and 12.70); the scePad sample layout and the sceNet socket

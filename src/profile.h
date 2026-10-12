@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Per-game profiles: a subset of the ampr_pack TOML (rules with action / include / exclude).
  * Searched in <E2A_PROFILE_DIR>/<TITLE_ID>.toml, <usb>/homebrew/profiles/<TITLE_ID>.toml and
  * <source>/exfat2ampr.toml. Rules are applied after the blind profile; the last match wins. */

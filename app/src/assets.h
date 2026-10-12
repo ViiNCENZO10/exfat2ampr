@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Pictures loaded on a background thread, so the interface never waits for them:
  *  - game covers (icon0.png through the engine);
  *  - full-screen wallpapers made from a game's key art (sce_sys/pic0.png) or, without one, from

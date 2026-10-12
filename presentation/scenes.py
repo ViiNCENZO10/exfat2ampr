@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
 """The presentation video, scene by scene: what the app shows (a script for the host build, against the mock
 engine's made-up catalogue), what the English voice says, and the subtitles in the app's nine languages.
 

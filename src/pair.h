@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Device pairing for the web page: the console shows a 6-digit code (home-screen app, start
  * notification); a PC or phone that types it receives a random token, kept in
  * E2A_STATE_DIR/paired.txt, and sends it with every request. The app itself talks over

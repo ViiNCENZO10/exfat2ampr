@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Animation clock and helpers. Everything moves with the real frame time, so the motion keeps
  * the same speed whatever the frame rate. No libm: sine and exponential are computed here. */
 #ifndef E2A_APP_ANIM_H

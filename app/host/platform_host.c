@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Linux side of platform.h, for the CI: the same app code runs against tests/mock_engine.py and a
  * scripted controller, and writes screenshots (PPM) of the screens it reaches.
  *

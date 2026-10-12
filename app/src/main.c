@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * exFAT2AMPR home-screen app: a DualSense interface for the exfat2ampr engine.
  * The engine (privileged payload) does the work; this sandboxed title starts it through the ELF
  * loader when needed and drives its HTTP API on 127.0.0.1:6972. Conversions keep running when the

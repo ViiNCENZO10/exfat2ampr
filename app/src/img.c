@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * PNG -> image_t: game covers (icon0.png, with half-size levels for small draws) and wallpaper
  * sources (pic0.png key art cropped to the screen's 16:9). */
 #include "img.h"

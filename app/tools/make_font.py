@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
 """Rasterize the app's fonts into anti-aliased glyph tables for its CPU renderer.
 
 usage: make_font.py DejaVuSans.ttf DejaVuSans-Bold.ttf OUT.c [EXTRA.bin]

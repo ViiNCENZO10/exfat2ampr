@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Source tree scan + blind pack profile (same spirit as Lazy_AMPR's safety list). */
 #include "scan.h"
 

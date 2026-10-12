@@ -212,6 +212,16 @@ font jamais packer un fichier que la liste de sécurité garde en clair. La CI c
 
 ## Licence
 
+exFAT2AMPR - Copyright (C) 2026 V-10. Logiciel libre sous GNU GPL version 3 ou ultérieure (texte complet :
+`COPYING`), avec des conditions supplémentaires de l'article 7 (fichier `NOTICE`) :
+- toute copie ou version modifiée garde ce copyright et le crédit « Créé par V-10 » ;
+- une version modifiée se présente comme modifiée et ne se fait pas passer pour l'originale ;
+- le nom « exFAT2AMPR » et son logo ne sont pas cédés : une version modifiée diffusée porte un autre nom et une
+  autre icône.
+
+Retirer le nom de l'auteur ou diffuser le programme sous un autre nom d'auteur met fin aux droits accordés par
+la licence (article 8).
+
 GPL-3.0-or-later. Formats et heuristiques d'après drakmor/ampr_emu (GPL-3.0),
 LZ4 (BSD-2), ps5-payload-sdk (GPL-3.0). Polices de l'app : DejaVu Sans (licence
 Bitstream Vera / DejaVu), Noto Sans Thai et Noto Sans CJK (SIL Open Font License 1.1).

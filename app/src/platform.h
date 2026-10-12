@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * What the app needs from the system. platform_ps5.c implements it on the console
  * (VideoOut, scePad, sceNet, AudioOut); app/host/platform_host.c renders screenshots, a demo
  * video and its sound track on Linux. */

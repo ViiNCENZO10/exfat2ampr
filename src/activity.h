@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * What happens around the engine, checked every 2 s by a monitor thread:
  *  - games running on the console (process list + sceKernelGetAppInfo, as ShadowMountPlus does):
  *    game mode slows the conversion down so the game keeps its CPU and disk, and a game is never

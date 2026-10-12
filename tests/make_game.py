@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
 """Generate a synthetic PS5 game folder that exercises every packer path:
 compressible data, duplicated blocks (dedup), an incompressible 70 MiB file
 (auto-loose), tiny and empty files, loose system files, dump leftovers."""

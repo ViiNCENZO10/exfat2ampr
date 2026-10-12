@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
 # Downloads the app's build inputs (pinned) and generates app/src/font_data.c:
 #  - stb_image.h (public domain / MIT) for the game covers
 #  - qrcodegen (Project Nayuki, MIT) for the pairing QR code

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Trace-driven profiles: port of drakmor/ampr_emu tools/ampr_pack_profile.py (generate, exact
  * pattern mode) and of the AMPRCMD1 decoder of tools/parse_ampr_command_log.py.
  * Not ported: the index-size budget pass, lanes/groups (single group here), content sampling. */

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * ShadowMountPlus API client. Contract (from the SMP sources, sm_api_service.c):
  *  - every JSON route is POST, Content-Type: application/json, Content-Length required,
  *    body = one JSON object (max 4096 bytes), one request per connection (Connection: close);

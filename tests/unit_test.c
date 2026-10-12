@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE.
  * Host unit tests (CI): destination detection on simulated PS5 mount tables, AMPR compatibility.
  * Build: see .github/workflows/ps5.yml (unit tests step). */
 #include "common.h"
