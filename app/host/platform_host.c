@@ -281,6 +281,7 @@ int plat_https_get(const char *url, int (*sink)(void *ctx, const uint8_t *data, 
   int rc = pclose(p);
   return stopped || rc != 0 ? -1 : 200;
 }
+unsigned plat_https_last_error(void) { return 0; }
 
 const char *plat_asset_dir(void) { const char *a = getenv("E2A_ASSETS"); return a ? a : "assets"; }
 const char *plat_settings_path(void) { return "/tmp/e2a_app_settings.txt"; }

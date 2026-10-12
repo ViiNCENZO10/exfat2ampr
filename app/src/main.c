@@ -1147,7 +1147,14 @@ static void draw_settings(void) {
         case UPD_DOWNLOADING: snprintf(v, sizeof v, T(S_UPD_DOWNLOADING), pct); c = C_ACCENT; break;
         case UPD_INSTALLED: scopy(v, sizeof v, T(S_UPD_RESTART)); c = C_OK; break;
         case UPD_UNREACHABLE: scopy(v, sizeof v, T(S_UPD_UNREACHABLE)); break;
-        case UPD_FAILED: snprintf(v, sizeof v, T(S_UPD_FAILED), "…"); c = C_ERR; break;
+        case UPD_FAILED: {   /* the reason, cut for the row; the retry dialog shows it in full */
+          char why[200];
+          update_state(NULL, NULL, 0, NULL, why, sizeof why);
+          if (strlen(why) > 44) scopy(why + 41, 4, "…");
+          snprintf(v, sizeof v, T(S_UPD_FAILED), why[0] ? why : "?");
+          c = C_ERR;
+          break;
+        }
         default: scopy(v, sizeof v, T(S_UPD_CHECKING)); break;
       }
       gfx_text_right(&FONT_BODY, x + w - 40, ry + 30, v, c);
@@ -1901,6 +1908,7 @@ static void handle_input(uint32_t p) {
           fmt_bytes(sz, sizeof sz, (double)size);
           snprintf(q, sizeof q, T(S_UPD_INSTALL_Q), ver, sz);
           confirm(ACT_UPDATE, q);
+          if (us == UPD_FAILED) update_state(NULL, NULL, 0, NULL, g_confirm_detail, sizeof g_confirm_detail);   /* why it failed */
         } else if (us != UPD_DOWNLOADING && us != UPD_INSTALLED) update_check(app_version());
         snd_cue_frame(SND_SELECT);
       }

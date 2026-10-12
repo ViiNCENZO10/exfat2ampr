@@ -60,6 +60,7 @@ int sceHttpSetRecvTimeOut(int id, uint32_t usec);
 int sceHttpsEnableOption(int id, uint32_t flags);
 int sceHttpSendRequest(int request, const void *data, size_t size);
 int sceHttpGetStatusCode(int request, int *status);
+int sceHttpGetAllResponseHeaders(int request, char **headers, size_t *size);
 int sceHttpReadData(int request, void *data, size_t size);
 int sceAudioOutInit(void);
 int sceAudioOutOpen(int user, int type, int index, uint32_t len, uint32_t freq, uint32_t param);
@@ -264,11 +265,20 @@ const char *plat_settings_path(void) { return "/download0/settings.txt"; }
 /* The console's HTTPS: sceHttp and sceSsl with the system's certificate store. Sequence and option values
  * from ps5-native-app-boilerplate's examples/update-check (UPDATE_CHECK_USE_SCEHTTP, GPL-3.0-or-later),
  * proven on hardware for sandboxed apps like this one. */
-int plat_https_get(const char *url, int (*sink)(void *ctx, const uint8_t *data, size_t len), void *ctx, bool follow) {
+static unsigned g_https_err;   /* the library's error code of the last failure, for the message shown */
+unsigned plat_https_last_error(void) { return g_https_err; }
+
+/* GET over HTTPS through the console's own library, the body handed to sink as it arrives. A redirect (a
+ * GitHub release download answers 302 towards objects.githubusercontent.com) is followed by the library
+ * when it does so, and by hand otherwise: up to five hops, read from the Location header. */
+int plat_https_get(const char *url0, int (*sink)(void *ctx, const uint8_t *data, size_t len), void *ctx, bool follow) {
   enum { NET_POOL = 1024 * 1024, SSL_POOL = 304 * 1024, HTTP_POOL = 4 * 1024 * 1024, HTTP_1_1 = 2, GET = 0,
          VERIFY = 0x01 | 0x04 | 0x08 | 0x10 | 0x20 | 0x80 };   /* server, name, dates, known CA, SNI */
+  static char url[2048];   /* one transfer at a time: the update thread (a signed download URL is long) */
   int pool = -1, ssl = -1, http = -1, tmpl = -1, conn = -1, req = -1, status = 0, rc;
-  uint32_t recv_us = follow ? 30000000u : 8000000u;
+  uint32_t recv_us = follow ? 60000000u : 8000000u;
+  g_https_err = 0;
+  snprintf(url, sizeof url, "%s", url0);
   rc = pool = sceNetPoolCreate("e2a_https", NET_POOL, 0);
   if (rc >= 0) rc = ssl = sceSslInit(SSL_POOL);
   if (rc >= 0) rc = http = sceHttpInit(pool, ssl, HTTP_POOL);
@@ -279,12 +289,35 @@ int plat_https_get(const char *url, int (*sink)(void *ctx, const uint8_t *data, 
   if (rc >= 0) rc = sceHttpSetSendTimeOut(tmpl, 8000000u);
   if (rc >= 0) rc = sceHttpSetRecvTimeOut(tmpl, recv_us);
   if (rc >= 0) rc = sceHttpsEnableOption(tmpl, VERIFY);
-  if (rc >= 0) rc = conn = sceHttpCreateConnectionWithURL(tmpl, url, 0);
-  if (rc >= 0) rc = req = sceHttpCreateRequestWithURL(conn, GET, url, 0);
-  if (rc >= 0) rc = sceHttpSendRequest(req, NULL, 0);
-  if (rc >= 0) rc = sceHttpGetStatusCode(req, &status);
+  for (int hop = 0; rc >= 0 && hop < 6; hop++) {
+    rc = conn = sceHttpCreateConnectionWithURL(tmpl, url, 0);
+    if (rc >= 0) rc = req = sceHttpCreateRequestWithURL(conn, GET, url, 0);
+    if (rc >= 0) rc = sceHttpSendRequest(req, NULL, 0);
+    if (rc >= 0) rc = sceHttpGetStatusCode(req, &status);
+    if (rc < 0) break;
+    if (!follow || (status != 301 && status != 302 && status != 303 && status != 307 && status != 308)) break;
+    /* the library left the redirect to us: the Location header, then the same request on the new address */
+    char *hdr = NULL;
+    size_t hlen = 0;
+    bool found = false;
+    if (sceHttpGetAllResponseHeaders(req, &hdr, &hlen) >= 0 && hdr) {
+      for (size_t i = 0; i + 9 < hlen; i++) {
+        if (i > 0 && hdr[i - 1] != '\n') continue;
+        if (strncmp(hdr + i, "Location:", 9) != 0 && strncmp(hdr + i, "location:", 9) != 0) continue;
+        size_t s = i + 9, e;
+        while (s < hlen && (hdr[s] == ' ' || hdr[s] == '\t')) s++;
+        for (e = s; e < hlen && hdr[e] != '\r' && hdr[e] != '\n'; e++) {}
+        if (e > s && e - s < sizeof url && hdr[s] == 'h') { memcpy(url, hdr + s, e - s); url[e - s] = 0; found = true; }
+        break;
+      }
+    }
+    sceHttpDeleteRequest(req); req = -1;
+    sceHttpDeleteConnection(conn); conn = -1;
+    if (!found) break;   /* the 3xx status is reported as it is */
+    status = 0;
+  }
   if (rc >= 0 && status == 200) {
-    static uint8_t buf[64 * 1024];   /* one transfer at a time: the update thread */
+    static uint8_t buf[64 * 1024];
     for (;;) {
       int got = sceHttpReadData(req, buf, sizeof buf);
       if (got < 0) { rc = got; break; }
@@ -292,6 +325,7 @@ int plat_https_get(const char *url, int (*sink)(void *ctx, const uint8_t *data, 
       if (sink(ctx, buf, (size_t)got) != 0) { rc = -1; break; }
     }
   }
+  if (rc < -1) g_https_err = (unsigned)rc;
   if (req >= 0) sceHttpDeleteRequest(req);
   if (conn >= 0) sceHttpDeleteConnection(conn);
   if (tmpl >= 0) sceHttpDeleteTemplate(tmpl);

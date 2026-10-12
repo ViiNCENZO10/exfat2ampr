@@ -48,6 +48,8 @@ const char *plat_icon_path(void);             /* the app's own icon0.png */
 /* HTTPS GET (the app's update): every piece of the body goes to sink (non-zero stops the transfer); follow:
  * redirects followed (a release download). Returns the HTTP status, < 0 when no server answers. */
 int plat_https_get(const char *url, int (*sink)(void *ctx, const uint8_t *data, size_t len), void *ctx, bool follow);
+/* the library's error code of the last plat_https_get that failed (0 when there is none): shown to the user */
+unsigned plat_https_last_error(void);
 
 /* sound: the platform's audio thread pulls 48 kHz stereo 16-bit samples from mix(); < 0 = no output */
 int plat_audio_start(void (*mix)(int16_t *lr, int frames));

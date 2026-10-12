@@ -181,11 +181,24 @@ static void *install_thread(void *arg) {
   u.total = size;
   u.piece = malloc(PIECE);
   if (!u.piece) { set_state(UPD_FAILED, "out of memory"); return NULL; }
-  st = plat_https_get(package, to_engine, &u, true);
-  if (st == 200 && !u.err[0] && u.used) send_piece(&u);
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (attempt) {   /* once more from the start: the engine truncates its file */
+      st = api_call("/api/update/begin", form, &d);
+      json_free(&d);
+      if (st != 200) break;
+      u.off = 0; u.used = 0; u.err[0] = 0;
+    }
+    st = plat_https_get(package, to_engine, &u, true);
+    if (st == 200 && !u.err[0] && u.used) send_piece(&u);
+    if (st == 200 && !u.err[0]) break;
+    if (!u.err[0]) {
+      if (st < 0) snprintf(u.err, sizeof u.err, "download failed (%d, 0x%08x)", st, plat_https_last_error());
+      else snprintf(u.err, sizeof u.err, "download answered HTTP %d", st);
+    }
+  }
   free(u.piece);
   if (st != 200 || u.err[0]) {
-    if (!u.err[0]) snprintf(u.err, sizeof u.err, st < 0 ? "download failed (%d)" : "download answered HTTP %d", st);
+    if (!u.err[0]) snprintf(u.err, sizeof u.err, "engine refused to restart the download (HTTP %d)", st);
     set_state(UPD_FAILED, u.err);
     return NULL;
   }
