@@ -253,7 +253,7 @@ jobs:
             mkdir -p "shots/$name"
             local mp=""
             if [ "$port" != 1 ]; then
-              env "$@" python3 app/host/mock_engine.py "$port" "$V" &
+              env "$@" python3 app/host/mock_engine.py "$port" "$V" > "mock_$name.log" 2>&1 &
               mp=$!
               sleep 1
             fi
@@ -266,6 +266,11 @@ jobs:
                 triangle wait:700 shot:10_paused r1 wait:700 shot:11_interrupted r1 wait:700 shot:12_settings
                 down down down down cross wait:900 shot:13_pair circle"
           run fr 2 18001 "$MAIN" MOCK_STORAGE=several
+          # the app's own log reached the engine: its start, the engine's answer, the screens visited
+          grep "\[applog\]" mock_fr.log | head -20
+          grep -q "\[applog\].*app starting" mock_fr.log
+          grep -q "\[applog\].*engine ready" mock_fr.log
+          test "$(grep -c "\[applog\].*ui: screen" mock_fr.log)" -ge 3
           run en 1 18002 "$MAIN" MOCK_STORAGE=several
           run ru 8 18003 "wait:3000 shot:01_games cross wait:600 down cross wait:800 shot:02_destinations" MOCK_STORAGE=several
           run usb_none 2 18004 "wait:2600 cross wait:600 down cross wait:800 shot:01_destinations circle up cross wait:1500 shot:02_check" MOCK_STORAGE=none

@@ -1,11 +1,22 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE. */
 #include "api.h"
+#include "log.h"
 #include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* the engine not answering is noted once in a while; never for the log shipping itself (it would feed itself) */
+static void api_note_down(const char *path, int status) {
+  static uint64_t last;
+  if (strncmp(path, "/api/applog", 11) == 0) return;
+  uint64_t now = plat_ms();
+  if (last && now - last < 10000) return;
+  last = now;
+  app_log("api: %.60s -> %s", path, status < 0 ? "no answer from the engine" : "bad answer");
+}
 
 static int send_all(int s, const void *buf, size_t len) {
   const uint8_t *p = buf;
@@ -22,7 +33,7 @@ static int http_body(const char *method, const char *path, const void *data, siz
                      size_t *outlen) {
   *out = NULL; *outlen = 0;
   int s = plat_tcp_connect(ENGINE_PORT, 1500);
-  if (s < 0) return -1;
+  if (s < 0) { api_note_down(path, -1); return -1; }
   char head[4096];
   int hn = data ? snprintf(head, sizeof head,
                            "%s %s HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: %s\r\n"
@@ -51,7 +62,7 @@ static int http_body(const char *method, const char *path, const void *data, siz
   int status = -1;
   if (n > 12 && !strncmp((char *)buf, "HTTP/1.", 7)) status = atoi((char *)buf + 9);
   char *body = strstr((char *)buf, "\r\n\r\n");
-  if (status < 0 || !body) { free(buf); return -1; }
+  if (status < 0 || !body) { api_note_down(path, 0); free(buf); return -1; }
   body += 4;
   size_t blen2 = n - (size_t)(body - (char *)buf);
   memmove(buf, body, blen2);

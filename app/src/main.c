@@ -14,6 +14,7 @@
 #include "i18n.h"
 #include "img.h"
 #include "json.h"
+#include "log.h"
 #include "platform.h"
 #include "qr.h"
 #include "sound.h"
@@ -82,8 +83,8 @@ typedef struct {
 } options_t;
 
 enum { TAB_GAMES, TAB_PROGRESS, TAB_RESUME, TAB_SETTINGS, TAB_COUNT };
-enum { SCR_BOOT, SCR_MAIN, SCR_OPTIONS, SCR_PAIR, SCR_DEST, SCR_CHECK, SCR_OPTIMIZE };
-enum { SET_LANG, SET_GAME_MODE, SET_SOUNDS, SET_ANIMS, SET_PAIR, SET_PLUGINS, SET_UPDATE, SET_QUIT, SET_COUNT };
+enum { SCR_BOOT, SCR_MAIN, SCR_OPTIONS, SCR_PAIR, SCR_DEST, SCR_CHECK, SCR_OPTIMIZE, SCR_LOG };
+enum { SET_LANG, SET_GAME_MODE, SET_SOUNDS, SET_ANIMS, SET_PAIR, SET_PLUGINS, SET_UPDATE, SET_LOG, SET_QUIT, SET_COUNT };
 enum { TOAST_INFO, TOAST_OK, TOAST_ERR };
 
 static game_t g_games[MAX_GAMES];
@@ -147,6 +148,7 @@ static void scopy(char *dst, size_t cap, const char *src) {
 }
 
 static void toast_kind(const char *msg, int kind) {
+  app_log("%s: %.150s", kind == TOAST_ERR ? "error" : kind == TOAST_OK ? "ok" : "note", msg);
   scopy(g_toast, sizeof g_toast, msg);
   g_toast_at = plat_ms();
   g_toast_until = g_toast_at + 3600;
@@ -425,6 +427,9 @@ static void poll_status(void) {
     last_rev = s.storage_rev;
   }
   if (memcmp(&s, &g_st, sizeof s) != 0) {
+    if (s.ok != g_st.ok || strcmp(s.state, g_st.state) != 0 || strcmp(s.phase, g_st.phase) != 0 || strcmp(s.title_id, g_st.title_id) != 0 ||
+        strcmp(s.version, g_st.version) != 0)
+      app_log("engine %.12s: %s%.16s / %.24s %.12s %.100s", s.version, s.ok ? "" : "no answer, ", s.state, s.phase, s.title_id, s.message);
     bool finished = g_st.ok && !strcmp(g_st.state, "running") && strcmp(s.state, "running") != 0;
     bool started = g_st.ok && !strcmp(s.state, "running") &&
                    (strcmp(g_st.state, "running") != 0 || (g_st.title_id[0] && strcmp(g_st.title_id, s.title_id) != 0));
@@ -1109,7 +1114,7 @@ static void draw_resume(void) {
 static void draw_settings(void) {
   const int x = 80, y = 230, w = 1060, h = 730, row = 88;
   panel(x, y, w, h);
-  const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_GAME_MODE), T(S_SOUNDS), T(S_ANIMS), T(S_PAIR), T(S_PLUGINS), T(S_UPDATES), T(S_QUIT_APP)};
+  const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_GAME_MODE), T(S_SOUNDS), T(S_ANIMS), T(S_PAIR), T(S_PLUGINS), T(S_UPDATES), T(S_LOG), T(S_QUIT_APP)};
   static anim_val sel_v, tog[3];
   float sv = anim_track(&sel_v, (float)g_set_sel, 22.0f, 0.002f);
   row_push(g_set_sel);
@@ -1130,6 +1135,11 @@ static void draw_settings(void) {
     else if (i == SET_SOUNDS) draw_toggle(x + w - 140, ry + 20, snd_enabled(), C_ACCENT, &tog[1]);
     else if (i == SET_ANIMS) draw_toggle(x + w - 140, ry + 20, g_anim_enabled, C_ACCENT, &tog[2]);
     else if (i == SET_PAIR) gfx_text_right(&FONT_HEAD, x + w - 44, ry + 25, "›", C_DIM);
+    else if (i == SET_LOG) {   /* how many lines the app has noted so far */
+      char n[32];
+      snprintf(n, sizeof n, "%d  ›", app_log_count());
+      gfx_text_right(&FONT_HEAD, x + w - 44, ry + 25, n, C_DIM);
+    }
     else if (i == SET_PLUGINS) {   /* the embedded releases and the last pass over the games */
       char v[160];
       if (!g_plug.ok) scopy(v, sizeof v, "…");
@@ -1328,6 +1338,34 @@ static void draw_pair(void) {
   gfx_pop();
 }
 
+/* the app's own log: the newest lines at the bottom, the whole screen for them */
+#define LOG_ROWS 26
+static int g_log_scroll;   /* lines hidden below the window (0: the newest line is the last row) */
+static void draw_log(void) {
+  gfx_text(&FONT_TITLE, 80, 60, T(S_LOG_TITLE), C_TEXT, 1400);
+  panel(80, 170, 1760, 790);
+  static char lines[LOG_ROWS][APP_LOG_LEN];
+  int n = app_log_copy(lines, LOG_ROWS, g_log_scroll);
+  if (n == 0) gfx_text(&FONT_BODY, 120, 220, T(S_LOG_EMPTY), C_DIM, 1600);
+  int step = FONT_SMALL.line + 2, y = 200;
+  for (int i = 0; i < n; i++, y += step) {
+    const char *l = lines[i];
+    const char *sp = strchr(l, ' ');   /* "seconds.ms message": the time in a dimmer colour */
+    if (sp && sp - l < 16) {
+      char ts[20];
+      snprintf(ts, sizeof ts, "%.*s", (int)(sp - l), l);
+      gfx_text(&FONT_SMALL, 120, y, ts, C_DIM, 150);
+      gfx_text(&FONT_SMALL, 290, y, sp + 1, C_TEXT, 1500);
+    } else gfx_text(&FONT_SMALL, 120, y, l, C_TEXT, 1670);
+  }
+  char pos[64];
+  int total = app_log_count();
+  if (g_log_scroll) snprintf(pos, sizeof pos, "%d / %d", total - g_log_scroll, total);
+  else snprintf(pos, sizeof pos, "%d", total);
+  gfx_text_right(&FONT_SMALL, 1800, 930, pos, C_DIM);
+  gfx_text(&FONT_SMALL, 120, 930, T(S_LOG_HINT), C_DIM, 1400);
+}
+
 /* start screen: the app icon in a breathing halo, a spinner while the engine gets ready */
 static void draw_boot(void) {
   const int cx = SCREEN_W / 2, s = 220;
@@ -1510,6 +1548,11 @@ static void draw(void) {
       int icons[] = {ICON_SQUARE, ICON_CIRCLE};
       str_id labels[] = {S_PAIR_RESET, S_BACK};
       draw_hints(icons, labels, 2);
+    } else if (g_screen == SCR_LOG) {
+      draw_log();
+      int icons[] = {ICON_DPAD, ICON_CIRCLE};
+      str_id labels[] = {S_LOG, S_BACK};
+      draw_hints(icons, labels, 2);
     } else if (g_screen == SCR_DEST) {
       draw_dest();
       int icons[] = {ICON_CROSS, ICON_CIRCLE, ICON_SQUARE, ICON_TRIANGLE, ICON_OPTIONS};
@@ -1592,6 +1635,7 @@ static void boot(void) {
     g_boot_want[strcspn(g_boot_want, "\r\n ")] = 0;
     free(v);
   }
+  app_log("app version %.16s: looking for the engine", g_boot_want[0] ? g_boot_want : "dev");
   __atomic_store_n(&g_boot_state, 1, __ATOMIC_RELEASE);
   pthread_t th;
   pthread_attr_t at;
@@ -1606,6 +1650,7 @@ static void boot(void) {
 static void boot_finish(void) {
   if (plat_ms() - g_boot_started < SPLASH_MS) return;
   __atomic_store_n(&g_boot_state, 0, __ATOMIC_RELEASE);
+  app_log("engine ready: result %d, version %.16s (the app shipped with %.16s)", g_boot_result, g_engine_version, g_boot_want);
   switch (g_boot_result) {
     case ENGINE_OK: break;
     case ENGINE_STARTED: toast_kind(T(S_ENGINE_STARTED), TOAST_OK); snd_cue_frame(SND_NOTIFY); break;
@@ -1668,6 +1713,18 @@ static void handle_input(uint32_t p) {
   if (g_screen == SCR_PAIR) {
     if (p & BTN_CIRCLE) { g_screen = SCR_MAIN; snd_cue_frame(SND_BACK); }
     if (p & BTN_SQUARE) { confirm(ACT_PAIR_RESET, T(S_PAIR_RESET_CONFIRM)); snd_cue_frame(SND_SELECT); }
+    return;
+  }
+  if (g_screen == SCR_LOG) {   /* up/down: one line, L1/R1: one page; the newest lines at the bottom */
+    int total = app_log_count(), page = LOG_ROWS;
+    if (p & BTN_CIRCLE) { g_screen = SCR_MAIN; snd_cue_frame(SND_BACK); }
+    if (p & BTN_UP) g_log_scroll++;
+    if (p & BTN_DOWN) g_log_scroll--;
+    if (p & BTN_L1) g_log_scroll += page;
+    if (p & BTN_R1) g_log_scroll -= page;
+    if (g_log_scroll > total - page) g_log_scroll = total - page;
+    if (g_log_scroll < 0) g_log_scroll = 0;
+    g_dirty = true;
     return;
   }
   if (g_screen == SCR_DEST) {
@@ -1897,6 +1954,7 @@ static void handle_input(uint32_t p) {
         settings_save();
       }
       if (g_set_sel == SET_PAIR && (p & BTN_CROSS)) { load_pair(); g_screen = SCR_PAIR; snd_cue_frame(SND_SELECT); }
+      if (g_set_sel == SET_LOG && (p & BTN_CROSS)) { g_log_scroll = 0; g_screen = SCR_LOG; snd_cue_frame(SND_SELECT); }
       if (g_set_sel == SET_PLUGINS && (p & BTN_CROSS)) {   /* every game and ShadowMountPlus' emulator folder, in the background */
         jdoc d;
         if (api_call("/api/plugins/refresh", "all=1", &d) == 200) { toast(T(S_PLUG_STARTED)); g_plug.running = true; g_plug.ok = true; }
@@ -1922,7 +1980,7 @@ static void handle_input(uint32_t p) {
   }
 }
 
-static int screen_depth(int s) { return s == SCR_BOOT ? 0 : s == SCR_MAIN ? 1 : s == SCR_OPTIONS || s == SCR_PAIR || s == SCR_OPTIMIZE ? 2 : 3; }
+static int screen_depth(int s) { return s == SCR_BOOT ? 0 : s == SCR_MAIN ? 1 : s == SCR_OPTIONS || s == SCR_PAIR || s == SCR_OPTIMIZE || s == SCR_LOG ? 2 : 3; }
 
 static void handle(uint32_t p) {
   if (!p) return;
@@ -1964,6 +2022,8 @@ int main(void) {
     for (;;) plat_sleep_ms(1000);
   }
   settings_load();
+  app_log_start();
+  app_log("app starting, language %d, engine port %d", i18n_get(), ENGINE_PORT);
   pthread_t fth;
   pthread_attr_t fat;
   pthread_attr_init(&fat);
@@ -1982,6 +2042,12 @@ int main(void) {
     uint32_t pressed = read_pressed();
     if (pressed) anim_input(start);
     handle(pressed);
+    {   /* breadcrumbs: where the user was when something went wrong */
+      static int last_screen = -1, last_tab = -1;
+      static unsigned log_seen;
+      if (g_screen != last_screen || g_tab != last_tab) { app_log("ui: screen %d, tab %d", g_screen, g_tab); last_screen = g_screen; last_tab = g_tab; }
+      if (g_screen == SCR_LOG && app_log_rev() != log_seen) { log_seen = app_log_rev(); g_dirty = true; }
+    }
     if (__atomic_load_n(&g_boot_state, __ATOMIC_ACQUIRE) == 2) boot_finish();
     uint64_t now = plat_ms();
     if (g_screen != SCR_BOOT && now >= next_poll) {

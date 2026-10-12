@@ -41,11 +41,48 @@ void e2a_notify(const char *fmt, ...) {
 }
 
 /* ------------------------------------------------------------------- log -- */
-#define LOG_LINES 64
+#define LOG_LINES 256
 #define LOG_LINE_LEN 256
-static char g_log[LOG_LINES][LOG_LINE_LEN];
-static int g_log_head = 0, g_log_count = 0;
+typedef struct { char lines[LOG_LINES][LOG_LINE_LEN]; int head, count; uint64_t seq; } logring;
+static logring g_log;      /* the engine's own lines */
+static logring g_applog;   /* the home-screen app's lines, delivered over the local API: they outlive the app */
 static pthread_mutex_t g_log_mx = PTHREAD_MUTEX_INITIALIZER;
+
+static void ring_push(logring *r, const char *line) {   /* under g_log_mx */
+  snprintf(r->lines[r->head], LOG_LINE_LEN, "%.255s", line);
+  r->head = (r->head + 1) % LOG_LINES;
+  if (r->count < LOG_LINES) r->count++;
+  r->seq++;
+}
+
+/* JSON array of the lines newer than `since` (as many as fit); returns the newest sequence number, so the
+ * next call asks for what came after */
+static uint64_t ring_since(logring *r, uint64_t since, char *out, size_t cap) {
+  size_t pos = 0;
+  if (cap < 3) { if (cap) out[0] = 0; return 0; }
+  out[pos++] = '[';
+  pthread_mutex_lock(&g_log_mx);
+  uint64_t newest = r->seq, oldest = newest - (uint64_t)r->count;   /* the lines (oldest, newest] are kept */
+  uint64_t skip = since > oldest ? since : oldest;
+  int start = (r->head - r->count + LOG_LINES) % LOG_LINES;
+  bool any = false;
+  for (uint64_t s = skip; s < newest; s++) {
+    char esc[LOG_LINE_LEN * 6 + 8];
+    e2a_json_escape(r->lines[(start + (int)(s - oldest)) % LOG_LINES], esc, sizeof esc);
+    size_t n = strlen(esc);
+    if (pos + n + 5 > cap) break;
+    if (any) out[pos++] = ',';
+    out[pos++] = '"';
+    memcpy(out + pos, esc, n);
+    pos += n;
+    out[pos++] = '"';
+    any = true;
+  }
+  pthread_mutex_unlock(&g_log_mx);
+  out[pos++] = ']';
+  out[pos] = 0;
+  return newest;
+}
 
 void e2a_log(const char *fmt, ...) {
   char line[LOG_LINE_LEN];
@@ -55,9 +92,7 @@ void e2a_log(const char *fmt, ...) {
   va_end(ap);
 
   pthread_mutex_lock(&g_log_mx);
-  memcpy(g_log[g_log_head], line, LOG_LINE_LEN);
-  g_log_head = (g_log_head + 1) % LOG_LINES;
-  if (g_log_count < LOG_LINES) g_log_count++;
+  ring_push(&g_log, line);
   pthread_mutex_unlock(&g_log_mx);
 
   fprintf(stderr, "[exfat2ampr] %s\n", line);
@@ -72,22 +107,64 @@ void e2a_log(const char *fmt, ...) {
   }
 }
 
-/* copy of the last log lines, taken under the log mutex (safe from any thread) */
+/* copy of the newest log lines that fit, taken under the log mutex (safe from any thread) */
 void e2a_log_tail_copy(char *out, size_t cap) {
   pthread_mutex_lock(&g_log_mx);
-  size_t pos = 0;
   if (cap) out[0] = 0;
-  int start = (g_log_head - g_log_count + LOG_LINES) % LOG_LINES;
-  for (int i = 0; i < g_log_count && cap; i++) {
-    const char *l = g_log[(start + i) % LOG_LINES];
+  int start = (g_log.head - g_log.count + LOG_LINES) % LOG_LINES, first = g_log.count;
+  size_t need = 0;
+  for (int i = g_log.count - 1; i >= 0; i--) {   /* from the newest back: how many fit */
+    size_t n = strlen(g_log.lines[(start + i) % LOG_LINES]) + 1;
+    if (need + n + 1 > cap) break;
+    need += n;
+    first = i;
+  }
+  size_t pos = 0;
+  for (int i = first; i < g_log.count; i++) {
+    const char *l = g_log.lines[(start + i) % LOG_LINES];
     size_t n = strlen(l);
-    if (pos + n + 2 >= cap) break;
     memcpy(out + pos, l, n);
     pos += n;
     out[pos++] = '\n';
     out[pos] = 0;
   }
   pthread_mutex_unlock(&g_log_mx);
+}
+
+uint64_t e2a_log_since(uint64_t since, char *out, size_t cap) { return ring_since(&g_log, since, out, cap); }
+uint64_t e2a_applog_since(uint64_t since, char *out, size_t cap) { return ring_since(&g_applog, since, out, cap); }
+
+/* lines from the home-screen app ('\n' separated), stamped with the engine's clock, kept in memory and
+ * appended to E2A_APPLOG_FILE (rotated past a megabyte: the previous one stays as .old) */
+void e2a_applog_add(const char *text, size_t len) {
+  char ts[16];
+  time_t t = time(NULL);
+  struct tm tm;
+  localtime_r(&t, &tm);
+  strftime(ts, sizeof ts, "%H:%M:%S", &tm);
+  struct stat st;
+  if (stat(E2A_APPLOG_FILE, &st) == 0 && st.st_size > (1 << 20)) rename(E2A_APPLOG_FILE, E2A_APPLOG_FILE ".old");
+  FILE *f = fopen(E2A_APPLOG_FILE, "a");
+  size_t i = 0;
+  while (i < len) {
+    size_t e = i;
+    while (e < len && text[e] != '\n') e++;
+    size_t n = e - i;
+    while (n && (text[i + n - 1] == '\r' || text[i + n - 1] == ' ')) n--;
+    if (n) {
+      char line[LOG_LINE_LEN];
+      snprintf(line, sizeof line, "%.15s %.*s", ts, (int)(n < 238 ? n : 238), text + i);
+      pthread_mutex_lock(&g_log_mx);
+      ring_push(&g_applog, line);
+      pthread_mutex_unlock(&g_log_mx);
+      if (f) fprintf(f, "%04d-%02d-%02d %s\n", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, line);
+#ifdef E2A_HOST
+      fprintf(stderr, "[app] %s\n", line);
+#endif
+    }
+    i = e + 1;
+  }
+  if (f) fclose(f);
 }
 
 void e2a_json_escape(const char *in, char *out, size_t cap) {

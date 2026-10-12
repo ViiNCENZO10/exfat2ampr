@@ -9,6 +9,7 @@
  * is the fallback. */
 #ifndef E2A_APP_HOST
 #include "platform.h"
+#include "log.h"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -22,6 +23,7 @@ int sceKernelAllocateDirectMemory(int64_t start, int64_t end, size_t len, size_t
 int sceKernelMapDirectMemory(void **addr, size_t len, int prot, int flags, int64_t phys, size_t align);
 int sceKernelSendNotificationRequest(int device, void *request, size_t size, int blocking);
 int sceKernelUsleep(unsigned int us);
+int sceKernelDebugOutText(int channel, const char *text);   /* the text goes to the kernel log as it is (no format) */
 uint64_t sceKernelGetProcessTime(void);
 int sceSystemServiceHideSplashScreen(void);
 int sceSystemServiceLoadExec(const char *path, const char **argv);
@@ -188,6 +190,12 @@ uint64_t plat_ms(void) { return sceKernelGetProcessTime() / 1000u; }
 int plat_pid(void) { return (int)getpid(); }
 void plat_sleep_ms(unsigned ms) { (void)sceKernelUsleep(ms * 1000u); }
 
+void plat_debug_text(const char *line) {
+  char buf[APP_LOG_LEN + 24];
+  snprintf(buf, sizeof buf, "[exfat2ampr] %.200s\n", line);
+  (void)sceKernelDebugOutText(0, buf);
+}
+
 void plat_notify(const char *msg) {
   static struct { char unused[45]; char message[3075]; } req;
   memset(&req, 0, sizeof req);
@@ -292,12 +300,15 @@ int plat_https_get(const char *url0, int (*sink)(void *ctx, const uint8_t *data,
   if (rc >= 0) rc = sceHttpSetSendTimeOut(tmpl, 8000000u);
   if (rc >= 0) rc = sceHttpSetRecvTimeOut(tmpl, recv_us);
   if (rc >= 0) rc = sceHttpsEnableOption(tmpl, VERIFY);
+  char host[80];
+  if (rc < 0) app_log("https: setup failed 0x%08x", (unsigned)rc);
   for (int hop = 0; rc >= 0 && hop < 6; hop++) {
     rc = conn = sceHttpCreateConnectionWithURL(tmpl, url, 0);
     if (rc >= 0) rc = req = sceHttpCreateRequestWithURL(conn, GET, url, 0);
     if (rc >= 0) rc = sceHttpSendRequest(req, NULL, 0);
     if (rc >= 0) rc = sceHttpGetStatusCode(req, &status);
-    if (rc < 0) break;
+    if (rc < 0) { app_log("https: %s failed 0x%08x (hop %d)", app_log_host(url, host, sizeof host), (unsigned)rc, hop); break; }
+    app_log("https: %s -> %d (hop %d)", app_log_host(url, host, sizeof host), status, hop);
     if (!follow || (status != 301 && status != 302 && status != 303 && status != 307 && status != 308)) break;
     /* the library left the redirect to us: the Location header, then the same request on the new address */
     char *hdr = NULL;
@@ -319,16 +330,19 @@ int plat_https_get(const char *url0, int (*sink)(void *ctx, const uint8_t *data,
     }
     sceHttpDeleteRequest(req); req = -1;
     sceHttpDeleteConnection(conn); conn = -1;
-    if (!found) break;   /* the 3xx status is reported as it is (also after too many hops) */
+    if (!found) { app_log("https: redirect without a usable Location header"); break; }   /* the 3xx status is reported as it is */
   }
   if (rc >= 0 && status == 200) {
     static uint8_t buf[64 * 1024];
+    unsigned long long total = 0;
     for (;;) {
       int got = sceHttpReadData(req, buf, sizeof buf);
-      if (got < 0) { rc = got; break; }
+      if (got < 0) { rc = got; app_log("https: read failed 0x%08x after %llu bytes", (unsigned)got, total); break; }
       if (got == 0) break;
-      if (sink(ctx, buf, (size_t)got) != 0) { rc = -1; break; }
+      total += (unsigned long long)got;
+      if (sink(ctx, buf, (size_t)got) != 0) { rc = -1; app_log("https: stopped by the receiver after %llu bytes", total); break; }
     }
+    if (rc >= 0) app_log("https: %llu bytes received", total);
   }
   if (rc < -1) g_https_err = (unsigned)rc;
   if (req >= 0) sceHttpDeleteRequest(req);

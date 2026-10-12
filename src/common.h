@@ -30,6 +30,7 @@
 #define E2A_APPMETA_DIR "/user/appmeta"   /* the system's copy of every registered title's icon0.png / pic0.png */
 #endif
 #define E2A_LOG_FILE E2A_STATE_DIR "/exfat2ampr.log"
+#define E2A_APPLOG_FILE E2A_STATE_DIR "/app.log"   /* the home-screen app's log, delivered over the local API */
 #define E2A_PROFILE_DIR E2A_STATE_DIR "/profiles"
 #define E2A_AMPR_RUNTIME_VERSION "0.4.2.1"   /* embedded libSceAmpr.sprx (drakmor/ampr_emu release) */
 #define E2A_AMPR_FORMAT "AMPRPAK4"
@@ -70,6 +71,11 @@ uint64_t e2a_fnv1a64_fold(const void *buf, size_t len);
 void e2a_fold_ascii(char *s);
 double e2a_now(void);
 void e2a_log_tail_copy(char *out, size_t cap);  /* last lines of the in-memory log (for the web UI) */
+/* incremental reads: a JSON array of the lines after `since`, and the newest sequence number to ask from next time */
+uint64_t e2a_log_since(uint64_t since, char *json_array, size_t cap);
+/* the home-screen app's own log: lines it delivers ('\n' separated), kept here so they outlive the app */
+void e2a_applog_add(const char *text, size_t len);
+uint64_t e2a_applog_since(uint64_t since, char *json_array, size_t cap);
 void e2a_json_escape(const char *in, char *out, size_t cap);
 
 /* sha256.c */

@@ -11,6 +11,7 @@
  *   E2A_VIDEO_FULL=1        the same at the screen's own 1920x1080 (the presentation video)
  *   E2A_AUDIO_WAV=demo.wav  what the app's mixer plays, 48 kHz stereo */
 #include "../src/platform.h"
+#include "../src/log.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -269,19 +270,23 @@ int plat_write_file(const char *path, const void *data, size_t len) {
 /* the CI: curl stands in for the console's sceHttp (the mock engine serves the manifest and the package) */
 int plat_https_get(const char *url, int (*sink)(void *ctx, const uint8_t *data, size_t len), void *ctx, bool follow) {
   (void)follow;
-  if (strchr(url, '\'') || strlen(url) > 900) return -1;
+  char host[80];
+  if (strchr(url, '\'') || strlen(url) > 900) { app_log("https: %s refused (bad address)", app_log_host(url, host, sizeof host)); return -1; }
   char cmd[1024];
   snprintf(cmd, sizeof cmd, "curl -fsSL --max-time 300 '%s'", url);
   FILE *p = popen(cmd, "r");
   if (!p) return -1;
   static uint8_t buf[64 * 1024];
   size_t n;
+  unsigned long long total = 0;
   bool stopped = false;
-  while (!stopped && (n = fread(buf, 1, sizeof buf, p)) > 0) stopped = sink(ctx, buf, n) != 0;
+  while (!stopped && (n = fread(buf, 1, sizeof buf, p)) > 0) { total += n; stopped = sink(ctx, buf, n) != 0; }
   int rc = pclose(p);
+  app_log("https: %s -> %s, %llu bytes (host curl)", app_log_host(url, host, sizeof host), stopped ? "stopped by the receiver" : rc ? "failed" : "200", total);
   return stopped || rc != 0 ? -1 : 200;
 }
 unsigned plat_https_last_error(void) { return 0; }
+void plat_debug_text(const char *line) { (void)line; }   /* app_log already prints to stderr on the host */
 
 const char *plat_asset_dir(void) { const char *a = getenv("E2A_ASSETS"); return a ? a : "assets"; }
 const char *plat_settings_path(void) { return "/tmp/e2a_app_settings.txt"; }

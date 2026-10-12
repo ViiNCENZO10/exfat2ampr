@@ -29,6 +29,9 @@ uint64_t plat_ms(void);
 int plat_pid(void);
 void plat_sleep_ms(unsigned ms);
 void plat_notify(const char *msg);
+/* a line for the console's kernel log (read on a PC with klogsrv, port 3232, or etaHEN's Klog, port 9081): a
+ * second channel that needs no engine; nothing on the host */
+void plat_debug_text(const char *line);
 int plat_language(void);                      /* system language id (PS4/PS5 numbering) */
 void plat_exit(void);                         /* close the app */
 

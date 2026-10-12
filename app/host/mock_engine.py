@@ -383,6 +383,10 @@ def check(path, smp, dest):
             "errors": errors, "warnings": warnings}
 
 
+APPLOG = []        # (seq, line) received from the app
+APPLOG_SEQ = [0]
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -400,6 +404,10 @@ class H(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(u.query)
         if u.path == "/api/state":
             return self.send(200, state_json())
+        if u.path == "/api/applog" or u.path == "/api/log":   # incremental reads: the lines after since=
+            since = int(q.get("since", ["0"])[0] or 0)
+            lines = [l for n, l in APPLOG if n > since] if u.path == "/api/applog" else []
+            return self.send(200, {"seq": APPLOG_SEQ[0], "lines": lines})
         if u.path == "/api/sources":
             return self.send(200, GAMES)
         if u.path == "/update/update.json":
@@ -454,6 +462,14 @@ class H(BaseHTTPRequestHandler):
                 return self.send(400, {"error": "piece out of order"})
             UPDATE["got"] += raw
             return self.send(200, {"ok": True})
+        if path == "/api/applog":   # the app's own log lines, printed so the CI log shows them
+            for line in raw.decode("utf-8", "replace").splitlines():
+                if line.strip():
+                    APPLOG_SEQ[0] += 1
+                    APPLOG.append((APPLOG_SEQ[0], line))
+                    print("[applog] " + line, flush=True)
+            del APPLOG[:-400]
+            return self.send(200, {"ok": True, "seq": APPLOG_SEQ[0]})
         body = urllib.parse.parse_qs(raw.decode())
         arg = lambda k: body.get(k, [""])[0]
         if path == "/api/update/begin":

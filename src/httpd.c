@@ -438,6 +438,21 @@ static bool peer_is_local(int fd) {
   return ntohl(a.sin_addr.s_addr) == 0x7f000001u;
 }
 
+/* the engine's log, or the app's, from a sequence number: {"seq":N,"lines":[...]} (the page and remote tools
+ * poll with since=<the seq they got last>) */
+static void api_log_since(int fd, const char *args, bool app) {
+  char v[32];
+  uint64_t since = form_get(args, "since", v, sizeof v) > 0 ? strtoull(v, NULL, 10) : 0;
+  const size_t cap = 96 * 1024;
+  char *lines = malloc(cap), *json = malloc(cap + 64);
+  if (!lines || !json) { free(lines); free(json); send_json(fd, 500, "{\"error\":\"out of memory\"}"); return; }
+  uint64_t seq = app ? e2a_applog_since(since, lines, cap) : e2a_log_since(since, lines, cap);
+  snprintf(json, cap + 64, "{\"seq\":%llu,\"lines\":%s}", (unsigned long long)seq, lines);
+  send_json(fd, 200, json);
+  free(lines);
+  free(json);
+}
+
 static void api_pair_info(int fd) {
   char ip[64], out[256];
   pair_local_ip(ip, sizeof ip);
@@ -521,6 +536,11 @@ static void handle(int fd) {
   } else if (strcmp(path, "/api/pair/info") == 0 && local) api_pair_info(fd);
   else if (strcmp(path, "/api/pair/reset") == 0 && post && local) { pair_reset(); api_pair_info(fd); }
   else if (strcmp(path, "/api/state") == 0) api_state(fd, args);
+  else if (strcmp(path, "/api/log") == 0) api_log_since(fd, args, false);
+  else if (strcmp(path, "/api/applog") == 0 && post) {   /* the app's own lines: from the console only */
+    if (!local) send_json(fd, 403, "{\"error\":\"from the console only\"}");
+    else { e2a_applog_add(body, body_len); send_json(fd, 200, "{\"ok\":true}"); }
+  } else if (strcmp(path, "/api/applog") == 0) api_log_since(fd, args, true);
   else if (strcmp(path, "/api/check") == 0) {
     char p[600], smp[16], dst[300], out[1400];
     form_get(args, "path", p, sizeof p);

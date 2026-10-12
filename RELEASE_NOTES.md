@@ -43,6 +43,11 @@ Made by **V-10** · LZ4 format: **DLPSGAME** · AMPR emulator: drakmor/ampr_emu 
   batch in one piece instead of one write per 64 KB block. Loose files (the incompressible ones) are copied the
   same way. The engine's log shows what each stage sustains (`pack stages: read … compress … write …`) every two
   minutes, so a slow source is told apart from a slow destination.
+- **The app's own log, readable from anywhere**: what the app did (screens, engine answers, every step of an
+  update download with the HTTP library's codes, errors shown on screen) is kept in Settings › Log, sent to the
+  engine as it happens (it stays there after the app closes, and in `/data/exfat2ampr/app.log`), shown on the
+  web page under the engine's log, and served to tools at `/api/applog?since=N` (the engine's log at
+  `/api/log?since=N`), so a failure can be diagnosed from a PC without the TV.
 - Nine languages: English, French, Spanish, Italian, Russian, Portuguese, Chinese, Thai, Vietnamese; the
   web page for a PC or a phone (pairing with a 6-digit code or a QR code) adds Arabic.
 
@@ -83,5 +88,9 @@ incompressibles laissés tels quels dès 16 Mo, table de déduplication bornée,
 vérifié pendant que le suivant se remplit, vérification reprenable, erreurs d'écriture passagères retentées.
 Plus rapide sur les images compressées (`.ffpfsc`, nouveau, pas encore mesuré sur console) : lecture par quatre
 threads, lots de 24 Mo, une seule écriture par lot, copie des fichiers non compressés de la même façon ; le journal
-du moteur indique toutes les deux minutes le débit de chaque étape (lecture, compression, écriture). La vidéo de présentation
+du moteur indique toutes les deux minutes le débit de chaque étape (lecture, compression, écriture). Journal de
+l'app (Réglages › Journal) : écrans visités, réponses du moteur, chaque étape d'un téléchargement de mise à jour
+avec les codes de la bibliothèque HTTP, erreurs affichées ; il part au fur et à mesure vers le moteur (conservé
+après la fermeture de l'app, dans `/data/exfat2ampr/app.log`), s'affiche sur la page web et se lit à distance
+via `/api/applog?since=N`. La vidéo de présentation
 (`exfat2ampr-presentation.mp4`, voix anglaise, sous-titres français) est jointe à la release.

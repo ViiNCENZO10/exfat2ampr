@@ -4,6 +4,7 @@
 
 #include "api.h"
 #include "json.h"
+#include "log.h"
 #include "platform.h"
 
 #include <pthread.h>
@@ -92,6 +93,7 @@ static void *check_thread(void *arg) {
   char url[200], err[200];
   membuf m = {buf, 0, sizeof buf - 1};
   int st = plat_https_get(manifest_url(url, sizeof url), to_memory, &m, false);
+  app_log("update: manifest -> %d (%zu bytes)", st, m.len);
   if (st != 200) {
     snprintf(err, sizeof err, st < 0 ? "no answer from the update server (%d)" : "update server answered HTTP %d", st);
     set_state(UPD_UNREACHABLE, err);
@@ -112,6 +114,7 @@ static void *check_thread(void *arg) {
       if (p->type == J_STR && p->str && strncmp(p->str, "https://", 8) == 0) snprintf(g_parts[g_nparts++], sizeof g_parts[0], "%s", p->str);
   long have = vnum(g_current), found = vnum(g_version);
   bool usable = (g_package[0] || g_nparts) && strlen(g_sha) == 64 && g_size > 0;
+  app_log("update: %.20s published (this app: %.20s), %d piece(s)%s", g_version, g_current, g_nparts, usable ? "" : ", manifest unusable");
   pthread_mutex_unlock(&g_mx);
   json_free(&d);
   set_state(have >= 0 && found > have && usable ? UPD_AVAILABLE : UPD_LATEST, NULL);
@@ -174,8 +177,12 @@ static int fetch_package(upload *u, const char *form, const char *const *urls, i
   json_free(&d);
   if (st != 200) { snprintf(u->err, sizeof u->err, "engine refused to start the download (HTTP %d)", st); return -1; }
   u->off = 0; u->used = 0; u->err[0] = 0;
+  app_log("update: %llu bytes via %s", (unsigned long long)u->total, n > 1 ? "the pieces" : "the release file");
   for (int i = 0; i < n; i++) {
     st = plat_https_get(urls[i], to_engine, u, follow);
+    char host[80];
+    app_log("update: %s -> %d, %llu bytes handed to the engine%s%.100s", app_log_host(urls[i], host, sizeof host), st,
+            (unsigned long long)(u->off + u->used), u->err[0] ? ": " : "", u->err);
     if (u->err[0]) return -1;
     if (st != 200) {
       if (st < 0) snprintf(u->err, sizeof u->err, "download failed (%d, 0x%08x)%s", st, plat_https_last_error(), n > 1 ? " [pieces]" : "");
@@ -231,6 +238,7 @@ static void *install_thread(void *arg) {
   st = api_call("/api/update/install", "", &d);
   snprintf(err, sizeof err, "%s", d.root ? json_str(d.root, "error", "") : "engine not answering");
   json_free(&d);
+  app_log("update: install -> %d %.120s", st, err);
   set_state(st == 200 ? UPD_INSTALLED : UPD_FAILED, st == 200 ? NULL : err);
   return NULL;
 }

@@ -116,6 +116,13 @@ redirection du téléchargement GitHub ; si la console n'y arrive pas, elle
 récupère le package en morceaux depuis la branche `updates` du dépôt. À la main :
 fermer l'app et remplacer le fichier `.ffpkg`.
 
+Journal de l'app : **Réglages → Journal** montre ce que l'app a fait (écrans, réponses du
+moteur, étapes d'une mise à jour avec les codes de la bibliothèque HTTP, erreurs
+affichées). Les lignes partent au fur et à mesure vers le moteur, qui les garde après la
+fermeture de l'app (`/data/exfat2ampr/app.log`), les montre sur la page web sous son
+propre journal et les sert à `/api/applog?since=N` (le sien à `/api/log?since=N`), avec
+le jeton d'appairage depuis un PC.
+
 ## Pause et reprise
 
 - Le packer écrit ses tampons (enregistrements, blocs, CRC, chaînes, table de
