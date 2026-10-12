@@ -110,8 +110,11 @@ floutée) derrière des panneaux de verre fumé, animations (sélection qui glis
 navigation synthétisés. **Réglages → Sons de navigation / Animations** les coupent
 (les animations coupées soulagent le processeur si besoin).
 
-Mises à jour : fermer l'app et remplacer le fichier `.ffpkg` (mise à jour
-automatique prévue).
+Mises à jour : **Réglages → Mises à jour** télécharge la nouvelle version et la
+met en place (l'ancien package est gardé en `.old`). L'app suit elle-même la
+redirection du téléchargement GitHub ; si la console n'y arrive pas, elle
+récupère le package en morceaux depuis la branche `updates` du dépôt. À la main :
+fermer l'app et remplacer le fichier `.ffpkg`.
 
 ## Pause et reprise
 
