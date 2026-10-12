@@ -254,7 +254,7 @@ static const char *code_text(const char *c) {
     {"smp_not_managed", S_X_SMP_NOT_MANAGED}, {"smp_no_path", S_X_SMP_NO_PATH}, {"smp_error", S_X_SMP_ERROR},
     {"smp_busy", S_X_SMP_GAME_ACTIVE}, {"paused_user", S_X_PAUSED_USER}, {"paused_game", S_PAUSE_GAME},
     {"paused_dest", S_PAUSE_DEST}, {"paused_source", S_PAUSE_SRC}, {"paused_full", S_PAUSE_FULL}, {"done", S_X_DONE},
-    {"done_fakelib", S_X_DONE_FAKELIB}, {"queue_full", S_X_QUEUE_FULL}, {"bad_path", S_X_BAD_PATH}, {"bad_name", S_X_BAD_PATH},
+    {"done_fakelib", S_X_DONE_FAKELIB}, {"queue_full", S_X_QUEUE_FULL}, {"already_running", S_X_ALREADY_RUNNING}, {"bad_path", S_X_BAD_PATH}, {"bad_name", S_X_BAD_PATH},
     /* checks before a conversion */
     {"smp_wait_app", S_W_SMP_WAIT_APP}, {"smp_wait_game", S_W_SMP_WAIT_GAME}, {"fakelib_disabled", S_W_FAKELIB_DISABLED},
     /* deleting a copy from the list */

@@ -656,8 +656,14 @@ static void handle(int fd) {
   }
   else if (strcmp(path, "/api/resume") == 0 && post) {
     form_get(args, "dest", v, sizeof v);
-    int rc = SAFE_PATH(v) ? job_resume(v) : -1;
-    send_json(fd, rc == 0 ? 200 : 400, rc == 0 ? "{\"ok\":true}" : "{\"error\":\"cannot resume\"}");
+    char lv[8] = "";
+    form_get(args, "level", lv, sizeof lv);
+    int rc = SAFE_PATH(v) ? job_resume_level(v, atoi(lv)) : -1;
+    send_json(fd, rc == 0 ? 200 : rc == -2 ? 409 : 400,
+              rc == 0 ? "{\"ok\":true}"
+              : rc == -2 ? "{\"error\":\"already running\",\"code\":\"already_running\"}"
+              : rc == -3 ? "{\"error\":\"queue full\",\"code\":\"queue_full\"}"
+                         : "{\"error\":\"nothing to resume\",\"code\":\"nothing_to_resume\"}");
   } else if (strcmp(path, "/api/discard") == 0 && post) {
     form_get(args, "dest", v, sizeof v);
     int rc = SAFE_PATH(v) ? job_discard(v) : -1;

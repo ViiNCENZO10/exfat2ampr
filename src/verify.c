@@ -63,6 +63,7 @@ typedef struct {
   volatile int *stop;
   const uint64_t *verified;   /* volumes the pack already read back (one bit each), or NULL */
   uint64_t bytes, chunks_ok, out_of_memory, gone;   /* gone: the destination stopped answering (drive removed) */
+  uint64_t skipped;   /* bytes of volumes checked while packing: counted, not read again */
 } vjob;
 
 static void *vworker(void *arg) {
@@ -86,6 +87,7 @@ static void *vworker(void *arg) {
       uint32_t codec = (cr->descriptor >> 20) & 3;
       if (j->verified && pack_id < 1024 && ((j->verified[pack_id >> 6] >> (pack_id & 63)) & 1)) {
         j->bytes += raw_size;   /* this volume was read back and checked while the pack went on */
+        j->skipped += raw_size;
         j->chunks_ok++;
         continue;
       }
@@ -233,6 +235,7 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
           else vs->files_loose++;
         }
         e2a_log("verify: resuming at file %llu of %llu", (unsigned long long)f0, (unsigned long long)h.file_count);
+        if (o->skip) o->skip(o->ctx, done);   /* checked by the previous run */
       }
       fclose(pf);
     }
@@ -254,6 +257,7 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
       if (stat(path, &st) != 0 || (uint64_t)st.st_size != fr->logical_size) fail(vs, "loose file missing or wrong size: %s (%llu)", rel, fr->logical_size);
       vs->files_loose++;
       done += fr->logical_size;
+      if (o->skip) o->skip(o->ctx, fr->logical_size);   /* only its size is checked: nothing is read */
       continue;
     }
     vs->files_packed++;
@@ -289,6 +293,11 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
       goto out;
     }
     done += covered;
+    {
+      uint64_t sk = 0;
+      for (int t = 0; t < nt; t++) sk += jobs[t].skipped;
+      if (sk && o->skip) o->skip(o->ctx, sk);
+    }
     if (o->cancel && *o->cancel) goto out;
     if (covered != fr->logical_size && vs->errors == 0) fail(vs, "chunk coverage incomplete: %s (%llu)", rel, fr->logical_size - covered);
     double now = e2a_now();

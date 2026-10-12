@@ -61,6 +61,8 @@ typedef struct {
 int  job_init(void);                        /* scheduler thread + runtime detection */
 int  job_enqueue(const job_request *req);   /* position in queue (0 = starts now), -1 when full */
 int  job_resume(const char *dest);          /* enqueue the request saved in <dest>/.e2a-state */
+/* level 1..12: the LZ4 level for what is left (0 keeps it); -1 nothing to resume, -2 already running or queued, -3 queue full */
+int  job_resume_level(const char *dest, int level);
 int  job_discard(const char *dest);         /* delete an interrupted conversion */
 void job_cancel(void);                      /* abort the current job and delete its destination */
 void job_pause(void);                       /* checkpoint and stop the current job; resume later */

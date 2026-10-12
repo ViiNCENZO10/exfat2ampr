@@ -54,6 +54,18 @@ static bool g_have_last;
 
 /* ------------------------------------------------------------- progress -- */
 static double g_rate_t0, g_rate_b0, g_last_report;
+#define RATE_WIN 40   /* samples of the speed window: 40 x 0.5 s = 20 s */
+static double g_win_t[RATE_WIN], g_win_b[RATE_WIN], g_skipped;
+static int g_win_head, g_win_n;
+
+/* bytes counted done without being read or written (a volume already checked while packing, a loose file
+ * already copied before a pause): they move the progress, never the speed */
+static void on_skip(void *ctx, uint64_t bytes) {
+  (void)ctx;
+  pthread_mutex_lock(&g_mx);
+  g_skipped += (double)bytes;
+  pthread_mutex_unlock(&g_mx);
+}
 
 static void set_phase(const char *phase, int pct, const char *msg) {
   pthread_mutex_lock(&g_mx);
@@ -71,6 +83,10 @@ static void begin_phase(const char *phase, const char *msg, uint64_t base) {
   pthread_mutex_unlock(&g_mx);
   set_phase(phase, pct, msg);
   g_rate_t0 = e2a_now(); g_rate_b0 = (double)base; g_last_report = 0;
+  pthread_mutex_lock(&g_mx);   /* each phase has its own pace: the window starts afresh */
+  g_win_n = 0; g_win_head = 0; g_skipped = 0;
+  g_status.speed_bps = 0;
+  pthread_mutex_unlock(&g_mx);
 }
 
 static void on_progress(void *ctx, uint64_t phase_done, const char *msg) {
@@ -78,10 +94,22 @@ static void on_progress(void *ctx, uint64_t phase_done, const char *msg) {
   pthread_mutex_lock(&g_mx);
   g_status.bytes_done = g_status.phase_base + phase_done;
   if (g_status.bytes_done > g_status.bytes_total) g_status.bytes_done = g_status.bytes_total;
-  double el = t - g_rate_t0;
-  if (el > 2.0) {
-    g_status.speed_bps = ((double)g_status.bytes_done - g_rate_b0) / el;
-    if (el > 60.0) { g_rate_t0 = t - 30.0; g_rate_b0 = (double)g_status.bytes_done - g_status.speed_bps * 30.0; }
+  /* the speed of the last 20 seconds of real work: a true sliding window (one sample per half second), so
+   * neither a fast start (cached reads, small files) nor bytes counted without being read (skipped, see
+   * on_skip) weigh on it for minutes afterwards */
+  if (t - g_win_t[(g_win_head + RATE_WIN - 1) % RATE_WIN] >= 0.5 || g_win_n == 0) {
+    g_win_t[g_win_head] = t;
+    g_win_b[g_win_head] = (double)g_status.bytes_done - g_skipped;
+    g_win_head = (g_win_head + 1) % RATE_WIN;
+    if (g_win_n < RATE_WIN) g_win_n++;
+  }
+  if (g_win_n >= 4) {
+    int newest = (g_win_head + RATE_WIN - 1) % RATE_WIN, oldest = (g_win_head + RATE_WIN - g_win_n) % RATE_WIN;
+    double dt = g_win_t[newest] - g_win_t[oldest];
+    if (dt >= 2.0) {
+      double sp = (g_win_b[newest] - g_win_b[oldest]) / dt;
+      g_status.speed_bps = sp > 0 ? sp : 0;
+    }
   }
   /* time left phase by phase: packing and copying at the speed measured now, the verification at its own
    * speed (it only reads and decodes: several times faster), learned on the previous run */
@@ -340,7 +368,16 @@ static void run_job(job_request req) {
   }
   covers_put_from_dir(game.title_id, src);   /* the image is open now: its pictures are kept for later */
   /* a game and its own conversion never run together */
-  if (activity_title_running(game.title_id)) FAIL("game_running", "this game is running: close it, then start its conversion");
+  if (activity_title_running(game.title_id)) {
+    if (req.resume) {   /* resumed while its game is still open: wait for it again, nothing is lost */
+      e2a_pack_set_pause_reason("game launched: its conversion is paused and resumes when the game is closed");
+      snprintf(dest, sizeof dest, "%s/%s", req.dest_base, req.name);
+      activity_pause_for(game.title_id, dest);
+      paused = true;
+      goto done;
+    }
+    FAIL("game_running", "this game is running: close it, then start its conversion");
+  }
   if (!req.resume && !req.force) {
     char why[200];
     int c = e2a_ampr_compat(src, why, sizeof why);
@@ -365,6 +402,8 @@ static void run_job(job_request req) {
   pthread_mutex_unlock(&g_mx);
   e2a_log("job%s: %s [%s] %s -> %s (lz4 %d, %d workers, dedup %d, verify %d)", req.resume ? " (resume)" : "",
           game.title, game.title_id, src, dest, req.level, req.workers, req.dedup, req.verify);
+  if (req.level >= 10)   /* LZ4HC 10-12 switch to the optimal parser: measured 35 MB/s against 150-190 at level 9 */
+    e2a_log("note: LZ4 level %d is several times slower to compress than 9 for about 1%% of space", req.level);
 
   if (strncmp(src, dest, strlen(dest)) == 0 && (src[strlen(dest)] == 0 || src[strlen(dest)] == '/')) {
     FAIL("dest_is_source", "destination is the source itself");
@@ -501,7 +540,7 @@ static void run_job(job_request req) {
   o.src_root = src; o.out_dir = dest; o.state_dir = state_dir;
   o.verified_bits = req.verify ? verified_bits : NULL;   /* no verification wanted: no read-back either */
   o.level = req.level; o.workers = req.workers; o.dedup = req.dedup;
-  o.max_pack_size = E2A_MAX_PACK; o.cancel = &g_cancel; o.pause = &g_pause; o.progress = on_progress;
+  o.max_pack_size = E2A_MAX_PACK; o.cancel = &g_cancel; o.pause = &g_pause; o.progress = on_progress; o.skip = on_skip;
 #ifdef E2A_HOST
   {   /* the CI: small volumes make a small game roll over, so the read-back of finished volumes is exercised */
     const char *mp = getenv("E2A_TEST_MAX_PACK_MB");
@@ -731,11 +770,17 @@ int job_enqueue(const job_request *req) {
   return pos;
 }
 
-int job_resume(const char *dest) {
+int job_resume_level(const char *dest, int level) {
   char state_dir[700];
   snprintf(state_dir, sizeof state_dir, "%s/.e2a-state", dest);
   job_request r;
   if (request_load(state_dir, &r) != 0) return -1;
+  /* the level can change on a resume: every block is compressed on its own, blocks of both levels mix */
+  if (level >= 1 && level <= 12 && level != r.level) {
+    e2a_log("resume of %s: LZ4 level %d -> %d", dest, r.level, level);
+    r.level = level;
+    request_save(state_dir, &r);
+  }
   r.resume = true;
   r.overwrite = false;
   r.test_pause_after = 0;   /* the test hook is one-shot */
@@ -748,9 +793,11 @@ int job_resume(const char *dest) {
     if (g_queue[i].resume && strcmp(qd, dest) == 0) dup = true;
   }
   pthread_mutex_unlock(&g_mx);
-  if (dup) return -1;
-  return job_enqueue(&r) >= 0 ? 0 : -1;
+  if (dup) return -2;   /* already running or waiting in the queue */
+  return job_enqueue(&r) >= 0 ? 0 : -3;
 }
+
+int job_resume(const char *dest) { return job_resume_level(dest, 0); }
 
 int job_discard(const char *dest) {
   char state_dir[700];

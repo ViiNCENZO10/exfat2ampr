@@ -1244,6 +1244,7 @@ int e2a_copy_loose(const e2a_list *l, const e2a_pack_opts *o) {
     struct stat st;
     if (stat(dst, &st) == 0 && S_ISREG(st.st_mode) && (uint64_t)st.st_size == e->size) {
       done += e->size;  /* already copied by a previous run */
+      if (o->skip) o->skip(o->ctx, e->size);
       continue;
     }
     char *slash = strrchr(dst, '/');

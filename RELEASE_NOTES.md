@@ -64,6 +64,17 @@ Made by **V-10** · LZ4 format: **DLPSGAME** · AMPR emulator: drakmor/ampr_emu 
   the packer does), refined while it packs and shown live (« files → about … »), with the image size beside it
   when the game comes from an image; the time left counts the verification at its own, faster speed; every run
   teaches the next forecasts.
+- **A game no longer "launched" by mistake**: a process of the game's title that only flickers (right after
+  ShadowMountPlus mounts the image) paused the conversion, then resumed it at once into a "game is running"
+  failure. A game now counts as running after about 6 seconds, as closed after 6 seconds without it, the log
+  names the process, and a resume that finds the game open waits for it instead of failing.
+- **Resume**: the LZ4 level chosen in the options applies to what is left of a conversion (levels 10 to 12
+  compress several times slower than 9); "already running" is said as such instead of a bare "Error".
+- **A steady, honest speed**: the speed shown is that of the last 20 seconds of real work. Before, it was an
+  average since the start of the phase, slow to forget a fast beginning; and the verification counted at once,
+  without reading them, the volumes already checked while packing and the loose files (only their size is
+  checked), which showed speeds of several GB/s that then sank. Those bytes still move the progress bar, never
+  the speed.
 - Nine languages: English, French, Spanish, Italian, Russian, Portuguese, Chinese, Thai, Vietnamese; the
   web page for a PC or a phone (pairing with a 6-digit code or a QR code) adds Arabic.
 

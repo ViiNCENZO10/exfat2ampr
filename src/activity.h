@@ -21,6 +21,7 @@ bool activity_app_alive(void);
 /* title ids of the games running now (never the home-screen app); returns count */
 int activity_running_titles(char titles[][16], int max);
 bool activity_title_running(const char *title_id);
+void activity_pause_for(const char *title_id, const char *dest);   /* resume that conversion when the game closes */
 
 bool activity_game_mode_enabled(void);
 void activity_set_game_mode_enabled(bool on);

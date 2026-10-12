@@ -41,6 +41,9 @@ static volatile int g_app_pid;
 static volatile double g_app_seen;
 static volatile uint64_t g_rev;
 static char g_paused_for[16], g_paused_dest[600];
+typedef struct { char t[16]; int present, absent; bool on; } track_t;
+static track_t g_track[MAX_TITLES * 2];
+static int g_ntrack;
 
 static bool is_game_title(const char *t) {
   if (strlen(t) != 9 || (strncmp(t, "PPSA", 4) && strncmp(t, "CUSA", 4))) return false;
@@ -49,13 +52,19 @@ static bool is_game_title(const char *t) {
   return strcmp(t, E2A_APP_TITLE_ID) != 0;   /* the home-screen app is not a game */
 }
 
-static int add_title(char out[][16], int n, int max, const char *t) {
+static char g_comm[MAX_TITLES][24];   /* the process name behind each title of the last scan (the log names it) */
+
+static int add_title_as(char out[][16], int n, int max, const char *t, const char *comm) {
   if (!is_game_title(t) || n >= max) return n;
   for (int k = 0; k < n; k++)
     if (!strcmp(out[k], t)) return n;
   snprintf(out[n], 16, "%s", t);
+  snprintf(g_comm[n], sizeof g_comm[n], "%s", comm ? comm : "");
   return n + 1;
 }
+#ifdef E2A_HOST
+static int add_title(char out[][16], int n, int max, const char *t) { return add_title_as(out, n, max, t, "host"); }
+#endif
 
 #ifdef E2A_HOST
 /* host tests: E2A_FAKE_RUNNING="PPSA01234,PPSA02530" */
@@ -94,7 +103,13 @@ static int scan_titles(char out[][16], int max) {
     if (l >= sizeof t) continue;
     memcpy(t, ai.title_id, l);
     t[l] = 0;
-    n = add_title(out, n, max, t);
+    char comm[24];
+    comm[0] = 0;
+    if ((size_t)size >= offsetof(struct kinfo_proc, ki_comm) + sizeof(((struct kinfo_proc *)0)->ki_comm)) {
+      const char *kc = (const char *)(p - size) + offsetof(struct kinfo_proc, ki_comm);
+      snprintf(comm, sizeof comm, "%.19s", kc);
+    }
+    n = add_title_as(out, n, max, t, comm);
   }
   free(buf);
   return n;
@@ -153,13 +168,45 @@ void activity_throttle(uint64_t bytes) {
 
 uint64_t activity_storage_rev(void) { return g_rev; }
 
+/* a conversion paused for its game (by the job itself): resumed by the monitor once the game is closed */
+void activity_pause_for(const char *title_id, const char *dest) {
+  snprintf(g_paused_for, sizeof g_paused_for, "%s", title_id);
+  snprintf(g_paused_dest, sizeof g_paused_dest, "%s", dest);
+}
+
 static void *monitor(void *arg) {
   (void)arg;
   uint64_t last_sig = storage_signature();
   bool was_game = false;
   for (;;) {
+    char seen[MAX_TITLES][16];
+    int ns = scan_titles(seen, MAX_TITLES);
+    /* a title counts as running after three scans in a row (about 6 s), and as closed after three scans
+     * without it: a process that only flickers (ShadowMountPlus preparing a freshly mounted image, the system
+     * reading its metadata) no longer pauses a conversion, nor resumes one into a game that is still open */
+    for (int i = 0; i < ns; i++) {
+      int k;
+      for (k = 0; k < g_ntrack && strcmp(g_track[k].t, seen[i]) != 0; k++) {}
+      if (k == g_ntrack && g_ntrack < MAX_TITLES * 2) { memset(&g_track[k], 0, sizeof g_track[k]); snprintf(g_track[k].t, 16, "%.15s", seen[i]); g_ntrack++; }
+      if (k < g_ntrack) {
+        g_track[k].absent = 0;
+        if (++g_track[k].present >= 3 && !g_track[k].on) {
+          g_track[k].on = true;
+          e2a_log("activity: %s is running (process %s)", seen[i], g_comm[i][0] ? g_comm[i] : "?");
+        }
+      }
+    }
+    for (int k = 0; k < g_ntrack; k++) {
+      bool here = false;
+      for (int i = 0; i < ns && !here; i++) here = !strcmp(seen[i], g_track[k].t);
+      if (here) continue;
+      g_track[k].present = 0;
+      if (g_track[k].on && ++g_track[k].absent >= 3) { g_track[k].on = false; e2a_log("activity: %s closed", g_track[k].t); }
+      if (!g_track[k].on && g_track[k].absent >= 0) { g_track[k] = g_track[--g_ntrack]; k--; }
+    }
     char t[MAX_TITLES][16];
-    int n = scan_titles(t, MAX_TITLES);
+    int n = 0;
+    for (int k = 0; k < g_ntrack && n < MAX_TITLES; k++) if (g_track[k].on) snprintf(t[n++], 16, "%.15s", g_track[k].t);
     pthread_mutex_lock(&g_mx);
     memcpy(g_titles, t, sizeof t);
     g_ntitles = n;

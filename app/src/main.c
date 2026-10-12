@@ -1922,6 +1922,7 @@ static void handle_input(uint32_t p) {
         if (g_st.resumable) {
           char form[1300] = "";
           form_add(form, sizeof form, "dest", g_st.dest);
+          form_add_int(form, sizeof form, "level", g_opt.level);   /* the level chosen now applies to what is left */
           st = api_call("/api/resume", form, &d);
           json_free(&d);
         } else if (g_st.can_retry) {
@@ -1950,6 +1951,7 @@ static void handle_input(uint32_t p) {
       else if ((p & BTN_TRIANGLE) && paused) {
         char form[1300] = "";
         form_add(form, sizeof form, "dest", g_st.dest);
+          form_add_int(form, sizeof form, "level", g_opt.level);   /* the level chosen now applies to what is left */
         api_call("/api/resume", form, &d);
         json_free(&d);
         poll_status();
@@ -1967,10 +1969,12 @@ static void handle_input(uint32_t p) {
         char form[1300] = "";
         jdoc d;
         form_add(form, sizeof form, "dest", g_res[g_res_sel].dest);
+        form_add_int(form, sizeof form, "level", g_opt.level);   /* the level chosen now applies to what is left */
         int st = api_call("/api/resume", form, &d);
-        json_free(&d);
         if (st == 200) { enter_tab(TAB_PROGRESS); snd_cue_frame(SND_START); }
-        else toast_err(T(S_ERROR));
+        else if (st == 409) { enter_tab(TAB_PROGRESS); toast(code_text("already_running")); }   /* it is running: show it */
+        else toast_err(d.root ? code_text(json_str(d.root, "code", "unknown")) : T(S_TIMEOUT));
+        json_free(&d);
       } else if (p & BTN_CROSS) snd_cue_frame(SND_ERROR);
       if ((p & BTN_SQUARE) && !g_res[g_res_sel].active) { confirm(ACT_DISCARD, T(S_DISCARD_CONFIRM)); snd_cue_frame(SND_SELECT); }
       break;

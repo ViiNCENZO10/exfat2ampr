@@ -26,6 +26,7 @@ typedef struct {
   volatile int *pause;      /* checkpoint and return E2A_PACK_PAUSED */
   /* bytes processed so far in the current phase + the file being handled */
   void (*progress)(void *ctx, uint64_t done_bytes, const char *msg);
+  void (*skip)(void *ctx, uint64_t bytes);   /* counted done without being read now (the speed ignores them) */
   void *ctx;
   /* 1024 bits, one per volume, owned by the caller: the pack sets the bit of every volume it read back and
    * checked while the next one filled; the final verification then skips those (NULL: not used) */
