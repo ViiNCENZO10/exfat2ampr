@@ -2,6 +2,8 @@
 
 Made by **V-10** · LZ4 format: **DLPSGAME** · AMPR emulator: drakmor/ampr_emu · free software (GPL-3.0)
 
+✅ **Tested and working on a PlayStation 5** by the author (firmware 12.40, kstuff, ShadowMountPlus 1.7).
+
 ### What it does
 
 - Finds every game and app on the console — internal storage, USB drives, M.2 SSD, `homebrew` and
@@ -28,15 +30,16 @@ Requirements: a jailbroken PS5 with kstuff, an ELF loader on port 9021 (elfldr, 
 2. Restart the console, start the jailbreak; ShadowMountPlus adds **exFAT2AMPR** to the home screen.
 3. Open it: the app starts its engine itself. `exfat2ampr.elf` is only needed to run the engine by hand.
 
-Not yet confirmed on every console: the speed test, the automatic update (HTTPS through the console's
-sceHttp), the CJK characters loaded at start. Reports are welcome.
+Tested and working on a PlayStation 5 by the author (firmware 12.40, kstuff, ShadowMountPlus 1.7). Other
+firmwares and setups: reports are welcome.
 
 ---
 
 ### En français
 
 exFAT2AMPR convertit les dumps de jeux PS5 au format AMPR LZ4, directement sur la console. Créé par **V-10**,
-format LZ4 : **DLPSGAME**. Installation : copier `PPSA99272.ffpkg` dans `homebrew/` (clé USB exFAT) ou dans
+format LZ4 : **DLPSGAME**. ✅ **Testé et fonctionnel sur PlayStation 5** par l'auteur (firmware 12.40, kstuff,
+ShadowMountPlus 1.7). Installation : copier `PPSA99272.ffpkg` dans `homebrew/` (clé USB exFAT) ou dans
 `/data/homebrew/` par FTP, en un seul exemplaire, redémarrer, lancer le jailbreak puis l'app. Les mises à jour
 suivantes s'installent depuis l'app (Réglages › Mises à jour). La vidéo de présentation (voix anglaise,
 sous-titres français) est jointe à la release.

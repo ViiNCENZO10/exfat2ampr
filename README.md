@@ -1,5 +1,7 @@
 # ps5-exfat2ampr
 
+✅ **Testé et fonctionnel sur PlayStation 5** par l'auteur, V-10 (firmware 12.40, kstuff, ShadowMountPlus 1.7).
+
 Payload PS5 (jailbreak + chargeur d'ELF) qui convertit **sur la console** un jeu
 en pack **AMPR LZ4** (format d'ampr_emu / Lazy_AMPR) et le dépose dans le dossier
 `homebrew` du support de votre choix : SSD interne, SSD M.2 étendu ou USB. Aucun PC
