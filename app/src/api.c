@@ -9,9 +9,12 @@
 #include <string.h>
 
 /* the engine not answering is noted once in a while; never for the log shipping itself (it would feed itself) */
+static bool g_quiet;   /* while the app starts the engine, its silence is expected */
+void api_set_quiet(bool quiet) { g_quiet = quiet; }
+
 static void api_note_down(const char *path, int status) {
   static uint64_t last;
-  if (strncmp(path, "/api/applog", 11) == 0) return;
+  if (g_quiet || strncmp(path, "/api/applog", 11) == 0) return;
   uint64_t now = plat_ms();
   if (last && now - last < 10000) return;
   last = now;

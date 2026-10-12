@@ -47,6 +47,15 @@ const char *e2a_pack_pause_reason(void);
 /* reason shown for a pause requested from outside (game launched, drive removed); "" clears it */
 void e2a_pack_set_pause_reason(const char *why);
 
+/* what each stage of the packer sustains right now (a few seconds' window), zeros when nothing packs:
+ * shown by the app and the web page so a slow source is told apart from a slow destination */
+typedef struct {
+  double read_mbps, compress_mbps, write_mbps;
+  int read_threads, workers;
+  uint64_t in_bytes, out_bytes, autoloose_bytes;   /* packed so far, their size in the volumes, files left loose */
+} e2a_pack_rates;
+void e2a_pack_rates_get(e2a_pack_rates *out);
+
 /* true when state_dir holds a checkpoint that e2a_pack can resume from */
 bool e2a_pack_has_checkpoint(const char *state_dir);
 void e2a_pack_clear_checkpoint(const char *state_dir);

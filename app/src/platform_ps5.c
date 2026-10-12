@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 size_t sceKernelGetDirectMemorySize(void);
@@ -286,6 +287,10 @@ int plat_https_get(const char *url0, int (*sink)(void *ctx, const uint8_t *data,
   int pool = -1, ssl = -1, http = -1, tmpl = -1, conn = -1, req = -1, status = 0, rc;
   uint32_t recv_us = follow ? 60000000u : 8000000u;
   g_https_err = 0;
+  if (!url0 || strncmp(url0, "https://", 8) != 0 || strlen(url0) >= sizeof url) {
+    app_log("https: invalid or insecure address refused");
+    return -1;
+  }
   snprintf(url, sizeof url, "%s", url0);
   rc = pool = sceNetPoolCreate("e2a_https", NET_POOL, 0);
   if (rc >= 0) rc = ssl = sceSslInit(SSL_POOL);
@@ -324,7 +329,11 @@ int plat_https_get(const char *url0, int (*sink)(void *ctx, const uint8_t *data,
         while (s < hlen && (hdr[s] == ' ' || hdr[s] == '\t')) s++;
         for (e = s; e < hlen && hdr[e] != '\r' && hdr[e] != '\n'; e++) {}
         while (e > s && (hdr[e - 1] == ' ' || hdr[e - 1] == '\t')) e--;
-        if (e > s && e - s < sizeof url && (hdr[s] | 0x20) == 'h') { memcpy(url, hdr + s, e - s); url[e - s] = 0; found = true; }
+        if (e - s >= 8 && e - s < sizeof url && strncasecmp(hdr + s, "https://", 8) == 0) {   /* never down to clear HTTP */
+          memcpy(url, hdr + s, e - s);
+          url[e - s] = 0;
+          found = true;
+        }
         break;
       }
     }

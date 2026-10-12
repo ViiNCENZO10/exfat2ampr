@@ -228,7 +228,7 @@ typedef struct {
   bool ok, overwrite_needed;
   char errors[6][24], warnings[6][24], compat[12];
   int nerr, nwarn;
-  double source_bytes, need_typ, need_max, dest_free, dest_total;
+  double source_bytes, need_typ, need_max, dest_free, dest_total, image_bytes;
 } check_t;
 static check_t g_checks[MAX_CHECKS];
 static int g_nchecks, g_check_scroll;
@@ -285,6 +285,7 @@ static void run_checks(void) {
     if (api_call("/api/check", q, &d) == 200 && d.root) {
       c->source_bytes = json_num(d.root, "source_bytes", 0);
       c->need_typ = json_num(d.root, "need_typical", 0);
+      c->image_bytes = json_num(d.root, "image_bytes", 0);
       c->need_max = json_num(d.root, "need_max", 0);
       c->dest_free = json_num(d.root, "dest_free", 0);
       c->dest_total = json_num(d.root, "dest_total", 0);
@@ -330,6 +331,12 @@ static void draw_checks(void) {
     fmt_bytes(m, sizeof m, c->need_max);
     if (c->source_bytes > 0) {
       snprintf(line, sizeof line, T(S_NEED_FMT), a, b, m);
+      if (c->image_bytes > 0) {   /* the image it comes from: a compressed one is smaller than what it holds */
+        char im[32];
+        fmt_bytes(im, sizeof im, c->image_bytes);
+        size_t n = strlen(line);
+        snprintf(line + n, sizeof line - n, T(S_SIZE_IMAGE), im);
+      }
       gfx_text(&FONT_BODY, tx, ry + 48, line, C_TEXT, tw);
     }
     const char *compat = !strcmp(c->compat, "yes") ? T(S_COMPAT_YES) : !strcmp(c->compat, "no") ? T(S_COMPAT_NO)

@@ -11,6 +11,8 @@
 #include "storage.h"
 #include "activity.h"
 #include "plugins.h"
+#include "covers.h"
+#include "estimate.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -81,8 +83,31 @@ static void on_progress(void *ctx, uint64_t phase_done, const char *msg) {
     g_status.speed_bps = ((double)g_status.bytes_done - g_rate_b0) / el;
     if (el > 60.0) { g_rate_t0 = t - 30.0; g_rate_b0 = (double)g_status.bytes_done - g_status.speed_bps * 30.0; }
   }
+  /* time left phase by phase: packing and copying at the speed measured now, the verification at its own
+   * speed (it only reads and decodes: several times faster), learned on the previous run */
+  const char *ph = (const char *)ctx;
+  bool verifying = ph && strcmp(ph, "verify") == 0;
   uint64_t left = g_status.bytes_total - g_status.bytes_done;
-  g_status.eta_seconds = g_status.speed_bps > 1.0 ? (int64_t)((double)left / g_status.speed_bps) : -1;
+  if (g_status.speed_bps > 1.0) {
+    double eta;
+    if (verifying || !g_status.verify_bytes) eta = (double)left / g_status.speed_bps;
+    else {
+      uint64_t vb = g_status.verify_bytes < left ? g_status.verify_bytes : left;
+      double vr = est_verify_rate();
+      if (vr <= 0) vr = g_status.speed_bps * 4.0;
+      eta = (double)(left - vb) / g_status.speed_bps + (double)vb / vr;
+    }
+    g_status.eta_seconds = (int64_t)(eta + 0.5);
+  } else g_status.eta_seconds = -1;
+  /* the converted size, refined with what the packed part really takes */
+  e2a_pack_rates pr;
+  e2a_pack_rates_get(&pr);
+  if (pr.in_bytes >= (256ull << 20) && pr.out_bytes) {
+    double r = (double)pr.out_bytes / (double)pr.in_bytes;
+    uint64_t done_in = pr.in_bytes + pr.autoloose_bytes;
+    uint64_t rest = g_status.pack_total > done_in ? g_status.pack_total - done_in : 0;
+    g_status.estimated_bytes = pr.out_bytes + (uint64_t)((double)rest * r) + g_status.loose_total + pr.autoloose_bytes + (2u << 20);
+  }
   g_status.percent = g_status.bytes_total ? (int)(g_status.bytes_done * 100 / g_status.bytes_total) : 0;
   snprintf(g_status.phase, sizeof g_status.phase, "%s", (const char *)ctx);
   if (t - g_last_report > 0.5) { g_last_report = t; snprintf(g_status.message, sizeof g_status.message, "%s", msg); }
@@ -313,6 +338,7 @@ static void run_job(job_request req) {
     if (req.resume) FAIL("source_missing", "source not available (plug the USB drive / mount the image, then resume)");
     FAIL("not_game", "not a PS5 game folder (sce_sys/param.json + eboot.bin)");
   }
+  covers_put_from_dir(game.title_id, src);   /* the image is open now: its pictures are kept for later */
   /* a game and its own conversion never run together */
   if (activity_title_running(game.title_id)) FAIL("game_running", "this game is running: close it, then start its conversion");
   if (!req.resume && !req.force) {
@@ -433,7 +459,20 @@ static void run_job(job_request req) {
   }
 
   uint64_t verify_bytes = req.verify ? entries.total_bytes : 0;
+  /* the forecast: the game's own blocks sampled the way the packer will treat them */
+  e2a_estimate est;
+  if (est_from_list(src, &entries, req.level, &est) != 0) est_from_history(game.title_id, entries.total_bytes, false, &est);
+  uint64_t image_bytes = req.smp_title[0] && e2a_is_file(req.source) ? (uint64_t)e2a_file_size(req.source) : 0;
+  e2a_log("forecast: %.2f GB of files (%.2f GB left as they are) -> about %.2f GB (%s)%s%.2f GB image", entries.total_bytes / 1e9,
+          est.loose / 1e9, est.predicted / 1e9, est.method, image_bytes ? ", from a " : "", image_bytes / 1e9);
   pthread_mutex_lock(&g_mx);
+  g_status.image_bytes = image_bytes;
+  g_status.estimated_bytes = est.predicted;
+  g_status.est_ratio = est.ratio;
+  snprintf(g_status.est_method, sizeof g_status.est_method, "%s", est.method);
+  g_status.verify_bytes = verify_bytes;
+  g_status.loose_total = est.loose;
+  g_status.pack_total = entries.total_bytes - est.loose;
   g_status.source_bytes = entries.total_bytes;
   g_status.bytes_total = entries.total_bytes + verify_bytes;
   g_status.bytes_done = 0;
@@ -521,7 +560,10 @@ static void run_job(job_request req) {
     resumable_error = true;
     begin_phase("verify", "checking every block", packed_total + loose_total);
     o.ctx = (void *)"verify";
+    double vt0 = e2a_now();
     int r = e2a_verify(dest, &o, &vs);
+    double vel = e2a_now() - vt0;   /* its speed, for the next forecasts (a long enough run only) */
+    if (r == E2A_PACK_OK && vel > 20.0 && vs.bytes > (1ull << 30)) est_set_verify_rate((double)vs.bytes / vel);
     if (r == E2A_PACK_PAUSED) { paused = true; goto done; }
     if (r != E2A_PACK_OK) {
       resumable_error = false;
@@ -535,6 +577,10 @@ static void run_job(job_request req) {
     uint64_t packed_bytes = dir_bytes(dest);
     pthread_mutex_lock(&g_mx);
     g_status.packed_bytes = packed_bytes;
+    g_status.estimated_bytes = packed_bytes;
+    est_remember(game.title_id, entries.total_bytes, g_status.image_bytes, packed_bytes);   /* the next forecasts learn */
+    e2a_log("sizes: %.2f GB of files -> %.2f GB converted (forecast was %.2f GB, %s)", entries.total_bytes / 1e9, packed_bytes / 1e9,
+            est.predicted / 1e9, est.method);
     g_status.shared_bytes = st.shared_bytes;
     pthread_mutex_unlock(&g_mx);
     char mpath[700], t[256], p[400], sj[1300], dj[1300];
@@ -1142,14 +1188,16 @@ static void add_code(char *list, size_t cap, const char *code) {
 int job_preflight(const char *path, const char *smp, const char *dest_base, char *json, size_t cap) {
   char errors[256] = "", warnings[256] = "", title[256] = "", tid[16] = "", root[600] = "";
   const char *compat = "later";
-  uint64_t source_bytes = 0;
+  uint64_t source_bytes = 0, image_bytes = 0;
+  bool packed_image = false;   /* a compressed image (pfsc) hides the size of what it holds */
   e2a_game g;
   memset(&g, 0, sizeof g);
   if (smp && smp[0]) {
     smp_game sg;
     if (!e2a_is_file(path)) add_code(errors, sizeof errors, "source_missing");
-    else source_bytes = (uint64_t)e2a_file_size(path);
+    else image_bytes = (uint64_t)e2a_file_size(path);
     if (smp_game_info(smp, &sg) == 0) {
+      packed_image = strcmp(sg.image_type, "pfsc") == 0 || strcmp(sg.image_type, "pfs") == 0;
       snprintf(tid, sizeof tid, "%s", sg.title_id);
       e2a_json_escape(sg.title, title, sizeof title);
       char mp[600];
@@ -1167,7 +1215,6 @@ int job_preflight(const char *path, const char *smp, const char *dest_base, char
     snprintf(root, sizeof root, "%s", path);
     snprintf(tid, sizeof tid, "%s", g.title_id);
     e2a_json_escape(g.title, title, sizeof title);
-    source_bytes = dir_bytes(path);
     char ai[700];
     snprintf(ai, sizeof ai, "%s/ampr_assets.index", path);
     if (e2a_is_file(ai)) add_code(warnings, sizeof warnings, "already_ampr");
@@ -1189,20 +1236,29 @@ int job_preflight(const char *path, const char *smp, const char *dest_base, char
   const char *want = dest_base && dest_base[0] ? dest_base : E2A_HOMEBREW_DIR;
   for (int i = 0; i < n; i++)
     if (!strcmp(st[i].base, want)) d = &st[i];
-  uint64_t need_max = source_bytes + (256ull << 20), need_typ = source_bytes / 10 * 6;
+  /* the forecast: the game's own files sampled when they can be read (a folder, a mounted image), else what
+   * an earlier run of this title taught, else the average of past conversions */
+  e2a_estimate est;
+  memset(&est, 0, sizeof est);
+  if (!root[0] || est_from_tree(root, 9, &est) != 0) est_from_history(tid, image_bytes, packed_image, &est);
+  source_bytes = est.content ? est.content : image_bytes;
+  uint64_t need_typ = est.predicted, need_max = source_bytes + (256ull << 20);
+  if (!est.content && packed_image) need_max = image_bytes * 2 + (256ull << 20);   /* what a pfsc holds is unknown */
   if (!d) add_code(errors, sizeof errors, "dest_missing");
   else if (!d->writable) add_code(errors, sizeof errors, "dest_readonly");
   else {
-    if (source_bytes && d->avail < source_bytes / 3) add_code(errors, sizeof errors, "space_insufficient");
+    if (need_typ && d->avail < need_typ / 10 * 9) add_code(errors, sizeof errors, "space_insufficient");
     else if (source_bytes && d->avail < need_max) add_code(warnings, sizeof warnings, "space_low");
     char out[700];
     snprintf(out, sizeof out, "%s/%s", want, tid);
     if (tid[0] && e2a_is_dir(out)) add_code(warnings, sizeof warnings, "already_exists");
   }
   int w = snprintf(json, cap,
-                   "{\"title_id\":\"%s\",\"title\":\"%s\",\"source_bytes\":%llu,\"need_typical\":%llu,\"need_max\":%llu,"
+                   "{\"title_id\":\"%s\",\"title\":\"%s\",\"source_bytes\":%llu,\"image_bytes\":%llu,\"estimate\":\"%s\","
+                   "\"need_typical\":%llu,\"need_max\":%llu,"
                    "\"dest_free\":%llu,\"dest_total\":%llu,\"compatible\":\"%s\",\"errors\":[%s],\"warnings\":[%s]}",
-                   tid, title, (unsigned long long)source_bytes, (unsigned long long)need_typ, (unsigned long long)need_max,
+                   tid, title, (unsigned long long)source_bytes, (unsigned long long)image_bytes, est.method ? est.method : "",
+                   (unsigned long long)need_typ, (unsigned long long)need_max,
                    (unsigned long long)(d ? d->avail : 0), (unsigned long long)(d ? d->total : 0), compat, errors, warnings);
   return w > 0 && (size_t)w < cap ? 0 : -1;
 }

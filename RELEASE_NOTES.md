@@ -47,7 +47,23 @@ Made by **V-10** · LZ4 format: **DLPSGAME** · AMPR emulator: drakmor/ampr_emu 
   update download with the HTTP library's codes, errors shown on screen) is kept in Settings › Log, sent to the
   engine as it happens (it stays there after the app closes, and in `/data/exfat2ampr/app.log`), shown on the
   web page under the engine's log, and served to tools at `/api/applog?since=N` (the engine's log at
-  `/api/log?since=N`), so a failure can be diagnosed from a PC without the TV.
+  `/api/log?since=N`), so a failure can be diagnosed from a PC without the TV. Screens are named in the log
+  and the engine's silence during the app's start is not noted.
+- **Diagnostic in one file**: Settings › Diagnostic (or the link at the bottom of the web page) writes
+  `exfat2ampr-diagnostic-<date>.txt` in the homebrew folder and on the first USB drive: versions, state of the
+  conversion, storages, sources, settings, plugins, the last lines of both logs; the pairing code and the
+  console's address are blanked, so the file can be posted or sent as it is.
+- **What each stage sustains**: while a game packs, the progress screen and the web page show the read,
+  compress and write rates of the last seconds, so a slow source is told apart from a slow destination.
+- The engine's log file starts again past 500 MB (the previous one stays as `.old`); the app's past 16 MB.
+- **Every cover shown**: a cover found once is kept by the engine (`/data/exfat2ampr/covers`) and served at once
+  afterwards; images ShadowMountPlus is slow to open (compressed `.ffpfsc`) get theirs fetched patiently in the
+  background, and the pictures of a game are kept when it is converted. Damaged pictures are skipped.
+- **Exact sizes and better forecasts**: sizes are counted like the console does (1 GB = 1,000,000,000 bytes)
+  with two decimals; the converted size is forecast from the game's own blocks (sampled and compressed the way
+  the packer does), refined while it packs and shown live (« files → about … »), with the image size beside it
+  when the game comes from an image; the time left counts the verification at its own, faster speed; every run
+  teaches the next forecasts.
 - Nine languages: English, French, Spanish, Italian, Russian, Portuguese, Chinese, Thai, Vietnamese; the
   web page for a PC or a phone (pairing with a 6-digit code or a QR code) adds Arabic.
 
@@ -92,5 +108,14 @@ du moteur indique toutes les deux minutes le débit de chaque étape (lecture, c
 l'app (Réglages › Journal) : écrans visités, réponses du moteur, chaque étape d'un téléchargement de mise à jour
 avec les codes de la bibliothèque HTTP, erreurs affichées ; il part au fur et à mesure vers le moteur (conservé
 après la fermeture de l'app, dans `/data/exfat2ampr/app.log`), s'affiche sur la page web et se lit à distance
-via `/api/applog?since=N`. La vidéo de présentation
+via `/api/applog?since=N`. Réglages › Diagnostic (ou le lien en bas de la page web) écrit un fichier
+`exfat2ampr-diagnostic-<date>.txt` dans le dossier homebrew et sur la première clé USB : versions, état,
+stockages, sources, réglages, plugins, dernières lignes des deux journaux, code d'appairage et adresse masqués.
+Pendant une conversion, l'écran de progression et la page web affichent le débit de lecture, de compression et
+d'écriture des dernières secondes. Le journal du moteur repart de zéro au-delà de 500 Mo (l'ancien gardé en
+`.old`). Jaquettes : toute jaquette trouvée une fois est gardée par le moteur et resservie aussitôt, celles des
+images lentes à ouvrir (`.ffpfsc`) sont récupérées patiemment en arrière-plan. Tailles : comptées comme la console
+(1 Go = 1 000 000 000 octets, deux décimales) ; taille finale prévue à partir des blocs du jeu lui-même, affinée et
+affichée en direct pendant la conversion, avec la taille de l'image d'origine ; temps restant plus juste (la
+vérification comptée à sa vraie vitesse). La vidéo de présentation
 (`exfat2ampr-presentation.mp4`, voix anglaise, sous-titres français) est jointe à la release.

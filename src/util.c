@@ -96,6 +96,11 @@ void e2a_log(const char *fmt, ...) {
   pthread_mutex_unlock(&g_log_mx);
 
   fprintf(stderr, "[exfat2ampr] %s\n", line);
+  static unsigned rot_check;
+  if ((++rot_check & 63) == 0) {   /* past E2A_LOG_MAX the file starts again, the previous one kept as .old */
+    struct stat st;
+    if (stat(E2A_LOG_FILE, &st) == 0 && (uint64_t)st.st_size > E2A_LOG_MAX) rename(E2A_LOG_FILE, E2A_LOG_FILE ".old");
+  }
   FILE *f = fopen(E2A_LOG_FILE, "a");
   if (f) {
     time_t t = time(NULL);
@@ -107,21 +112,21 @@ void e2a_log(const char *fmt, ...) {
   }
 }
 
-/* copy of the newest log lines that fit, taken under the log mutex (safe from any thread) */
-void e2a_log_tail_copy(char *out, size_t cap) {
+/* copy of the newest lines that fit, taken under the log mutex (safe from any thread) */
+static void ring_tail_copy(logring *r, char *out, size_t cap) {
   pthread_mutex_lock(&g_log_mx);
   if (cap) out[0] = 0;
-  int start = (g_log.head - g_log.count + LOG_LINES) % LOG_LINES, first = g_log.count;
+  int start = (r->head - r->count + LOG_LINES) % LOG_LINES, first = r->count;
   size_t need = 0;
-  for (int i = g_log.count - 1; i >= 0; i--) {   /* from the newest back: how many fit */
-    size_t n = strlen(g_log.lines[(start + i) % LOG_LINES]) + 1;
+  for (int i = r->count - 1; i >= 0; i--) {   /* from the newest back: how many fit */
+    size_t n = strlen(r->lines[(start + i) % LOG_LINES]) + 1;
     if (need + n + 1 > cap) break;
     need += n;
     first = i;
   }
   size_t pos = 0;
-  for (int i = first; i < g_log.count; i++) {
-    const char *l = g_log.lines[(start + i) % LOG_LINES];
+  for (int i = first; i < r->count; i++) {
+    const char *l = r->lines[(start + i) % LOG_LINES];
     size_t n = strlen(l);
     memcpy(out + pos, l, n);
     pos += n;
@@ -130,6 +135,8 @@ void e2a_log_tail_copy(char *out, size_t cap) {
   }
   pthread_mutex_unlock(&g_log_mx);
 }
+void e2a_log_tail_copy(char *out, size_t cap) { ring_tail_copy(&g_log, out, cap); }
+void e2a_applog_tail_copy(char *out, size_t cap) { ring_tail_copy(&g_applog, out, cap); }
 
 uint64_t e2a_log_since(uint64_t since, char *out, size_t cap) { return ring_since(&g_log, since, out, cap); }
 uint64_t e2a_applog_since(uint64_t since, char *out, size_t cap) { return ring_since(&g_applog, since, out, cap); }
@@ -143,7 +150,7 @@ void e2a_applog_add(const char *text, size_t len) {
   localtime_r(&t, &tm);
   strftime(ts, sizeof ts, "%H:%M:%S", &tm);
   struct stat st;
-  if (stat(E2A_APPLOG_FILE, &st) == 0 && st.st_size > (1 << 20)) rename(E2A_APPLOG_FILE, E2A_APPLOG_FILE ".old");
+  if (stat(E2A_APPLOG_FILE, &st) == 0 && (uint64_t)st.st_size > E2A_APPLOG_MAX) rename(E2A_APPLOG_FILE, E2A_APPLOG_FILE ".old");
   FILE *f = fopen(E2A_APPLOG_FILE, "a");
   size_t i = 0;
   while (i < len) {
@@ -352,6 +359,7 @@ int e2a_copy_file(const char *src, const char *dst, int64_t mtime) {
     if (e2a_write_all(out, buf, (size_t)r) != 0) { saved = errno; rc = -1; break; }
     if (e2a_copy_hook) e2a_copy_hook((uint64_t)r);
   }
+  if (rc == 0 && fsync(out) != 0) { saved = errno; rc = -1; }   /* on the disk before it gets its final name */
   close(in);
   if (close(out) != 0 && rc == 0) { saved = errno; rc = -1; }
   if (rc == 0) {

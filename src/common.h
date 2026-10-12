@@ -31,6 +31,8 @@
 #endif
 #define E2A_LOG_FILE E2A_STATE_DIR "/exfat2ampr.log"
 #define E2A_APPLOG_FILE E2A_STATE_DIR "/app.log"   /* the home-screen app's log, delivered over the local API */
+#define E2A_LOG_MAX (500ull << 20)     /* past this size the engine's log file starts again (the previous one stays as .old) */
+#define E2A_APPLOG_MAX (16ull << 20)   /* the app's log file, likewise */
 #define E2A_PROFILE_DIR E2A_STATE_DIR "/profiles"
 #define E2A_AMPR_RUNTIME_VERSION "0.4.2.1"   /* embedded libSceAmpr.sprx (drakmor/ampr_emu release) */
 #define E2A_AMPR_FORMAT "AMPRPAK4"
@@ -76,6 +78,7 @@ uint64_t e2a_log_since(uint64_t since, char *json_array, size_t cap);
 /* the home-screen app's own log: lines it delivers ('\n' separated), kept here so they outlive the app */
 void e2a_applog_add(const char *text, size_t len);
 uint64_t e2a_applog_since(uint64_t since, char *json_array, size_t cap);
+void e2a_applog_tail_copy(char *out, size_t cap);
 void e2a_json_escape(const char *in, char *out, size_t cap);
 
 /* sha256.c */

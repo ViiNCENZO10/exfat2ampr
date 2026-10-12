@@ -14,6 +14,8 @@
 
 /* GET (body == NULL) or POST form; fills *doc with the JSON answer. Returns the HTTP status, < 0 if unreachable. */
 int api_call(const char *path, const char *form, jdoc *doc);
+/* quiet: the engine's silence is not logged (while the app starts it) */
+void api_set_quiet(bool quiet);
 /* POST of raw bytes (the app's update, to the engine); JSON answer in *doc */
 int api_post_bytes(const char *path, const void *data, size_t len, jdoc *doc);
 /* raw GET (icons); *data malloc'd */

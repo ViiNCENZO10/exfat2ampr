@@ -42,5 +42,6 @@ int smp_game_info(const char *title_id, smp_game *g);
 
 /* GET /api/v1/games/icon?title_id=...: PNG bytes (caller frees) */
 int smp_icon(const char *title_id, uint8_t **png, size_t *len);
+int smp_icon_wait(const char *title_id, uint8_t **png, size_t *len, int timeout_s);   /* the background pass: patient */
 
 #endif

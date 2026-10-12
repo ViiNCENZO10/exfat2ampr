@@ -13,6 +13,9 @@
 #include "selfupdate.h"
 #include "scan.h"
 #include "plugins.h"
+#include "ampr_pack.h"
+#include "covers.h"
+#include "diag.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -99,6 +102,8 @@ static void api_state(int fd, const char *args) {
     e2a_json_escape(tail, log, sizeof log);
   }
   job_runtime_json(runtime, sizeof runtime);
+  e2a_pack_rates rt;
+  e2a_pack_rates_get(&rt);
   /* a failed or cancelled conversion can be started again; a checkpoint left behind can be resumed */
   char state_dir[700];
   snprintf(state_dir, sizeof state_dir, "%s/.e2a-state", s.dest);
@@ -124,6 +129,8 @@ static void api_state(int fd, const char *args) {
            "\"bytes_total\":%llu,\"bytes_done\":%llu,\"speed_bps\":%.0f,\"eta_seconds\":%lld,"
            "\"title_id\":\"%s\",\"title\":\"%s\",\"dest\":\"%s\",\"profile\":\"%s\",\"source_bytes\":%llu,\"packed_bytes\":%llu,"
            "\"shared_bytes\":%llu,\"started\":%llu,\"finished\":%llu,\"queue\":%s,\"runtime\":%s,"
+           "\"rates\":{\"read\":%.1f,\"compress\":%.1f,\"write\":%.1f,\"read_threads\":%d,\"workers\":%d},"
+           "\"image_bytes\":%llu,\"estimated_bytes\":%llu,\"estimate\":\"%s\","
            "\"storage_rev\":%llu,\"game_running\":\"%s\",\"game_mode\":%s,\"game_mode_enabled\":%s,\"log\":\"%s\"}",
            E2A_VERSION, names[s.state], s.phase, msg, s.code, s.reason, s.waiting ? "true" : "false",
            job_can_retry() ? "true" : "false", resumable ? "true" : "false", del, s.percent,
@@ -131,6 +138,8 @@ static void api_state(int fd, const char *args) {
            s.title_id, title, dest, prof,
            (unsigned long long)s.source_bytes, (unsigned long long)s.packed_bytes, (unsigned long long)s.shared_bytes,
            (unsigned long long)s.started, (unsigned long long)s.finished, queue, runtime,
+           rt.read_mbps, rt.compress_mbps, rt.write_mbps, rt.read_threads, rt.workers,
+           (unsigned long long)s.image_bytes, (unsigned long long)s.estimated_bytes, s.est_method,
            (unsigned long long)activity_storage_rev(), game, activity_game_mode() ? "true" : "false",
            activity_game_mode_enabled() ? "true" : "false", log);
   send_json(fd, 200, json);
@@ -207,14 +216,21 @@ static void send_png(int fd, const void *img, size_t len) {
 }
 
 /* a PNG file sent as it is; false when it is missing, too big or not a PNG */
+/* the title whose picture this connection looks for: what is found goes to the covers' cache too */
+static __thread char t_cover_tid[16];
+static __thread bool t_cover_bg;
+
 static bool send_png_file(int fd, const char *path, int64_t max) {
   int64_t size = e2a_file_size(path);
   if (size <= 8 || size > max) return false;
   char *img = NULL;
   size_t len = 0;
   if (e2a_read_text(path, &img, &len, (size_t)size) != 0) return false;
-  bool png = len > 8 && (unsigned char)img[0] == 0x89 && img[1] == 'P' && img[2] == 'N' && img[3] == 'G';
-  if (png) send_png(fd, img, len);
+  bool png = covers_png_ok(img, len);   /* a damaged file is skipped: the next source may have a good one */
+  if (png) {
+    send_png(fd, img, len);
+    if (t_cover_tid[0]) covers_put(t_cover_tid, t_cover_bg, img, len);
+  }
   free(img);
   return png;
 }
@@ -266,6 +282,18 @@ static void api_icon(int fd, const char *args) {
   static const char *const wide[] = {"sce_sys/pic0.png", "sce_sys/pic1.png", NULL};
   const char *const *mine = bg ? art : icons, *const *meta = bg ? meta_art : meta_icon;
   const int64_t max = bg ? (24 << 20) : (8 << 20);   /* a 4K key art can weigh a dozen MB */
+  snprintf(t_cover_tid, sizeof t_cover_tid, "%s", tid);
+  t_cover_bg = bg;
+  {   /* found once: served at once, whatever the source takes now (or if it is gone) */
+    uint8_t *png = NULL;
+    size_t plen = 0;
+    if (tid[0] && covers_get(tid, bg, &png, &plen)) {
+      t_cover_tid[0] = 0;
+      send_png(fd, png, plen);
+      free(png);
+      return;
+    }
+  }
   /* fastest first, every game and app gets its picture: the folder itself; the copy the console keeps of
    * every title it registered (local files, instant); an image ShadowMountPlus keeps mounted (its list,
    * kept 15 s); ShadowMountPlus' icon; at last a folder's key art used as an icon */
@@ -278,9 +306,16 @@ static void api_icon(int fd, const char *args) {
   if (!bg && tid[0]) {
     uint8_t *png = NULL;
     size_t plen = 0;
-    if (smp_icon(tid, &png, &plen) == 0) { send_png(fd, png, plen); free(png); return; }
+    if (smp_icon(tid, &png, &plen) == 0 && covers_png_ok(png, plen)) {
+      covers_put(tid, false, png, plen);
+      send_png(fd, png, plen);
+      free(png);
+      return;
+    }
+    free(png);
   }
   if (!bg && (folder || mp[0]) && send_from(fd, folder ? root : mp, wide, max)) return;
+  if (tid[0] && !bg) covers_want(tid);   /* slow or missing now: the background pass keeps trying, patiently */
   send_json(fd, 404, "{\"error\":\"no icon\"}");
 }
 
@@ -541,6 +576,28 @@ static void handle(int fd) {
     if (!local) send_json(fd, 403, "{\"error\":\"from the console only\"}");
     else { e2a_applog_add(body, body_len); send_json(fd, 200, "{\"ok\":true}"); }
   } else if (strcmp(path, "/api/applog") == 0) api_log_since(fd, args, true);
+  else if (strcmp(path, "/api/diagnostic") == 0) {   /* everything a bug report needs, in one text */
+    if (post) {
+      char paths[1400], err[200], j[1800];
+      if (diag_write(paths, sizeof paths, err, sizeof err) == 0) {
+        char pe[1400 * 2];
+        e2a_json_escape(paths, pe, sizeof pe);
+        snprintf(j, sizeof j, "{\"ok\":true,\"paths\":\"%.1500s\"}", pe);
+        send_json(fd, 200, j);
+      } else {
+        char ee[400];
+        e2a_json_escape(err, ee, sizeof ee);
+        snprintf(j, sizeof j, "{\"error\":\"%.300s\"}", ee);
+        send_json(fd, 500, j);
+      }
+    } else {
+      char *text = NULL;
+      size_t len = 0;
+      if (diag_build(&text, &len) == 0) send_response(fd, 200, "text/plain; charset=utf-8", text, len);
+      else send_json(fd, 500, "{\"error\":\"out of memory\"}");
+      free(text);
+    }
+  }
   else if (strcmp(path, "/api/check") == 0) {
     char p[600], smp[16], dst[300], out[1400];
     form_get(args, "path", p, sizeof p);

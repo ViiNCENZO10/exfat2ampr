@@ -150,9 +150,12 @@ typedef struct {
   uint64_t stg_off;
   volume *stg_vol;
   bool stg_failed;            /* a flush failed: the chunk records of this batch are not on disk, no checkpoint */
-  /* what each stage sustains, logged now and then */
+  /* what each stage sustains, logged now and then; w_*: the values at the start of the current window */
   double t_read, t_comp, t_write, t_rate_log;
   uint64_t b_read, b_comp, b_write;
+  double w_at, w_tr, w_tc, w_tw;
+  uint64_t w_br, w_bc, w_bw;
+  uint64_t autoloose;   /* bytes of files found incompressible and left as they are */
   /* worker outputs for the batch being processed */
   const uint8_t *cur_raw;
   const uint32_t *cur_len;
@@ -702,15 +705,50 @@ static int stg_put(packer *P, volume *v, uint64_t off, const void *data, size_t 
   return 0;
 }
 
+static pthread_mutex_t g_rates_mx = PTHREAD_MUTEX_INITIALIZER;
+static e2a_pack_rates g_rates;
+
+void e2a_pack_rates_get(e2a_pack_rates *out) {
+  pthread_mutex_lock(&g_rates_mx);
+  *out = g_rates;
+  pthread_mutex_unlock(&g_rates_mx);
+}
+
+static void rates_set(double r, double c, double w, int threads, int workers) {
+  pthread_mutex_lock(&g_rates_mx);
+  g_rates.read_mbps = r; g_rates.compress_mbps = c; g_rates.write_mbps = w;
+  g_rates.read_threads = threads; g_rates.workers = workers;
+  pthread_mutex_unlock(&g_rates_mx);
+}
+
+/* what is packed so far against what it takes on disk (volumes included, page padding too): the forecast */
+static void rate_totals(packer *P, uint64_t file_done) {
+  uint64_t out = 0;
+  for (uint32_t i = 0; i < P->nvols; i++) out += P->vols[i].pos;
+  pthread_mutex_lock(&g_rates_mx);
+  g_rates.in_bytes = P->packed_in + file_done;
+  g_rates.out_bytes = out;
+  g_rates.autoloose_bytes = P->autoloose;
+  pthread_mutex_unlock(&g_rates_mx);
+}
+
+/* every few seconds the rates of the last window go to the clients; every two minutes a line goes to the log */
 static void rate_log(packer *P, bool final) {
   double now = e2a_now();
-  if (!final && now - P->t_rate_log < RATE_LOG_S) return;
-  if (!P->b_read) return;
-  P->t_rate_log = now;
-  pthread_mutex_lock(&P->mx);
+  pthread_mutex_lock(&P->mx);   /* the reader thread updates these */
   double tr = P->t_read;
   uint64_t br = P->b_read;
   pthread_mutex_unlock(&P->mx);
+  if (!br) { if (final) rates_set(0, 0, 0, 0, 0); return; }
+  if (final) rates_set(0, 0, 0, 0, 0);
+  else if (now - P->w_at >= 3.0) {
+    double dtr = tr - P->w_tr, dtc = P->t_comp - P->w_tc, dtw = P->t_write - P->w_tw;
+    rates_set(dtr > 0 ? (double)(br - P->w_br) / dtr / 1e6 : 0, dtc > 0 ? (double)(P->b_comp - P->w_bc) / dtc / 1e6 : 0,
+              dtw > 0 ? (double)(P->b_write - P->w_bw) / dtw / 1e6 : 0, E2A_READ_THREADS, activity_workers(P->o->workers));
+    P->w_at = now; P->w_tr = tr; P->w_tc = P->t_comp; P->w_tw = P->t_write; P->w_br = br; P->w_bc = P->b_comp; P->w_bw = P->b_write;
+  }
+  if (!final && now - P->t_rate_log < RATE_LOG_S) return;
+  P->t_rate_log = now;
   e2a_log("pack stages: read %d MB/s (%d threads), compress %d MB/s (%d workers), write %d MB/s%s",
           tr > 0 ? (int)(br / tr / 1e6) : 0, E2A_READ_THREADS,
           P->t_comp > 0 ? (int)(P->b_comp / P->t_comp / 1e6) : 0, activity_workers(P->o->workers),
@@ -844,6 +882,7 @@ static int pack_one(packer *P, size_t index, uint64_t entry_count, uint64_t tota
         if (werr) { rc = storage_pause(werr) ? E2A_PACK_PAUSED : E2A_PACK_ERROR; if (rc == E2A_PACK_ERROR) break; }
       }
       rate_log(P, false);
+      rate_totals(P, file_done);
       if (o->progress) o->progress(o->ctx, P->packed_in + file_done, e->rel);
       {
         uint64_t batch = 0;
@@ -947,6 +986,11 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
     e2a_log("packer: %u MiB pools refused, trying smaller ones", P->pool >> 20);
   }
   P->t_rate_log = e2a_now();
+  P->w_at = P->t_rate_log;
+  rates_set(0, 0, 0, 0, 0);
+  pthread_mutex_lock(&g_rates_mx);
+  g_rates.in_bytes = g_rates.out_bytes = g_rates.autoloose_bytes = 0;
+  pthread_mutex_unlock(&g_rates_mx);
   P->comp_len = calloc(MAX_SLOTS, sizeof(int));
   P->raw_crc = calloc(MAX_SLOTS, sizeof(uint32_t));
   P->fp = calloc(MAX_SLOTS, 16);
@@ -1020,8 +1064,9 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
       int r = pack_one(P, i, entries->n, entries->total_bytes, e, &fr, so, fc, nc);
       if (r == E2A_PACK_PAUSED) { rc = E2A_PACK_PAUSED; goto out; }
       if (r < 0) goto out;
-      if (r == 1) { fr.flags = 0; fr.chunk_count = 0; fr.first_chunk = 0; fr.block_shift = 0; st->files_loose++; }
+      if (r == 1) { fr.flags = 0; fr.chunk_count = 0; fr.first_chunk = 0; fr.block_shift = 0; st->files_loose++; P->autoloose += e->size; }
       else P->packed_in += e->size;
+      rate_totals(P, 0);
     } else {
       st->files_loose++;
     }
@@ -1172,11 +1217,11 @@ out:
       }
     }
   }
+  rate_log(P, true);   /* the report takes mx: before it is destroyed */
   pthread_mutex_destroy(&P->mx);
   pthread_cond_destroy(&P->cv);
   pthread_mutex_destroy(&P->bgv_mx);
   pthread_cond_destroy(&P->bgv_cv);
-  rate_log(P, true);
   for (int k = 0; k < 2; k++) { free(P->raw[k]); free(P->raw_len[k]); }
   free(P->stg);
   free(P->comp); free(P->comp_len); free(P->raw_crc); free(P->fp); free(P->dd_tab);

@@ -20,6 +20,7 @@
 #define UPDATE_MAX (2ULL << 30)   /* a package is ~150 MB; never more than 2 GiB */
 
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_install_mx = PTHREAD_MUTEX_INITIALIZER;   /* a new download never truncates a package being installed */
 static int g_fd = -1;
 static uint64_t g_size, g_got;
 static char g_sha[65];
@@ -28,6 +29,7 @@ int selfupdate_begin(uint64_t size, const char *sha256_hex, char *err, size_t er
   bool hex = sha256_hex && strlen(sha256_hex) == 64;
   for (int i = 0; hex && i < 64; i++) hex = (sha256_hex[i] >= '0' && sha256_hex[i] <= '9') || (sha256_hex[i] >= 'a' && sha256_hex[i] <= 'f');
   if (!size || size > UPDATE_MAX || !hex) { snprintf(err, errcap, "bad size or sha256"); return -1; }
+  pthread_mutex_lock(&g_install_mx);
   pthread_mutex_lock(&g_mx);
   if (g_fd >= 0) close(g_fd);
   mkdir(E2A_STATE_DIR, 0777);
@@ -39,6 +41,7 @@ int selfupdate_begin(uint64_t size, const char *sha256_hex, char *err, size_t er
   g_got = 0;
   snprintf(g_sha, sizeof g_sha, "%s", sha256_hex);
   pthread_mutex_unlock(&g_mx);
+  pthread_mutex_unlock(&g_install_mx);
   if (rc == 0) e2a_log("app update: receiving %llu bytes", (unsigned long long)size);
   return rc;
 }
@@ -47,7 +50,7 @@ int selfupdate_chunk(uint64_t off, const void *data, size_t len, char *err, size
   pthread_mutex_lock(&g_mx);
   int rc = 0;
   if (g_fd < 0) { snprintf(err, errcap, "no update in progress"); rc = -1; }
-  else if (off != g_got || off + len > g_size) { snprintf(err, errcap, "piece out of order (%llu, expected %llu)", (unsigned long long)off, (unsigned long long)g_got); rc = -1; }
+  else if (off != g_got || off > g_size || len > g_size - off) { snprintf(err, errcap, "piece out of order (%llu, expected %llu)", (unsigned long long)off, (unsigned long long)g_got); rc = -1; }
   else if (e2a_write_all(g_fd, data, len) != 0) { snprintf(err, errcap, "write failed: %s", strerror(errno)); rc = -1; }
   else g_got += len;
   pthread_mutex_unlock(&g_mx);
@@ -74,7 +77,7 @@ static void app_package(char *out, size_t cap) {
   snprintf(out, cap, "%s/%s.ffpkg", E2A_HOMEBREW_DIR, E2A_APP_TITLE_ID);
 }
 
-int selfupdate_install(char *where, size_t wcap, char *err, size_t errcap) {
+static int install_package(char *where, size_t wcap, char *err, size_t errcap) {
   pthread_mutex_lock(&g_mx);
   int fd = g_fd;
   g_fd = -1;
@@ -96,7 +99,7 @@ int selfupdate_install(char *where, size_t wcap, char *err, size_t errcap) {
     unlink(UPDATE_PART);
     return -1;
   }
-  char target[600], staged[640], old[640];
+  char target[600], staged[640], old[640] = "";
   app_package(target, sizeof target);
   /* next to the target first (rename across file systems is a copy), then the swap */
   snprintf(staged, sizeof staged, "%s.new", target);
@@ -108,9 +111,20 @@ int selfupdate_install(char *where, size_t wcap, char *err, size_t errcap) {
     }
     unlink(UPDATE_PART);
   }
+  /* checked again where it lies now: a copy to another drive can go wrong */
+  if ((uint64_t)e2a_file_size(staged) != size || e2a_sha256_file(staged, hex) != 0 || strcasecmp(hex, sha) != 0) {
+    snprintf(err, errcap, "the package next to %s does not match the published SHA-256", target);
+    unlink(staged);
+    return -1;
+  }
   if (e2a_is_file(target)) {   /* the running version stays, renamed: nothing is deleted */
     snprintf(old, sizeof old, "%s.old", target);
     for (int k = 2; e2a_is_file(old) && k < 100; k++) snprintf(old, sizeof old, "%s.old%d", target, k);
+    if (e2a_is_file(old)) {   /* every name taken: never overwrite a kept version */
+      snprintf(err, errcap, "too many kept versions next to %s: move some .old files away", target);
+      unlink(staged);
+      return -1;
+    }
     if (rename(target, old) != 0) {
       snprintf(err, errcap, "cannot set %s aside: %s", target, strerror(errno));
       unlink(staged);
@@ -118,10 +132,20 @@ int selfupdate_install(char *where, size_t wcap, char *err, size_t errcap) {
     }
   }
   if (rename(staged, target) != 0) {
-    snprintf(err, errcap, "cannot put the new package in place: %s", strerror(errno));
+    int saved = errno;   /* the app must never be left without its package: the previous one goes back */
+    if (old[0] && rename(old, target) != 0)
+      snprintf(err, errcap, "install failed (%s); put %s back by hand", strerror(saved), old);
+    else snprintf(err, errcap, "cannot put the new package in place: %s; the previous one is back", strerror(saved));
     return -1;
   }
   snprintf(where, wcap, "%s", target);
   e2a_log("app update installed: %s (%llu bytes); restart the console to run it", target, (unsigned long long)size);
   return 0;
+}
+
+int selfupdate_install(char *where, size_t wcap, char *err, size_t errcap) {
+  pthread_mutex_lock(&g_install_mx);
+  int rc = install_package(where, wcap, err, errcap);
+  pthread_mutex_unlock(&g_install_mx);
+  return rc;
 }

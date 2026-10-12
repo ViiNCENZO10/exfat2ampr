@@ -152,8 +152,9 @@ static int read_test(const char *base, const char *mount) {
 /* ------------------------------------------------------------------ write */
 static int write_test(const char *base, char *err, size_t errcap) {
   char tmp[400];
-  snprintf(tmp, sizeof tmp, "%s/.e2a-speedtest.tmp", base);
-  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  int n = snprintf(tmp, sizeof tmp, "%s/.e2a-speedtest.XXXXXX", base);
+  if (n < 0 || (size_t)n >= sizeof tmp) { snprintf(err, errcap, "benchmark path too long"); return -1; }
+  int fd = mkstemp(tmp);   /* a new file of its own: never truncates an existing one or follows a link */
   if (fd < 0) { snprintf(err, errcap, "cannot write in %s: %s", base, strerror(errno)); return -1; }
   uint8_t *buf = malloc(WRITE_CHUNK);
   if (!buf) { close(fd); unlink(tmp); snprintf(err, errcap, "out of memory"); return -1; }
@@ -165,14 +166,13 @@ static int write_test(const char *base, char *err, size_t errcap) {
   uint64_t t0 = now_us(), bytes = 0;
   bool ok = true;
   while ((int64_t)bytes < WRITE_MAX) {
-    ssize_t w = write(fd, buf, WRITE_CHUNK);
-    if (w != WRITE_CHUNK) { ok = false; break; }
+    if (e2a_write_all(fd, buf, WRITE_CHUNK) != 0) { ok = false; break; }
     bytes += WRITE_CHUNK;
     if (now_us() - t0 > PHASE_MS * 1000ull) break;
   }
   if (fsync(fd) != 0) ok = false;
   uint64_t us = now_us() - t0;
-  close(fd);
+  if (close(fd) != 0) ok = false;
   unlink(tmp);
   free(buf);
   if (!ok) { snprintf(err, errcap, "write failed in %s (full or removed?)", base); return -1; }

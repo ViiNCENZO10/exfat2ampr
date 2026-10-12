@@ -2,6 +2,7 @@
  * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE. */
 #include "verify.h"
 #include "activity.h"
+#include "manifest_validate.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -146,13 +147,35 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
     hc.header_crc = 0;
     if (memcmp(h.magic, AMPR_MAGIC_PAK, 8) != 0 || h.version != 4 || h.header_size != 128 ||
         e2a_crc32(0, &hc, sizeof hc) != h.header_crc) { fail(vs, "manifest header invalid %s (%llu)", "", 0); goto out; }
-    if (idx_len != 128 + h.file_count * 48 + h.chunk_count * 12 + (uint64_t)h.pack_count * 32 + h.strings_size ||
+    if (!e2a_manifest_layout_valid(&h, idx_len) ||
         e2a_crc32(0, idx + 128, idx_len - 128) != h.payload_crc) { fail(vs, "manifest payload crc mismatch %s (%llu)", "", 0); goto out; }
   }
   const ampr_file_record *files = (const ampr_file_record *)(idx + h.files_offset);
   const ampr_chunk_record *chunks = (const ampr_chunk_record *)(idx + h.chunks_offset);
   const ampr_pack_record *packs = (const ampr_pack_record *)(idx + h.packs_offset);
   const char *strings = (const char *)(idx + h.strings_offset);
+  /* every record points inside the manifest before anything follows it */
+  for (uint64_t f = 0; f < h.file_count; f++) {
+    const ampr_file_record *fr = &files[f];
+    if (!e2a_manifest_string_valid(strings, h.strings_size, fr->path_offset, fr->path_length) ||
+        fr->first_chunk > h.chunk_count || fr->chunk_count > h.chunk_count - fr->first_chunk) {
+      fail(vs, "invalid file record %s (%llu)", "", (unsigned long long)f);
+      goto out;
+    }
+    if (fr->flags & AMPR_FILE_PACKED) {
+      if (fr->block_shift < 14 || fr->block_shift > 20) { fail(vs, "invalid block size %s (%llu)", "", (unsigned long long)f); goto out; }
+      uint64_t bs = 1ull << fr->block_shift;
+      if (fr->chunk_count != fr->logical_size / bs + (fr->logical_size % bs != 0)) {
+        fail(vs, "chunks do not cover the file %s (%llu)", "", (unsigned long long)f);
+        goto out;
+      }
+    }
+  }
+  for (uint32_t p = 0; p < h.pack_count; p++)
+    if (!e2a_manifest_string_valid(strings, h.strings_size, packs[p].name_offset, packs[p].name_length)) {
+      fail(vs, "invalid volume name %s (%llu)", "", (unsigned long long)p);
+      goto out;
+    }
 
   snprintf(path, sizeof path, "%s/ampr_assets.index.crc", out_dir);
   if (read_file(path, &crcf, &crc_len) != 0 || crc_len < sizeof(ampr_crc_header)) { fail(vs, "cannot read %s (%llu)", path, 0); goto out; }
@@ -161,9 +184,9 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
   {
     ampr_crc_header cc = ch;
     cc.header_crc = 0;
-    if (memcmp(ch.magic, AMPR_MAGIC_CRC, 8) != 0 || e2a_crc32(0, &cc, sizeof cc) != ch.header_crc ||
+    if (memcmp(ch.magic, AMPR_MAGIC_CRC, 8) != 0 || ch.version != 1 || ch.header_size != 48 || e2a_crc32(0, &cc, sizeof cc) != ch.header_crc ||
         memcmp(ch.build_id, h.build_id, 16) != 0 || ch.chunk_count != h.chunk_count ||
-        crc_len != 48 + 4 * ch.chunk_count || e2a_crc32(0, crcf + 48, crc_len - 48) != ch.payload_crc) {
+        ch.chunk_count > (crc_len - 48) / 4 || crc_len != 48 + 4 * ch.chunk_count || e2a_crc32(0, crcf + 48, crc_len - 48) != ch.payload_crc) {
       fail(vs, "crc sidecar invalid or not matching the manifest %s (%llu)", "", 0); goto out;
     }
   }
@@ -292,12 +315,17 @@ int e2a_manifest_actions(const char *out_dir, e2a_list *l) {
   if (read_file(path, &idx, &idx_len) != 0 || idx_len < sizeof(ampr_pak_header)) { free(idx); return -1; }
   ampr_pak_header h;
   memcpy(&h, idx, sizeof h);
-  if (memcmp(h.magic, AMPR_MAGIC_PAK, 8) != 0 || h.file_count != l->n || idx_len < 128 + h.file_count * 48) { free(idx); return -1; }
+  ampr_pak_header hc = h;   /* a resume trusts this manifest: the same checks as the verification */
+  hc.header_crc = 0;
+  if (memcmp(h.magic, AMPR_MAGIC_PAK, 8) != 0 || h.version != 4 || h.header_size != 128 || h.file_count != l->n ||
+      !e2a_manifest_layout_valid(&h, idx_len) || e2a_crc32(0, &hc, sizeof hc) != h.header_crc ||
+      e2a_crc32(0, idx + 128, idx_len - 128) != h.payload_crc) { free(idx); return -1; }
   const ampr_file_record *files = (const ampr_file_record *)(idx + h.files_offset);
   for (size_t i = 0; i < l->n; i++) {
     char canon[1100];
     snprintf(canon, sizeof canon, "/app0/%s", l->v[i].rel);
-    if (files[i].path_hash != e2a_fnv1a64_fold(canon, strlen(canon))) { free(idx); return -1; }
+    if (files[i].path_hash != e2a_fnv1a64_fold(canon, strlen(canon)) || files[i].logical_size != l->v[i].size ||
+        (!l->v[i].synthetic && files[i].mtime != l->v[i].mtime)) { free(idx); return -1; }   /* the source changed */
     if (!(files[i].flags & AMPR_FILE_PACKED)) l->v[i].action = E2A_LOOSE;
     else l->v[i].action = (files[i].flags & AMPR_FILE_STORE_ONLY) ? E2A_STORE : E2A_COMPRESS;
   }

@@ -39,6 +39,18 @@ jobs:
           ./unit_test
       - name: Generate a synthetic game
         run: python3 tests/make_game.py testgame
+      - name: Manifest bounds regression tests (ASan/UBSan)
+        run: |
+          gcc -std=gnu11 -O1 -Wall -Wextra -Werror -fsanitize=address,undefined -Isrc tests/manifest_test.c -o manifest_test
+          ./manifest_test
+      - name: Update integrity regression tests
+        run: |
+          gcc -std=gnu11 -D_GNU_SOURCE -DE2A_HOST -O1 -Wall -Wextra -Werror -Isrc src/util.c src/sha256.c src/selfupdate.c tests/update_test.c -pthread -lm -o update_test
+          mkdir -p update-test-work
+          cd update-test-work
+          ../update_test
+      - name: Benchmark runner syntax
+        run: python3 -m py_compile tools/benchmark.py
       - name: Pack (forced pause after 48 MiB)
         run: |
           set +e
@@ -270,7 +282,7 @@ jobs:
           grep "\[applog\]" mock_fr.log | head -20
           grep -q "\[applog\].*app starting" mock_fr.log
           grep -q "\[applog\].*engine ready" mock_fr.log
-          test "$(grep -c "\[applog\].*ui: screen" mock_fr.log)" -ge 3
+          test "$(grep -c "\[applog\].*ui: " mock_fr.log)" -ge 3
           run en 1 18002 "$MAIN" MOCK_STORAGE=several
           run ru 8 18003 "wait:3000 shot:01_games cross wait:600 down cross wait:800 shot:02_destinations" MOCK_STORAGE=several
           run usb_none 2 18004 "wait:2600 cross wait:600 down cross wait:800 shot:01_destinations circle up cross wait:1500 shot:02_check" MOCK_STORAGE=none

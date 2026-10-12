@@ -393,11 +393,13 @@ int smp_unmount(const char *title_id, char *errmsg, size_t errcap) {
   return rc;
 }
 
-int smp_icon(const char *title_id, uint8_t **png, size_t *len) {
+int smp_icon(const char *title_id, uint8_t **png, size_t *len) { return smp_icon_wait(title_id, png, len, 4); }   /* a cover: never worth a long wait */
+
+int smp_icon_wait(const char *title_id, uint8_t **png, size_t *len, int timeout_s) {
   char path[96], *body = NULL;
   size_t n = 0;
   snprintf(path, sizeof path, "/api/v1/games/icon?title_id=%.12s", title_id);
-  int st = smp_http("GET", path, NULL, &body, &n, 4);   /* a cover: never worth a long wait */
+  int st = smp_http("GET", path, NULL, &body, &n, timeout_s);
   if (st != 200 || n < 8 || (unsigned char)body[0] != 0x89) { free(body); return -1; }
   *png = (uint8_t *)body;
   *len = n;

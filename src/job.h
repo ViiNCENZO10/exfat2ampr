@@ -49,6 +49,10 @@ typedef struct {
   char title[128];
   char profile[320];                  /* profile file applied, empty = blind */
   uint64_t source_bytes, packed_bytes, shared_bytes;
+  /* forecasts: the image file (0 for a folder), the converted size expected (refined while packing) */
+  uint64_t image_bytes, estimated_bytes, pack_total, loose_total, verify_bytes;
+  double est_ratio;
+  char est_method[12];
   uint64_t started, finished;         /* unix seconds */
   int queue_len;
   char queue[E2A_QUEUE_MAX][96];

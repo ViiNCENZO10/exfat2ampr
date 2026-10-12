@@ -40,7 +40,7 @@ DLC_URL     := https://github.com/drakmor/dlc_emu/releases/download/$(DLC_VERSIO
 PLUGIN_DIR  := third_party/plugins
 PLUGINS     := $(PLUGIN_DIR)/libScePlayGo.sprx $(PLUGIN_DIR)/dlc_emu.ok
 
-CORE_SRCS := src/util.c src/sha256.c src/scan.c src/profile.c src/ampr_index.c src/ampr_pack.c src/verify.c src/smp.c src/trace.c src/pair.c src/storage.c src/bench.c src/selfupdate.c src/activity.c src/plugins.c src/job.c src/httpd.c
+CORE_SRCS := src/util.c src/sha256.c src/scan.c src/profile.c src/ampr_index.c src/ampr_pack.c src/verify.c src/smp.c src/trace.c src/pair.c src/storage.c src/bench.c src/selfupdate.c src/activity.c src/plugins.c src/diag.c src/covers.c src/estimate.c src/job.c src/httpd.c
 GEN       := gen/index_html.c gen/libSceAmpr_sprx.c gen/libSceAmpr_debug_sprx.c gen/plugin_playgo.c gen/plugin_appcontent.c gen/plugin_gameupdate.c gen/plugin_entitlement.c
 COMMON_CFLAGS := -O2 -g -Wall -Wextra -std=gnu11 -Isrc -I$(LZ4_DIR) -DE2A_VERSION=\"$(VERSION)\" -DLOG_JSON_CAP=20000
 

@@ -1279,6 +1279,23 @@ static const char *const STR[S_COUNT][LANG_COUNT] = {
                   "也可在网页和 API（/api/applog）中查看；应用关闭后日志仍保留在引擎中",
                   "อ่านได้จากหน้าเว็บและ API (/api/applog) ด้วย บรรทัดจะยังอยู่ในเอนจินหลังปิดแอป",
                   "Cũng đọc được từ trang web và API (/api/applog); các dòng vẫn còn trong engine sau khi đóng ứng dụng"},
+  /* the diagnostic file (Settings): everything a bug report needs, written to the homebrew folder and a USB drive */
+  [S_DIAG] = {"Diagnostic", "Diagnostic", "Diagnóstico", "Diagnostica", "Диагностика", "Diagnóstico", "诊断", "การวินิจฉัย", "Chẩn đoán"},
+  [S_DIAG_DONE] = {"Diagnostic écrit : %s", "Diagnostic written: %s", "Diagnóstico guardado: %s", "Diagnostica scritta: %s", "Диагностика записана: %s", "Diagnóstico gravado: %s", "诊断已写入：%s", "เขียนไฟล์วินิจฉัยแล้ว: %s", "Đã ghi chẩn đoán: %s"},
+  [S_DIAG_FAIL] = {"Diagnostic impossible (%s)", "Diagnostic failed (%s)", "Diagnóstico imposible (%s)", "Diagnostica non riuscita (%s)", "Диагностика не удалась (%s)", "Diagnóstico falhou (%s)", "诊断失败（%s）", "การวินิจฉัยล้มเหลว (%s)", "Chẩn đoán thất bại (%s)"},
+  /* sizes on the progress screen: files → converted (gain), and the image the game came from */
+  [S_SIZE_DONE] = {"Fichiers %s → %s compressé%s", "Files %s → %s packed%s", "Archivos %s → %s comprimido%s", "File %s → %s compresso%s",
+                   "Файлы %s → %s после сжатия%s", "Arquivos %s → %s comprimido%s", "文件 %s → 压缩后 %s%s", "ไฟล์ %s → บีบอัดแล้ว %s%s",
+                   "Tệp %s → %s sau khi nén%s"},
+  [S_SIZE_EST] = {"Fichiers %s → environ %s après compression%s", "Files %s → about %s once packed%s", "Archivos %s → unos %s al comprimir%s",
+                  "File %s → circa %s dopo la compressione%s", "Файлы %s → около %s после сжатия%s", "Arquivos %s → cerca de %s depois de comprimir%s",
+                  "文件 %s → 压缩后约 %s%s", "ไฟล์ %s → ประมาณ %s หลังบีบอัด%s", "Tệp %s → khoảng %s sau khi nén%s"},
+  [S_SIZE_IMAGE] = {" · image %s", " · image %s", " · imagen %s", " · immagine %s", " · образ %s", " · imagem %s", " · 镜像 %s", " · อิมเมจ %s", " · ảnh %s"},
+  /* what each stage of the packer sustains (progress screen) */
+  [S_RATES] = {"Lecture %d Mo/s · Compression %d Mo/s · Écriture %d Mo/s", "Read %d MB/s · Compress %d MB/s · Write %d MB/s",
+               "Lectura %d MB/s · Compresión %d MB/s · Escritura %d MB/s", "Lettura %d MB/s · Compressione %d MB/s · Scrittura %d MB/s",
+               "Чтение %d МБ/с · Сжатие %d МБ/с · Запись %d МБ/с", "Leitura %d MB/s · Compressão %d MB/s · Gravação %d MB/s",
+               "读取 %d MB/s · 压缩 %d MB/s · 写入 %d MB/s", "อ่าน %d MB/s · บีบอัด %d MB/s · เขียน %d MB/s", "Đọc %d MB/s · Nén %d MB/s · Ghi %d MB/s"},
   /* the author's advice next to every option: the defaults are the recommended values */
   [S_RECO] = {"Recommandé", "Recommended", "Recomendado", "Consigliato", "Рекомендуется", "Recomendado", "推荐", "แนะนำ", "Khuyến nghị"},
   [S_LESS_RECO] = {"Moins recommandé", "Less recommended", "Menos recomendado", "Meno consigliato", "Менее рекомендуется", "Menos recomendado", "不太推荐", "ไม่ค่อยแนะนำ", "Ít khuyến nghị"},

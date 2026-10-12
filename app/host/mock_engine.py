@@ -332,6 +332,7 @@ def state_json():
     if s == "done" and not STATE["code"]:
         STATE["code"] = "done"
     return {"version": VERSION, "state": s, "phase": "waiting" if waiting else "pack" if s != "idle" else "",
+            "rates": {"read": 41.5, "compress": 152.0, "write": 88.0, "read_threads": 4, "workers": 6} if s == "running" and not waiting else {"read": 0, "compress": 0, "write": 0, "read_threads": 0, "workers": 0},
             "message": STATE["message"] or "data/level3/world_3.pak", "code": STATE["code"], "reason": STATE["reason"],
             "waiting": waiting, "can_retry": s in ("error", "cancelled") and STATE["retry"], "resumable": False,
             "deleting": DELETE["active"], "delete_seq": DELETE["seq"], "delete_ok": DELETE["ok"], "delete_code": DELETE["code"],
@@ -339,7 +340,7 @@ def state_json():
             "percent": pct, "bytes_total": total, "bytes_done": done, "speed_bps": 187e6 if not game else 61e6,
             "eta_seconds": 1342 if not game else 4120,
             "title_id": STATE["title_id"], "title": STATE["title"], "dest": "/mnt/usb0/homebrew/PPSA02530", "profile": "",
-            "source_bytes": total, "packed_bytes": total * 0.61 if s == "done" else 0, "shared_bytes": 0, "started": 0, "finished": 0,
+            "source_bytes": total, "packed_bytes": total * 0.61 if s == "done" else 0, "shared_bytes": 0, "estimated_bytes": int(total * 0.62), "image_bytes": 0, "estimate": "sampled", "started": 0, "finished": 0,
             "queue": STATE["queue"], "runtime": {}, "storage_rev": storage_rev(), "game_running": game,
             "game_mode": bool(game) and SETTINGS["game_mode"], "game_mode_enabled": SETTINGS["game_mode"], "log": ""}
 
@@ -383,6 +384,11 @@ def check(path, smp, dest):
             "errors": errors, "warnings": warnings}
 
 
+def diag_text():
+    lines = ["exFAT2AMPR diagnostic (mock)", "engine " + VERSION, "", "== app log (memory) =="] + [l for n, l in APPLOG]
+    return "\n".join(lines) + "\n"
+
+
 APPLOG = []        # (seq, line) received from the app
 APPLOG_SEQ = [0]
 
@@ -404,6 +410,8 @@ class H(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(u.query)
         if u.path == "/api/state":
             return self.send(200, state_json())
+        if u.path == "/api/diagnostic":   # the text a bug report needs
+            return self.send(200, diag_text().encode("utf-8"), "text/plain; charset=utf-8")
         if u.path == "/api/applog" or u.path == "/api/log":   # incremental reads: the lines after since=
             since = int(q.get("since", ["0"])[0] or 0)
             lines = [l for n, l in APPLOG if n > since] if u.path == "/api/applog" else []
@@ -462,6 +470,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send(400, {"error": "piece out of order"})
             UPDATE["got"] += raw
             return self.send(200, {"ok": True})
+        if path == "/api/diagnostic":
+            return self.send(200, {"ok": True, "paths": "/data/homebrew/exfat2ampr-diagnostic-20261013-000000.txt, /mnt/usb0/homebrew/exfat2ampr-diagnostic-20261013-000000.txt"})
         if path == "/api/applog":   # the app's own log lines, printed so the CI log shows them
             for line in raw.decode("utf-8", "replace").splitlines():
                 if line.strip():

@@ -65,6 +65,8 @@ typedef struct {
   char state[16], phase[24], message[300], title[160], title_id[16], dest[600], version[48];
   int percent, queue_len;
   double speed, total, done, source_bytes, packed_bytes, shared_bytes;
+  double rate_read, rate_comp, rate_write;   /* MB/s of each stage of the packer, zeros when nothing packs */
+  double image_bytes, estimated_bytes;       /* the image file (0: a folder); the converted size expected */
   long long eta;
   char queue[16][96];
   double storage_rev;
@@ -84,7 +86,7 @@ typedef struct {
 
 enum { TAB_GAMES, TAB_PROGRESS, TAB_RESUME, TAB_SETTINGS, TAB_COUNT };
 enum { SCR_BOOT, SCR_MAIN, SCR_OPTIONS, SCR_PAIR, SCR_DEST, SCR_CHECK, SCR_OPTIMIZE, SCR_LOG };
-enum { SET_LANG, SET_GAME_MODE, SET_SOUNDS, SET_ANIMS, SET_PAIR, SET_PLUGINS, SET_UPDATE, SET_LOG, SET_QUIT, SET_COUNT };
+enum { SET_LANG, SET_GAME_MODE, SET_SOUNDS, SET_ANIMS, SET_PAIR, SET_PLUGINS, SET_UPDATE, SET_LOG, SET_DIAG, SET_QUIT, SET_COUNT };
 enum { TOAST_INFO, TOAST_OK, TOAST_ERR };
 
 static game_t g_games[MAX_GAMES];
@@ -162,9 +164,16 @@ static void toast_err(const char *msg) { toast_kind(msg, TOAST_ERR); }
 /* ---------------------------------------------------------------- formats -- */
 static void fmt_bytes(char *out, size_t cap, double b) {
   int l = i18n_get();
+  /* decimal units, as the console's own storage screen counts (1 GB = 1 000 000 000 bytes): the sizes shown
+   * here match the PS5's; two decimals below 100 GB, one above, terabytes past 1000 GB */
+  const char *tb = l == LANG_FR ? "To" : l == LANG_RU ? "ТБ" : "TB";
   const char *gb = l == LANG_FR ? "Go" : l == LANG_RU ? "ГБ" : "GB", *mb = l == LANG_FR ? "Mo" : l == LANG_RU ? "МБ" : "MB";
-  if (b >= 1073741824.0) snprintf(out, cap, "%.1f %s", b / 1073741824.0, gb);
-  else snprintf(out, cap, "%.0f %s", b / 1048576.0, mb);
+  if (b < 0) b = 0;
+  if (b >= 1e12) snprintf(out, cap, "%.2f %s", b / 1e12, tb);
+  else if (b >= 1e11) snprintf(out, cap, "%.1f %s", b / 1e9, gb);
+  else if (b >= 1e9) snprintf(out, cap, "%.2f %s", b / 1e9, gb);
+  else if (b >= 1e7) snprintf(out, cap, "%.0f %s", b / 1e6, mb);
+  else snprintf(out, cap, "%.1f %s", b / 1e6, mb);
   if (l != LANG_EN && l != LANG_ZH && l != LANG_TH)   /* 199,1 Go: a decimal comma everywhere else */
     for (char *c = out; *c; c++)
       if (*c == '.') *c = ',';
@@ -385,6 +394,10 @@ static void poll_status(void) {
     s.source_bytes = json_num(r, "source_bytes", 0);
     s.packed_bytes = json_num(r, "packed_bytes", 0);
     s.shared_bytes = json_num(r, "shared_bytes", 0);
+    s.image_bytes = json_num(r, "image_bytes", 0);
+    s.estimated_bytes = json_num(r, "estimated_bytes", 0);
+    const jnode *rt = json_get(r, "rates");
+    if (rt) { s.rate_read = json_num(rt, "read", 0); s.rate_comp = json_num(rt, "compress", 0); s.rate_write = json_num(rt, "write", 0); }
     const jnode *q = json_get(r, "queue");
     for (const jnode *n = q ? q->child : NULL; n && s.queue_len < 16; n = n->next)
       if (n->type == J_STR) scopy(s.queue[s.queue_len++], 96, n->str);
@@ -428,8 +441,12 @@ static void poll_status(void) {
   }
   if (memcmp(&s, &g_st, sizeof s) != 0) {
     if (s.ok != g_st.ok || strcmp(s.state, g_st.state) != 0 || strcmp(s.phase, g_st.phase) != 0 || strcmp(s.title_id, g_st.title_id) != 0 ||
-        strcmp(s.version, g_st.version) != 0)
-      app_log("engine %.12s: %s%.16s / %.24s %.12s %.100s", s.version, s.ok ? "" : "no answer, ", s.state, s.phase, s.title_id, s.message);
+        strcmp(s.version, g_st.version) != 0) {
+      char what[200];
+      snprintf(what, sizeof what, "%s%s%s%s%s%s", s.state, s.phase[0] ? " / " : "", s.phase, s.title_id[0] ? " " : "", s.title_id,
+               s.message[0] ? " — " : "");
+      app_log("engine %.12s: %s%s%.100s", s.version, s.ok ? "" : "no answer, ", what, s.message);
+    }
     bool finished = g_st.ok && !strcmp(g_st.state, "running") && strcmp(s.state, "running") != 0;
     bool started = g_st.ok && !strcmp(s.state, "running") &&
                    (strcmp(g_st.state, "running") != 0 || (g_st.title_id[0] && strcmp(g_st.title_id, s.title_id) != 0));
@@ -997,6 +1014,10 @@ static void draw_progress(void) {
   if (error || cancelled || paused || waiting || done)
     gfx_text_wrap(&FONT_BODY, tx, y + 166, msg, error ? RGB(255, 178, 178) : paused || waiting ? RGB(255, 214, 150) : done ? C_OK : C_DIM, tw, 3);
   else gfx_text_wrap(&FONT_SMALL, tx, y + 170, msg, C_DIM, w - 340, 2);   /* the file being packed */
+  if (running && !waiting && !strcmp(g_st.phase, "pack") && g_st.rate_read > 0) {   /* what each stage sustains */
+    snprintf(line, sizeof line, T(S_RATES), (int)(g_st.rate_read + 0.5), (int)(g_st.rate_comp + 0.5), (int)(g_st.rate_write + 0.5));
+    gfx_text(&FONT_SMALL, tx, y + 238, line, C_DIM, w - 340);
+  }
   gfx_pop();
 
   /* percentage: counts smoothly between the engine's updates; left alone for a while, the bar
@@ -1066,12 +1087,27 @@ static void draw_progress(void) {
   stat_card(bx, cy, cw, T(S_PROGRESS), v1, C_TEXT);
   stat_card(bx + cw + 24, cy, cw, T(S_SPEED), running && !waiting ? line : "—", C_TEXT);   /* no speed or time left while paused */
   stat_card(bx + 2 * (cw + 24), cy, cw, T(S_ETA), running && !waiting ? d : "—", C_TEXT);
-  if (done && g_st.source_bytes > 0) {
-    char s1[32], s2[32];
+  if (g_st.source_bytes > 0 && (done || running || paused)) {
+    /* the game's files → the converted game (expected while it works, real once done), the gain, and the
+     * image it came from when there was one */
+    char s1[32], s2[32], s3[32], gain[32] = "";
+    double after = done ? g_st.packed_bytes : g_st.estimated_bytes;
     fmt_bytes(s1, sizeof s1, g_st.source_bytes);
-    fmt_bytes(s2, sizeof s2, g_st.packed_bytes);
-    snprintf(line, sizeof line, "%s → %s (%s)", s1, s2, T(S_PACKED));
-    gfx_text(&FONT_BODY, bx, cy + 128, line, C_OK, bw);
+    fmt_bytes(s2, sizeof s2, after);
+    if (after > 0 && after < g_st.source_bytes) {
+      snprintf(gain, sizeof gain, "  −%.1f %%", 100.0 * (1.0 - after / g_st.source_bytes));
+      int l = i18n_get();
+      if (l != LANG_EN && l != LANG_ZH && l != LANG_TH)
+        for (char *p = gain; *p; p++) if (*p == '.') *p = ',';
+    }
+    if (after > 0) snprintf(line, sizeof line, T(done ? S_SIZE_DONE : S_SIZE_EST), s1, s2, gain);
+    else snprintf(line, sizeof line, "%s", s1);
+    if (g_st.image_bytes > 0) {
+      fmt_bytes(s3, sizeof s3, g_st.image_bytes);
+      size_t n = strlen(line);
+      snprintf(line + n, sizeof line - n, T(S_SIZE_IMAGE), s3);
+    }
+    gfx_text(&FONT_BODY, bx, cy + 128, line, done ? C_OK : C_DIM, bw);
   }
   gfx_pop();
   /* queue */
@@ -1114,7 +1150,7 @@ static void draw_resume(void) {
 static void draw_settings(void) {
   const int x = 80, y = 230, w = 1060, h = 730, row = 88;
   panel(x, y, w, h);
-  const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_GAME_MODE), T(S_SOUNDS), T(S_ANIMS), T(S_PAIR), T(S_PLUGINS), T(S_UPDATES), T(S_LOG), T(S_QUIT_APP)};
+  const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_GAME_MODE), T(S_SOUNDS), T(S_ANIMS), T(S_PAIR), T(S_PLUGINS), T(S_UPDATES), T(S_LOG), T(S_DIAG), T(S_QUIT_APP)};
   static anim_val sel_v, tog[3];
   float sv = anim_track(&sel_v, (float)g_set_sel, 22.0f, 0.002f);
   row_push(g_set_sel);
@@ -1139,7 +1175,7 @@ static void draw_settings(void) {
       char n[32];
       snprintf(n, sizeof n, "%d  ›", app_log_count());
       gfx_text_right(&FONT_HEAD, x + w - 44, ry + 25, n, C_DIM);
-    }
+    } else if (i == SET_DIAG) gfx_text_right(&FONT_HEAD, x + w - 44, ry + 25, "›", C_DIM);
     else if (i == SET_PLUGINS) {   /* the embedded releases and the last pass over the games */
       char v[160];
       if (!g_plug.ok) scopy(v, sizeof v, "…");
@@ -1364,6 +1400,19 @@ static void draw_log(void) {
   else snprintf(pos, sizeof pos, "%d", total);
   gfx_text_right(&FONT_SMALL, 1800, 930, pos, C_DIM);
   gfx_text(&FONT_SMALL, 120, 930, T(S_LOG_HINT), C_DIM, 1400);
+}
+
+/* the diagnostic: the engine writes one text (versions, state, storages, logs) in the homebrew folder and on a
+ * USB drive; the toast says where */
+static void diag_run(void) {
+  jdoc d;
+  int st = api_call("/api/diagnostic", "", &d);
+  char m[400];
+  if (st == 200 && d.root) snprintf(m, sizeof m, T(S_DIAG_DONE), json_str(d.root, "paths", "?"));
+  else snprintf(m, sizeof m, T(S_DIAG_FAIL), d.root ? json_str(d.root, "error", "?") : "engine not answering");
+  json_free(&d);
+  if (st == 200) toast_kind(m, TOAST_OK);
+  else toast_err(m);
 }
 
 /* start screen: the app icon in a breathing halo, a spinner while the engine gets ready */
@@ -1650,6 +1699,7 @@ static void boot(void) {
 static void boot_finish(void) {
   if (plat_ms() - g_boot_started < SPLASH_MS) return;
   __atomic_store_n(&g_boot_state, 0, __ATOMIC_RELEASE);
+  api_set_quiet(false);
   app_log("engine ready: result %d, version %.16s (the app shipped with %.16s)", g_boot_result, g_engine_version, g_boot_want);
   switch (g_boot_result) {
     case ENGINE_OK: break;
@@ -1955,6 +2005,7 @@ static void handle_input(uint32_t p) {
       }
       if (g_set_sel == SET_PAIR && (p & BTN_CROSS)) { load_pair(); g_screen = SCR_PAIR; snd_cue_frame(SND_SELECT); }
       if (g_set_sel == SET_LOG && (p & BTN_CROSS)) { g_log_scroll = 0; g_screen = SCR_LOG; snd_cue_frame(SND_SELECT); }
+      if (g_set_sel == SET_DIAG && (p & BTN_CROSS)) { snd_cue_frame(SND_SELECT); diag_run(); }
       if (g_set_sel == SET_PLUGINS && (p & BTN_CROSS)) {   /* every game and ShadowMountPlus' emulator folder, in the background */
         jdoc d;
         if (api_call("/api/plugins/refresh", "all=1", &d) == 200) { toast(T(S_PLUG_STARTED)); g_plug.running = true; g_plug.ok = true; }
@@ -2016,6 +2067,16 @@ static void *fonts_thread(void *arg) {
   return NULL;
 }
 
+/* names for the log's breadcrumbs */
+static const char *screen_name(int s) {
+  static const char *n[] = {"boot", "main", "options", "pair", "destinations", "check", "optimize", "log"};
+  return s >= 0 && s < (int)(sizeof n / sizeof n[0]) ? n[s] : "?";
+}
+static const char *tab_name(int t) {
+  static const char *n[] = {"games", "progress", "resume", "settings"};
+  return t >= 0 && t < (int)(sizeof n / sizeof n[0]) ? n[t] : "?";
+}
+
 int main(void) {
   if (plat_init() != 0 || gfx_init() != 0) {
     plat_notify("exFAT2AMPR: display init failed");
@@ -2024,6 +2085,7 @@ int main(void) {
   settings_load();
   app_log_start();
   app_log("app starting, language %d, engine port %d", i18n_get(), ENGINE_PORT);
+  api_set_quiet(true);   /* the engine is not there yet: its silence is no news */
   pthread_t fth;
   pthread_attr_t fat;
   pthread_attr_init(&fat);
@@ -2045,7 +2107,7 @@ int main(void) {
     {   /* breadcrumbs: where the user was when something went wrong */
       static int last_screen = -1, last_tab = -1;
       static unsigned log_seen;
-      if (g_screen != last_screen || g_tab != last_tab) { app_log("ui: screen %d, tab %d", g_screen, g_tab); last_screen = g_screen; last_tab = g_tab; }
+      if (g_screen != last_screen || g_tab != last_tab) { app_log("ui: %s (tab %s)", screen_name(g_screen), tab_name(g_tab)); last_screen = g_screen; last_tab = g_tab; }
       if (g_screen == SCR_LOG && app_log_rev() != log_seen) { log_seen = app_log_rev(); g_dirty = true; }
     }
     if (__atomic_load_n(&g_boot_state, __ATOMIC_ACQUIRE) == 2) boot_finish();
