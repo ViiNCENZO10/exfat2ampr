@@ -140,6 +140,8 @@ $(SPRX_DEBUG):
 	@mkdir -p third_party
 	curl -fsSL -o $@ $(SPRX_DEBUG_URL)
 
+.DELETE_ON_ERROR:   # a download whose digest does not match is removed, never kept as "up to date"
+
 # the plugins: every file checked against tools/plugins.sha256 before it is embedded
 $(PLUGIN_DIR)/libScePlayGo.sprx:
 	@mkdir -p $(PLUGIN_DIR)

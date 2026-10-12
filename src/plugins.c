@@ -3,6 +3,7 @@
 #include "plugins.h"
 
 #include "activity.h"
+#include "job.h"
 #include "scan.h"
 
 #include <dirent.h>
@@ -104,6 +105,8 @@ typedef struct {
   bool playgo_checked;   /* the eboot was scanned for the libScePlayGo import (slow: done in the background pass) */
 } game_eval;
 
+static int import_cached(const char *game_dir);
+
 static void eval_game(const char *game_dir, bool scan_eboot, game_eval *ev) {
   char path[1200];
   memset(ev, 0, sizeof *ev);
@@ -119,9 +122,33 @@ static void eval_game(const char *game_dir, bool scan_eboot, game_eval *ev) {
   /* PlayGo: a game that imports libScePlayGo wants the stub (a full dump: every chunk is there) */
   if (ev->st[P_PLAYGO] != F_ABSENT) ev->need[P_PLAYGO] = true;
   else if (scan_eboot) {
-    ev->need[P_PLAYGO] = e2a_game_imports(game_dir, "libScePlayGo") == 1;
+    ev->need[P_PLAYGO] = import_cached(game_dir) == 1;
     ev->playgo_checked = true;
   }
+}
+
+/* the eboot scan reads the whole executable: its answer is kept per game, keyed by the eboot's size and date */
+static int import_cached(const char *game_dir) {
+  static struct { char path[600]; uint64_t key; int8_t result; } cache[256];
+  static int n, next;
+  static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+  char eb[1200];
+  struct stat st;
+  snprintf(eb, sizeof eb, "%s/eboot.bin", game_dir);
+  uint64_t key = stat(eb, &st) == 0 ? ((uint64_t)st.st_size << 20) ^ (uint64_t)st.st_mtime ^ 1 : 0;
+  pthread_mutex_lock(&mx);
+  for (int i = 0; i < n; i++)
+    if (cache[i].key == key && strcmp(cache[i].path, game_dir) == 0) { int r = cache[i].result; pthread_mutex_unlock(&mx); return r; }
+  pthread_mutex_unlock(&mx);
+  int r = e2a_game_imports(game_dir, "libScePlayGo");
+  pthread_mutex_lock(&mx);
+  int slot = n < 256 ? n++ : next;
+  if (n == 256 && slot == next) next = (next + 1) % 256;
+  snprintf(cache[slot].path, sizeof cache[slot].path, "%.599s", game_dir);
+  cache[slot].key = key;
+  cache[slot].result = (int8_t)r;
+  pthread_mutex_unlock(&mx);
+  return r;
 }
 
 static const char *summary(const game_eval *ev) {
@@ -247,17 +274,24 @@ static int put_file(const char *dir, const plugin *p, bool keep_old, char *repor
 
 /* the game read in eval_dir, the files written to write_dir/fakelib (the same folder, or the destination of a
  * conversion); keep_old: a replaced copy stays next to the new one as <name>.old */
-static pthread_mutex_t g_apply_mx = PTHREAD_MUTEX_INITIALIZER;   /* one game at a time: the background pass and a request never race */
+static pthread_mutex_t g_apply_mx = PTHREAD_MUTEX_INITIALIZER;   /* in-place refreshes one at a time: the background pass and a request never race */
 
 static int apply_core(const char *eval_dir, const char *write_dir, bool keep_old, unsigned *written, char *report, size_t cap) {
-  pthread_mutex_lock(&g_apply_mx);
+  bool in_place = strcmp(eval_dir, write_dir) == 0;
   report[0] = 0;
   *written = 0;
   game_eval ev;
-  eval_game(eval_dir, true, &ev);
+  eval_game(eval_dir, true, &ev);   /* the slow part (eboot scan, digests) runs without the lock */
   int count = 0, rc = 0;
-  char dir[1100];
+  char dir[1100], path[1300];
   snprintf(dir, sizeof dir, "%s/fakelib", write_dir);
+  if (in_place) pthread_mutex_lock(&g_apply_mx);
+  e2a_game g;
+  if (in_place && e2a_read_game(eval_dir, &g) == 0 && activity_title_running(g.title_id)) {   /* launched meanwhile */
+    add_report(report, cap, "the game is running: left alone");
+    pthread_mutex_unlock(&g_apply_mx);
+    return -1;
+  }
   for (int i = 0; i < P_N; i++) {
     const plugin *p = &PLUGINS[i];
     if (ev.st[i] != F_ABSENT && ev.st[i] != F_OLD) {
@@ -266,6 +300,12 @@ static int apply_core(const char *eval_dir, const char *write_dir, bool keep_old
       continue;   /* current */
     }
     if (ev.st[i] == F_ABSENT && !ev.need[i]) continue;
+    if (!in_place) {   /* a resumed conversion: the destination may already hold the file; never rewrite it (its
+                        * date is part of the checkpoint's hash), just list it again */
+      const char *v;
+      snprintf(path, sizeof path, "%s/%s", dir, p->name);
+      if (classify(p, path, &v) == F_CURRENT) { *written |= 1u << i; continue; }
+    }
     if (e2a_mkdir_p(dir) != 0) { add_report(report, cap, "cannot create fakelib (%s)", strerror(errno)); rc = -1; continue; }
     if (put_file(dir, p, keep_old && ev.st[i] == F_OLD, report, cap) != 0) { rc = -1; continue; }
     count++;
@@ -273,11 +313,12 @@ static int apply_core(const char *eval_dir, const char *write_dir, bool keep_old
     if (ev.st[i] == F_ABSENT) add_report(report, cap, "%s %s added", p->name, p->known[0].version);
     else add_report(report, cap, "%s %s -> %s", p->name, ev.version[i], p->known[0].version);
   }
-  game_eval now;   /* the listing shows the new state right away */
+  game_eval now;   /* the listing shows the new state right away (what the game needs is kept) */
   eval_game(write_dir, false, &now);
-  cache_put(write_dir, fingerprint(write_dir), summary(&now), false);
+  for (int i = 0; i < P_N; i++) now.need[i] |= ev.need[i];
+  cache_put(write_dir, fingerprint(write_dir), summary(&now), true);
   if (count) e2a_log("plugins of %s: %s", write_dir, report);
-  pthread_mutex_unlock(&g_apply_mx);
+  if (in_place) pthread_mutex_unlock(&g_apply_mx);
   return rc < 0 ? -1 : count;
 }
 
@@ -295,6 +336,11 @@ const char *plugins_name(int i) { return i >= 0 && i < P_N ? PLUGINS[i].name : N
 /* ----------------------------------------------------------------- emus -- */
 int plugins_sync_emus(char *report, size_t cap) {
   report[0] = 0;
+  char parent[300];   /* ShadowMountPlus' own folder: without it, there is nobody to feed */
+  snprintf(parent, sizeof parent, "%s", E2A_EMUS_DIR);
+  char *slash = strrchr(parent, '/');
+  if (slash) *slash = 0;
+  if (!e2a_is_dir(parent)) { add_report(report, cap, "%s not present: ShadowMountPlus not installed", parent); return 0; }
   if (e2a_mkdir_p(E2A_EMUS_DIR) != 0) { add_report(report, cap, "cannot create %s (%s)", E2A_EMUS_DIR, strerror(errno)); return -1; }
   int written = 0, rc = 0;
   for (int i = 0; i < P_N; i++) {
@@ -348,8 +394,7 @@ bool plugins_path_allowed(const char *path) {
     if (strncmp(real, root, n) != 0 || real[n] != '/') continue;
     int depth = 1;
     for (const char *p = real + n + 1; *p; p++) if (*p == '/') depth++;
-    int allowed = strncmp(ROOTS[r], "/mnt/", 5) == 0 && !strstr(ROOTS[r] + 5, "/") ? 2 : 1;
-    if (depth <= allowed) return true;
+    if (depth <= 2) return true;   /* the listing scans one sub-folder deep under every root */
   }
   return false;
 }
@@ -367,6 +412,7 @@ static void visit_game(pass *ps, const char *path) {
   if (e2a_read_game(path, &g) != 0 || seen(ps, path)) return;
   ps->games++;
   if (activity_title_running(g.title_id)) return;   /* its fakelib is mounted: next time */
+  if (job_path_busy(path)) return;   /* the source or destination of a conversion (running, queued or paused) */
   char report[400];
   int n = plugins_apply(path, report, sizeof report);
   if (n > 0) ps->updated++;
@@ -395,7 +441,7 @@ static struct { time_t at; int games, updated, failed, emus; char emus_report[40
 int plugins_refresh_all(char *report, size_t cap) {
   pass *ps = calloc(1, sizeof *ps);
   if (!ps) { snprintf(report, cap, "out of memory"); return -1; }
-  for (int r = 0; ROOTS[r]; r++) visit_dir(ps, ROOTS[r], strncmp(ROOTS[r], "/mnt/", 5) == 0 && !strstr(ROOTS[r] + 5, "/") ? 1 : 0);
+  for (int r = 0; ROOTS[r]; r++) visit_dir(ps, ROOTS[r], 1);   /* one sub-folder deep, like the listing */
   snprintf(report, cap, "%d games, %d updated, %d failed", ps->games, ps->updated, ps->failed);
   pthread_mutex_lock(&g_mx);
   g_last.at = time(NULL);

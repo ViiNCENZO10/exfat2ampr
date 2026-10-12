@@ -63,6 +63,60 @@ void e2a_blind_tune(e2a_list *l) {
   }
 }
 
+static uint64_t blocks_of(const e2a_entry *e) {
+  unsigned shift = e->block_shift ? e->block_shift : E2A_BLOCK_SHIFT;
+  uint64_t block = 1ull << shift;
+  return (e->size + block - 1) / block;
+}
+
+static int by_size_desc(const void *a, const void *b) {
+  const e2a_entry *const *x = a, *const *y = b;
+  return (*x)->size < (*y)->size ? 1 : (*x)->size > (*y)->size ? -1 : 0;
+}
+
+uint64_t e2a_plan_budget(e2a_list *l, uint64_t budget, char *note, size_t cap) {
+  note[0] = 0;
+  uint64_t total = 0;
+  size_t ncand = 0;
+  for (size_t i = 0; i < l->n; i++) {
+    const e2a_entry *e = &l->v[i];
+    if (e->action == E2A_LOOSE || e->synthetic) continue;
+    total += blocks_of(e);
+    if (!e->hot && e->layout != E2A_LAYOUT_RANDOM && e->size >= (64ull << 20)) ncand++;
+  }
+  if (total <= budget || ncand == 0) return total;
+  /* the biggest files first: one of them weighs as much as thousands of small ones */
+  const e2a_entry **cand = malloc(ncand * sizeof *cand);
+  if (!cand) return total;
+  size_t k = 0;
+  for (size_t i = 0; i < l->n; i++) {
+    const e2a_entry *e = &l->v[i];
+    if (e->action == E2A_LOOSE || e->synthetic || e->hot || e->layout == E2A_LAYOUT_RANDOM || e->size < (64ull << 20)) continue;
+    cand[k++] = e;
+  }
+  qsort(cand, ncand, sizeof *cand, by_size_desc);
+  uint64_t before = total;
+  int changed = 0;
+  unsigned top = 0;
+  for (unsigned target = 17; target <= 19 && total > budget; target++) {   /* 128 KiB, 256 KiB, 512 KiB */
+    for (size_t i = 0; i < ncand && total > budget; i++) {
+      e2a_entry *e = (e2a_entry *)cand[i];
+      unsigned shift = e->block_shift ? e->block_shift : E2A_BLOCK_SHIFT;
+      if (shift >= target) continue;
+      total -= blocks_of(e);
+      e->block_shift = (uint8_t)target;
+      total += blocks_of(e);
+      changed++;
+      top = target;
+    }
+  }
+  free(cand);
+  if (changed)
+    snprintf(note, cap, "big game: %llu blocks estimated, %d large files moved to blocks of up to %u KiB: %llu blocks%s",
+             (unsigned long long)before, changed, 1u << (top - 10), (unsigned long long)total, total > budget ? " (still over the budget)" : "");
+  return total;
+}
+
 int e2a_classify(const char *rel) {
   const char *name = base_name(rel);
   for (int i = 0; LOOSE_NAMES[i]; i++) if (strcasecmp(name, LOOSE_NAMES[i]) == 0) return E2A_LOOSE;

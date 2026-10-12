@@ -22,7 +22,8 @@
 
 /* Per-file block size (16 KiB .. 1 MiB, from the profile). The batch buffers have a fixed byte
  * budget; the number of blocks per batch adapts to the block size of the file being packed. */
-#define POOL_BYTES (8u << 20)
+#define POOL_BYTES (24u << 20)   /* one batch: read by four threads, compressed by the workers, written in one piece */
+#define RATE_LOG_S 120.0         /* how often the packer logs what each stage sustains */
 #define MIN_BLOCK (16u << 10)
 #define MAX_SLOTS (POOL_BYTES / MIN_BLOCK)
 #define CKPT_INTERVAL_S 10.0
@@ -100,6 +101,9 @@ typedef struct __attribute__((packed)) {
   uint32_t vol_flags[MAX_VOLS];
 } e2a_ckpt;
 
+/* a volume handed to the read-back thread: its chunk records and CRCs, copied (the main thread keeps appending) */
+typedef struct { uint32_t id; char path[1100]; size_t nrec; ampr_chunk_record *recs; uint32_t *crcs; } bgv_item;
+
 typedef struct {
   const e2a_pack_opts *o;
   uint32_t payload_offset;
@@ -112,6 +116,18 @@ typedef struct {
   uint64_t entries_hash;
   /* dedup hash table: 1-based indices into dedup (dd_rec array), open addressing */
   uint32_t *dd_tab; size_t dd_cap, dd_count;
+  bool dd_capped;             /* DD_MAX_RECORDS reached: later blocks are written without being offered for sharing */
+  /* a volume that filled up is read back and checked on its own thread while the next one fills */
+  pthread_t bgv_th;
+  bool bgv_started, bgv_stop;
+  volatile bool bgv_stop_now;
+  pthread_mutex_t bgv_mx;
+  pthread_cond_t bgv_cv;
+  bgv_item *bgv_queue[MAX_VOLS];
+  int bgv_head, bgv_tail;
+  volatile int bgv_err;
+  char bgv_msg[200];
+  uint32_t vol_first_chunk[MAX_VOLS];   /* first chunk record of each volume opened in this run (UINT32_MAX: reopened) */
   /* checkpoint bookkeeping */
   uint64_t ck_files, ck_chunks, ck_crcs, ck_strings, ck_dedup;
   double last_ckpt;
@@ -120,13 +136,23 @@ typedef struct {
   uint32_t block;             /* block size of the current file */
   int layout;                 /* E2A_LAYOUT_* of the current file */
   bool want_fp;               /* fingerprints only when the current file can be deduplicated */
+  uint32_t pool;              /* bytes per input buffer (POOL_BYTES, or less when the console is short of memory) */
   uint8_t *raw[2];
   uint32_t *raw_len[2];
   int bcount[2], bstate[2];   /* 0 free, 1 full, 2 last batch of the file */
   int rd_fd, reader_err, reader_abort;
-  uint64_t rd_remaining;
+  uint64_t rd_remaining, rd_pos;
   pthread_mutex_t mx;
   pthread_cond_t cv;
+  /* output staging: the blocks of a batch land in one buffer and reach the volume in one write */
+  uint8_t *stg;
+  size_t stg_cap, stg_len;
+  uint64_t stg_off;
+  volume *stg_vol;
+  bool stg_failed;            /* a flush failed: the chunk records of this batch are not on disk, no checkpoint */
+  /* what each stage sustains, logged now and then */
+  double t_read, t_comp, t_write, t_rate_log;
+  uint64_t b_read, b_comp, b_write;
   /* worker outputs for the batch being processed */
   const uint8_t *cur_raw;
   const uint32_t *cur_len;
@@ -283,7 +309,15 @@ static const dd_rec *dd_find(packer *P, const uint8_t fp[16], uint32_t raw_len, 
   return NULL;
 }
 
+/* the table costs 36 bytes per record plus the index: a 300 GB game would ask for hundreds of MiB, so past this
+ * many records new blocks are no longer offered for sharing (earlier ones still are); the pack stays valid */
+#define DD_MAX_RECORDS (4u << 20)
+
 static int dd_insert(packer *P, const uint8_t fp[16], uint32_t raw_len, uint32_t want_raw, uint64_t location, uint32_t descriptor) {
+  if (P->dd_count >= DD_MAX_RECORDS) {
+    if (!P->dd_capped) { P->dd_capped = true; e2a_log("dedup table full (%u blocks): the following blocks are written without sharing", DD_MAX_RECORDS); }
+    return 0;
+  }
   if (!P->dd_tab && dd_rehash(P, 1 << 16)) return -1;
   if ((P->dd_count + 1) * 2 > P->dd_cap && dd_rehash(P, P->dd_cap * 2)) return -1;
   dd_rec r;
@@ -313,6 +347,7 @@ static int vol_open(packer *P) {
   if (v->fd < 0) { e2a_log("cannot create %s: %s", path, strerror(errno)); return -1; }
   v->pos = P->payload_offset;
   v->flags = AMPR_PACK_IO_PAGE_LAYOUT;
+  P->vol_first_chunk[v->id] = (uint32_t)(P->chunks.n / sizeof(ampr_chunk_record));
   P->cur = v;
   P->nvols++;
   e2a_log("volume %s opened", v->name);
@@ -330,7 +365,114 @@ static int vol_reopen(packer *P, uint32_t id, uint64_t pos, uint32_t flags) {
   if (v->fd < 0) { e2a_log("cannot reopen %s: %s", path, strerror(errno)); return -1; }
   if (ftruncate(v->fd, (off_t)pos) != 0) { close(v->fd); v->fd = -1; return -1; }  /* drop bytes written after the checkpoint */
   v->pos = pos; v->flags = flags;
+  P->vol_first_chunk[id] = UINT32_MAX;   /* filled in a previous run: the final verification covers it */
   return 0;
+}
+
+/* -------------------------------------------------- read-back of volumes -- */
+/* A volume that just filled up is read back on its own thread while the next one fills: every block it holds
+ * is decoded and CRC-compared, so a bad disk is caught within minutes instead of at the end, and the final
+ * verification skips it. The records are copied at enqueue time: the main thread keeps appending to P->chunks. */
+static void *bgv_thread(void *arg) {
+  packer *P = arg;
+  uint8_t *stored = malloc((1u << 20) + 4096), *raw = malloc(1u << 20);
+  for (;;) {
+    pthread_mutex_lock(&P->bgv_mx);
+    while (P->bgv_head == P->bgv_tail && !P->bgv_stop) pthread_cond_wait(&P->bgv_cv, &P->bgv_mx);
+    if (P->bgv_head == P->bgv_tail) { pthread_mutex_unlock(&P->bgv_mx); break; }
+    bgv_item *it = P->bgv_queue[P->bgv_head++];
+    pthread_mutex_unlock(&P->bgv_mx);
+    const char *what = NULL;
+    size_t bad = 0, k = 0;
+    int fd = -1;
+    if (!P->bgv_stop_now && !P->bgv_err) {
+      if (!stored || !raw) what = "out of memory";
+      else if ((fd = open(it->path, O_RDONLY)) < 0) what = "cannot reopen the volume";
+    }
+    for (; !what && fd >= 0 && k < it->nrec && !P->bgv_stop_now; k++) {
+      const ampr_chunk_record *cr = &it->recs[k];
+      uint32_t pack_id = (uint32_t)(cr->location >> 48), flags = cr->descriptor >> 22;
+      if (pack_id != it->id || (flags & AMPR_CHUNK_SHARED)) continue;   /* a block shared from another volume */
+      uint64_t off = cr->location & 0xFFFFFFFFFFFFull;
+      uint32_t ssize = (cr->descriptor & 0xFFFFF) + 1, codec = (cr->descriptor >> 20) & 3;
+      if (ssize > (1u << 20) + 4096 || e2a_pread_all(fd, stored, ssize, off) != 0) { what = "read failed"; bad = k; break; }
+      const uint8_t *data = stored;
+      uint32_t n = ssize;
+      if (codec == AMPR_CODEC_LZ4) {
+        int d = LZ4_decompress_safe((const char *)stored, (char *)raw, (int)ssize, 1 << 20);
+        if (d < 0) { what = "lz4 decode failed"; bad = k; break; }
+        data = raw;
+        n = (uint32_t)d;
+      }
+      if (e2a_crc32(0, data, n) != it->crcs[k]) { what = "crc mismatch"; bad = k; break; }
+      activity_throttle(ssize);
+    }
+    bool closed_ok = fd >= 0;
+    if (fd >= 0) close(fd);
+    if (!closed_ok) k = 0;
+    if (what && !P->bgv_stop_now) {
+      pthread_mutex_lock(&P->bgv_mx);
+      if (!P->bgv_err) {
+        snprintf(P->bgv_msg, sizeof P->bgv_msg, "read-back of volume %u failed: %s (block %zu of %zu)", it->id, what, bad, it->nrec);
+        P->bgv_err = 1;
+      }
+      pthread_mutex_unlock(&P->bgv_mx);
+    } else if (!what && fd >= 0 && k == it->nrec && !P->bgv_stop_now && P->o->verified_bits && it->id < MAX_VOLS) {   /* every block read */
+      P->o->verified_bits[it->id >> 6] |= 1ull << (it->id & 63);
+      e2a_log("volume %u read back: %zu blocks OK", it->id, it->nrec);
+    }
+    free(it->recs);
+    free(it->crcs);
+    free(it);
+  }
+  free(stored);
+  free(raw);
+  return NULL;
+}
+
+static int bgv_enqueue(packer *P, const volume *v) {
+  if (!P->o->verified_bits || v->id >= MAX_VOLS || P->vol_first_chunk[v->id] == UINT32_MAX) return 0;
+  uint32_t a = P->vol_first_chunk[v->id], b = (uint32_t)(P->chunks.n / sizeof(ampr_chunk_record));
+  if (b < a) return 0;
+  bgv_item *it = calloc(1, sizeof *it);
+  if (!it) return -1;
+  it->id = v->id;
+  it->nrec = b - a;
+  vol_path(P, v, it->path, sizeof it->path);
+  if (it->nrec) {
+    it->recs = malloc(it->nrec * sizeof(ampr_chunk_record));
+    it->crcs = malloc(it->nrec * sizeof(uint32_t));
+    if (!it->recs || !it->crcs) { free(it->recs); free(it->crcs); free(it); return -1; }
+    memcpy(it->recs, (const ampr_chunk_record *)P->chunks.p + a, it->nrec * sizeof(ampr_chunk_record));
+    memcpy(it->crcs, (const uint32_t *)P->crcs.p + a, it->nrec * sizeof(uint32_t));
+  }
+  pthread_mutex_lock(&P->bgv_mx);
+  if (!P->bgv_started) {
+    if (pthread_create(&P->bgv_th, NULL, bgv_thread, P) != 0) {   /* no read-back: the final pass does it all */
+      pthread_mutex_unlock(&P->bgv_mx);
+      free(it->recs); free(it->crcs); free(it);
+      return 0;
+    }
+    P->bgv_started = true;
+  }
+  P->bgv_queue[P->bgv_tail++] = it;   /* at most one item per volume: MAX_VOLS slots suffice */
+  pthread_cond_signal(&P->bgv_cv);
+  pthread_mutex_unlock(&P->bgv_mx);
+  return 0;
+}
+
+/* wait_queue: every queued volume is checked first (the end of a pack); otherwise the work is dropped (pause,
+ * cancel, error). Returns -1 when a read-back found an error. */
+static int bgv_shutdown(packer *P, bool wait_queue) {
+  if (!P->bgv_started) return P->bgv_err ? -1 : 0;
+  pthread_mutex_lock(&P->bgv_mx);
+  P->bgv_stop = true;
+  if (!wait_queue) P->bgv_stop_now = true;
+  pthread_cond_broadcast(&P->bgv_cv);
+  pthread_mutex_unlock(&P->bgv_mx);
+  pthread_join(P->bgv_th, NULL);
+  P->bgv_started = false;
+  return P->bgv_err ? -1 : 0;
 }
 
 static int vol_finish(packer *P, volume *v, const uint8_t build_id[16]) {
@@ -405,7 +547,8 @@ static int compress_batch(packer *P, int count) {
   return 0;
 }
 
-/* read-ahead: fills raw[k] while the main thread compresses and writes raw[k^1] */
+/* read-ahead: fills raw[k] while the main thread compresses and writes raw[k^1]. A batch is one range of the
+ * file, fetched by E2A_READ_THREADS threads at once (a compressed image decodes on the thread that asks). */
 static void *reader_fn(void *arg) {
   packer *P = arg;
   int k = 0;
@@ -416,12 +559,24 @@ static void *reader_fn(void *arg) {
     pthread_mutex_unlock(&P->mx);
 
     int count = 0;
-    while (count < P->slots && P->rd_remaining) {
-      size_t want = P->rd_remaining < P->block ? (size_t)P->rd_remaining : P->block, got = 0;
-      if (e2a_read_full(P->rd_fd, P->raw[k] + (size_t)count * P->block, want, &got) != 0 || got != want) { P->reader_err = 1; break; }
-      P->raw_len[k][count] = (uint32_t)got;
-      P->rd_remaining -= got;
-      count++;
+    size_t want = (size_t)P->slots * P->block;
+    if (P->rd_remaining < want) want = (size_t)P->rd_remaining;
+    if (want) {
+      double t0 = e2a_now();
+      if (e2a_pread_parallel(P->rd_fd, P->raw[k], want, P->rd_pos, E2A_READ_THREADS) != 0) P->reader_err = 1;
+      else {
+        for (size_t done = 0; done < want; count++) {
+          size_t l = want - done < P->block ? want - done : P->block;
+          P->raw_len[k][count] = (uint32_t)l;
+          done += l;
+        }
+        P->rd_pos += want;
+        P->rd_remaining -= want;
+        pthread_mutex_lock(&P->mx);
+        P->t_read += e2a_now() - t0;
+        P->b_read += want;
+        pthread_mutex_unlock(&P->mx);
+      }
     }
     bool last = P->rd_remaining == 0 || P->reader_err;
     pthread_mutex_lock(&P->mx);
@@ -467,8 +622,8 @@ static void set_geometry(packer *P, const e2a_entry *e) {
   if (shift > 20) shift = 20;
   P->block = 1u << shift;
   P->bound = LZ4_compressBound((int)P->block);
-  int slots = (int)(POOL_BYTES / P->block);
-  int cap = P->o->workers * 16;
+  int slots = (int)(P->pool / P->block);
+  int cap = P->o->workers * 64;   /* 6 workers: 24 MiB batches of 64 KiB blocks */
   if (slots > cap) slots = cap;
   if (slots < 2) slots = 2;
   P->slots = slots;
@@ -503,6 +658,63 @@ static int auto_loose_check(packer *P, int fd, uint64_t size, bool *loose) {
   if (saved < 0.05 || raw_blocks * 10 >= count * 9) *loose = true;   /* little gained, or 90 % of it stays raw */
   if (lseek(fd, 0, SEEK_SET) < 0) return -1;
   return 0;
+}
+
+/* ------------------------------------------------------------- staging -- */
+/* one write per volume range: a passing hiccup of a USB drive gets three more tries; returns errno or 0 */
+static int vol_write(packer *P, volume *v, const void *data, size_t len, uint64_t off) {
+  int werr = 0;
+  double t0 = e2a_now();
+  for (int attempt = 0; attempt < 4; attempt++) {
+    if (e2a_pwrite_all(v->fd, data, len, off) == 0) { werr = 0; break; }
+    werr = errno;
+    if (attempt == 3 || !(werr == EIO || werr == EAGAIN || werr == ETIMEDOUT || werr == EBUSY || werr == EINTR)) break;
+    e2a_log("write failed on %s: %s (retry %d)", v->name, strerror(werr), attempt + 1);
+    sleep(2);
+  }
+  P->t_write += e2a_now() - t0;
+  P->b_write += len;
+  if (werr) e2a_log("write failed on %s: %s", v->name, strerror(werr));
+  return werr;
+}
+
+static int stg_flush(packer *P) {
+  if (!P->stg_len) return 0;
+  int werr = vol_write(P, P->stg_vol, P->stg, P->stg_len, P->stg_off);
+  P->stg_len = 0;
+  if (werr) P->stg_failed = true;
+  return werr;
+}
+
+/* a block placed at off in volume v: appended to the staging buffer (gaps zeroed), flushed when the buffer
+ * is full or the volume changes; the data reaches the disk in a few large writes instead of one per block */
+static int stg_put(packer *P, volume *v, uint64_t off, const void *data, size_t len) {
+  if (P->stg_len && (v != P->stg_vol || off < P->stg_off + P->stg_len || off + len - P->stg_off > P->stg_cap)) {
+    int werr = stg_flush(P);
+    if (werr) return werr;
+  }
+  if (!P->stg_len) { P->stg_off = off; P->stg_vol = v; }
+  if (len > P->stg_cap) return vol_write(P, v, data, len, off);   /* never: a block is far smaller than the buffer */
+  size_t at = (size_t)(off - P->stg_off);
+  if (at > P->stg_len) memset(P->stg + P->stg_len, 0, at - P->stg_len);
+  memcpy(P->stg + at, data, len);
+  P->stg_len = at + len;
+  return 0;
+}
+
+static void rate_log(packer *P, bool final) {
+  double now = e2a_now();
+  if (!final && now - P->t_rate_log < RATE_LOG_S) return;
+  if (!P->b_read) return;
+  P->t_rate_log = now;
+  pthread_mutex_lock(&P->mx);
+  double tr = P->t_read;
+  uint64_t br = P->b_read;
+  pthread_mutex_unlock(&P->mx);
+  e2a_log("pack stages: read %d MB/s (%d threads), compress %d MB/s (%d workers), write %d MB/s%s",
+          tr > 0 ? (int)(br / tr / 1e6) : 0, E2A_READ_THREADS,
+          P->t_comp > 0 ? (int)(P->b_comp / P->t_comp / 1e6) : 0, activity_workers(P->o->workers),
+          P->t_write > 0 ? (int)(P->b_write / P->t_write / 1e6) : 0, final ? " (whole run)" : "");
 }
 
 /* ------------------------------------------------------------- pack file -- */
@@ -547,7 +759,8 @@ static int pack_one(packer *P, size_t index, uint64_t entry_count, uint64_t tota
   /* rd_remaining belongs to the reader once it runs: a small file can be read entirely before
    * this thread looks at it again, so the loop condition is taken from this local copy */
   const uint64_t to_read = e->size - file_done;
-  P->rd_fd = fd; P->rd_remaining = to_read; P->reader_err = 0; P->reader_abort = 0;
+  P->rd_fd = fd; P->rd_remaining = to_read; P->rd_pos = file_done; P->reader_err = 0; P->reader_abort = 0;
+  P->stg_len = 0; P->stg_failed = false;
   P->bstate[0] = P->bstate[1] = 0; P->bcount[0] = P->bcount[1] = 0;
   pthread_t reader;
   bool have_reader = false;
@@ -574,7 +787,10 @@ static int pack_one(packer *P, size_t index, uint64_t entry_count, uint64_t tota
 
     if (count > 0) {
       P->cur_raw = P->raw[k]; P->cur_len = P->raw_len[k]; P->batch_store = store;
+      double tc = e2a_now();
       if (compress_batch(P, count) != 0) { rc = E2A_PACK_ERROR; break; }
+      P->t_comp += e2a_now() - tc;
+      for (int i = 0; i < count; i++) P->b_comp += P->cur_len[i];
       for (int i = 0; i < count; i++) {
         uint32_t raw = P->cur_len[i];
         const uint8_t *fp = P->fp + (size_t)i * 16;
@@ -594,15 +810,17 @@ static int pack_one(packer *P, size_t index, uint64_t entry_count, uint64_t tota
 
           /* a full volume is left open and finalized with the build id at the end */
           if (!P->cur || e2a_align_up(P->cur->pos, E2A_PAGE) + stored > o->max_pack_size) {
+            int werr = stg_flush(P);   /* the full volume must be complete on disk before it is read back */
+            if (werr) { rc = storage_pause(werr) ? E2A_PACK_PAUSED : E2A_PACK_ERROR; break; }
+            if (P->cur && bgv_enqueue(P, P->cur) != 0) { rc = E2A_PACK_ERROR; break; }   /* the full one is read back meanwhile */
             if (vol_open(P) != 0) { rc = E2A_PACK_ERROR; break; }
             extent_start = layout == E2A_LAYOUT_STREAMING;
           }
           volume *v = P->cur;
           uint64_t off = place(v->pos, stored, layout, extent_start);
-          if (e2a_pwrite_all(v->fd, data, stored, off) != 0) {
-            int err = errno;
-            e2a_log("write failed on %s: %s", v->name, strerror(err));
-            rc = storage_pause(err) ? E2A_PACK_PAUSED : E2A_PACK_ERROR;
+          int werr = stg_put(P, v, off, data, stored);
+          if (werr) {
+            rc = storage_pause(werr) ? E2A_PACK_PAUSED : E2A_PACK_ERROR;
             break;
           }
           v->pos = off + stored;
@@ -621,6 +839,11 @@ static int pack_one(packer *P, size_t index, uint64_t entry_count, uint64_t tota
         file_done += raw;
       }
       if (rc == E2A_PACK_ERROR) break;
+      if (rc == E2A_PACK_OK) {   /* the batch reaches the disk before anything (progress, checkpoint) counts on it */
+        int werr = stg_flush(P);
+        if (werr) { rc = storage_pause(werr) ? E2A_PACK_PAUSED : E2A_PACK_ERROR; if (rc == E2A_PACK_ERROR) break; }
+      }
+      rate_log(P, false);
       if (o->progress) o->progress(o->ctx, P->packed_in + file_done, e->rel);
       {
         uint64_t batch = 0;
@@ -639,8 +862,19 @@ static int pack_one(packer *P, size_t index, uint64_t entry_count, uint64_t tota
     if (rc == E2A_PACK_PAUSED) break;
     if (o->cancel && *o->cancel) { rc = E2A_PACK_ERROR; break; }
     if (o->pause && *o->pause) { rc = E2A_PACK_PAUSED; break; }
-    if (e2a_now() - P->last_ckpt > CKPT_INTERVAL_S)
+    if (P->bgv_err) {   /* a finished volume read back wrong: stop here rather than hours later */
+      pthread_mutex_lock(&P->bgv_mx);
+      e2a_log("%s", P->bgv_msg);
+      pthread_mutex_unlock(&P->bgv_mx);
+      rc = E2A_PACK_ERROR;
+      break;
+    }
+    if (e2a_now() - P->last_ckpt > CKPT_INTERVAL_S && !P->stg_failed)
       checkpoint(P, index, file_done, first_chunk, nchunks, entry_count, total_bytes);  /* best effort */
+  }
+  if (rc == E2A_PACK_OK && !P->stg_failed) {
+    int werr = stg_flush(P);
+    if (werr) rc = storage_pause(werr) ? E2A_PACK_PAUSED : E2A_PACK_ERROR;
   }
 
   if (have_reader) {
@@ -653,6 +887,9 @@ static int pack_one(packer *P, size_t index, uint64_t entry_count, uint64_t tota
   close(fd);
 
   if (rc == E2A_PACK_PAUSED) {
+    /* after a failed flush the records of the last batch have no data on disk: the previous checkpoint (every
+     * 10 s, taken after a flush) stays the one to resume from */
+    if (P->stg_failed) { e2a_log("pause after a write failure: resuming from the last checkpoint"); return E2A_PACK_PAUSED; }
     if (checkpoint(P, index, file_done, first_chunk, nchunks, entry_count, total_bytes) != 0) return E2A_PACK_ERROR;
     return E2A_PACK_PAUSED;
   }
@@ -697,9 +934,19 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
   P->o = o;
   P->st = st;
   P->payload_offset = (uint32_t)e2a_align_up(sizeof(ampr_dat_header), E2A_PAGE);
-  /* fixed budget: 2 x 8 MiB input + 8 MiB (+LZ4 bound overhead) output, whatever the block size */
-  for (int k = 0; k < 2; k++) { P->raw[k] = malloc(POOL_BYTES); P->raw_len[k] = calloc(MAX_SLOTS, sizeof(uint32_t)); }
-  P->comp = malloc((size_t)POOL_BYTES + POOL_BYTES / 255 + (size_t)MAX_SLOTS * 16 + 4096);
+  /* fixed budget: 2 x 24 MiB input + 24 MiB (+LZ4 bound overhead) output + 26 MiB staging, whatever the block
+   * size; a console short of memory gets the 8 MiB pools of the earlier versions */
+  for (P->pool = POOL_BYTES; P->pool >= (8u << 20); P->pool /= 3) {
+    for (int k = 0; k < 2; k++) { P->raw[k] = malloc(P->pool); P->raw_len[k] = calloc(MAX_SLOTS, sizeof(uint32_t)); }
+    P->comp = malloc((size_t)P->pool + P->pool / 255 + (size_t)MAX_SLOTS * 16 + 4096);
+    P->stg_cap = (size_t)P->pool + (2u << 20);   /* about a batch; a batch with many page gaps goes in two writes */
+    P->stg = malloc(P->stg_cap);
+    if (P->raw[0] && P->raw[1] && P->raw_len[0] && P->raw_len[1] && P->comp && P->stg) break;
+    for (int k = 0; k < 2; k++) { free(P->raw[k]); free(P->raw_len[k]); P->raw[k] = NULL; P->raw_len[k] = NULL; }
+    free(P->comp); free(P->stg); P->comp = NULL; P->stg = NULL;
+    e2a_log("packer: %u MiB pools refused, trying smaller ones", P->pool >> 20);
+  }
+  P->t_rate_log = e2a_now();
   P->comp_len = calloc(MAX_SLOTS, sizeof(int));
   P->raw_crc = calloc(MAX_SLOTS, sizeof(uint32_t));
   P->fp = calloc(MAX_SLOTS, 16);
@@ -707,10 +954,12 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
   P->last_ckpt = e2a_now();
   pthread_mutex_init(&P->mx, NULL);
   pthread_cond_init(&P->cv, NULL);
+  pthread_mutex_init(&P->bgv_mx, NULL);
+  pthread_cond_init(&P->bgv_cv, NULL);
   for (uint32_t i = 0; i < MAX_VOLS; i++) P->vols[i].fd = -1;
   int rc = E2A_PACK_ERROR;
   bytebuf payload = {0};
-  if (!P->raw[0] || !P->raw[1] || !P->raw_len[0] || !P->raw_len[1] || !P->comp || !P->comp_len || !P->raw_crc || !P->fp) goto out;
+  if (!P->raw[0] || !P->raw[1] || !P->raw_len[0] || !P->raw_len[1] || !P->comp || !P->comp_len || !P->raw_crc || !P->fp || !P->stg) goto out;
 
   size_t start = 0;
   uint64_t cur_offset = 0;
@@ -788,6 +1037,7 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
     }
     if (e2a_now() - P->last_ckpt > CKPT_INTERVAL_S) checkpoint(P, i + 1, 0, 0, 0, entries->n, entries->total_bytes);
   }
+  if (bgv_shutdown(P, true) != 0) { e2a_log("%s", P->bgv_msg); goto out; }   /* every queued volume checked before the manifest */
   if (P->nvols == 0 && vol_open(P) != 0) goto out;  /* nothing compressible: still emit a valid empty volume */
 
   /* pack records (names into the string table) */
@@ -909,6 +1159,7 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
   rc = E2A_PACK_OK;
 
 out:
+  bgv_shutdown(P, false);   /* a pause, a cancel or an error: the read-back still queued is dropped */
   free(payload.p);
   for (uint32_t i = 0; i < P->nvols; i++) {
     if (P->vols[i].fd >= 0) {
@@ -923,7 +1174,11 @@ out:
   }
   pthread_mutex_destroy(&P->mx);
   pthread_cond_destroy(&P->cv);
+  pthread_mutex_destroy(&P->bgv_mx);
+  pthread_cond_destroy(&P->bgv_cv);
+  rate_log(P, true);
   for (int k = 0; k < 2; k++) { free(P->raw[k]); free(P->raw_len[k]); }
+  free(P->stg);
   free(P->comp); free(P->comp_len); free(P->raw_crc); free(P->fp); free(P->dd_tab);
   free(P->files.p); free(P->chunks.p); free(P->packs.p); free(P->strings.p); free(P->crcs.p); free(P->dedup.p);
   free(P);

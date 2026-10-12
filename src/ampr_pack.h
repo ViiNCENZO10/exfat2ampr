@@ -27,6 +27,9 @@ typedef struct {
   /* bytes processed so far in the current phase + the file being handled */
   void (*progress)(void *ctx, uint64_t done_bytes, const char *msg);
   void *ctx;
+  /* 1024 bits, one per volume, owned by the caller: the pack sets the bit of every volume it read back and
+   * checked while the next one filled; the final verification then skips those (NULL: not used) */
+  uint64_t *verified_bits;
 } e2a_pack_opts;
 
 typedef struct {

@@ -83,6 +83,8 @@ int job_list_destinations(char *json, size_t cap);
 int job_list_resumable(char *json, size_t cap);
 int job_list_profiles(char *json, size_t cap);
 int job_runtime_json(char *json, size_t cap);
+/* the source or destination of a conversion that runs, waits in the queue or is paused: nobody else may touch it */
+bool job_path_busy(const char *path);
 
 
 #endif

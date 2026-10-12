@@ -171,6 +171,40 @@ int e2a_pread_all(int fd, void *buf, size_t len, uint64_t off) {
   return 0;
 }
 
+/* one range read by several threads at once (pread, no shared cursor). A compressed image mounted by
+ * ShadowMountPlus (pfsc) decodes every request on the thread that asks: one reader waits on the decoder
+ * between two blocks, four of them keep it busy. On a plain drive the requests are simply queued. */
+typedef struct { int fd; uint8_t *dst; uint64_t off; size_t len; int err; } pseg;
+static void *pseg_fn(void *a) {
+  pseg *s = a;
+  errno = 0;
+  if (e2a_pread_all(s->fd, s->dst, s->len, s->off) != 0) s->err = errno ? errno : EIO;
+  return NULL;
+}
+int e2a_pread_parallel(int fd, void *buf, size_t len, uint64_t off, int threads) {
+  if (threads < 1) threads = 1;
+  if (threads > 8) threads = 8;
+  size_t seg = (len / (size_t)threads + 65535) & ~(size_t)65535;   /* 64 KiB multiples: whole blocks per thread */
+  if (seg == 0 || len < 2u << 20) threads = 1;
+  if (threads == 1) return e2a_pread_all(fd, buf, len, off);
+  pseg s[8];
+  pthread_t th[8];
+  int n = 0, err = 0;
+  for (size_t done = 0; done < len && n < threads; n++) {
+    size_t l = len - done < seg ? len - done : seg;
+    s[n].fd = fd; s[n].dst = (uint8_t *)buf + done; s[n].off = off + done; s[n].len = l; s[n].err = 0;
+    done += l;
+    if (n == threads - 1 && done < len) s[n].len += len - done, done = len;   /* rounding: the last one takes the rest */
+    if (pthread_create(&th[n], NULL, pseg_fn, &s[n]) != 0) { pseg_fn(&s[n]); th[n] = 0; }
+  }
+  for (int i = 0; i < n; i++) {
+    if (th[i]) pthread_join(th[i], NULL);
+    if (s[i].err && !err) err = s[i].err;
+  }
+  if (err) { errno = err; return -1; }
+  return 0;
+}
+
 int e2a_read_full(int fd, void *buf, size_t len, size_t *got) {
   uint8_t *p = buf;
   size_t n = 0;
@@ -214,7 +248,7 @@ int e2a_write_file_atomic(const char *path, const void *data, size_t len) {
 void (*e2a_copy_hook)(uint64_t bytes);
 
 int e2a_copy_file(const char *src, const char *dst, int64_t mtime) {
-  const size_t BUF = 4u << 20;
+  const size_t BUF = 16u << 20;   /* read by four threads at once, written in one piece */
   uint8_t *buf = malloc(BUF);
   if (!buf) return -1;
   int in = open(src, O_RDONLY);
@@ -224,7 +258,17 @@ int e2a_copy_file(const char *src, const char *dst, int64_t mtime) {
   int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (out < 0) { int e = errno; close(in); free(buf); errno = e; return -1; }
   int rc = 0, saved = 0;
-  for (;;) {
+  struct stat st;
+  uint64_t size = fstat(in, &st) == 0 ? (uint64_t)st.st_size : 0, pos = 0;
+  while (pos < size) {
+    size_t n = size - pos < BUF ? (size_t)(size - pos) : BUF;
+    if (e2a_pread_parallel(in, buf, n, pos, E2A_READ_THREADS) != 0) { saved = errno; rc = -1; break; }
+    if (e2a_write_all(out, buf, n) != 0) { saved = errno; rc = -1; break; }
+    pos += n;
+    if (e2a_copy_hook) e2a_copy_hook(n);
+  }
+  if (rc == 0 && lseek(in, (off_t)pos, SEEK_SET) < 0) { saved = errno; rc = -1; }   /* pread left the cursor at 0 */
+  for (; rc == 0;) {   /* a file that grew meanwhile: the rest, the old way */
     ssize_t r = read(in, buf, BUF);
     if (r < 0) { if (errno == EINTR) continue; saved = errno; rc = -1; break; }
     if (r == 0) break;

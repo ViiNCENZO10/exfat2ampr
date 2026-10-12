@@ -422,6 +422,15 @@ static void run_job(job_request req) {
     }
   }
   e2a_list_sort(&entries);
+  /* big games: the emulator keeps every block in memory (its caches shrink as the manifest grows) and refuses
+   * a pack beyond 16 M blocks; bigger blocks on the biggest files keep a 300 GB game within its budget */
+  {
+    char note[300];
+    uint64_t blocks = e2a_plan_budget(&entries, E2A_BLOCK_BUDGET, note, sizeof note);
+    if (note[0]) e2a_log("%s", note);
+    if (blocks > E2A_BLOCK_LIMIT)
+      FAIL("too_many_blocks", "too many blocks for the emulator (over 16 million): leave the biggest files loose or give them bigger blocks in the profile");
+  }
 
   uint64_t verify_bytes = req.verify ? entries.total_bytes : 0;
   pthread_mutex_lock(&g_mx);
@@ -449,9 +458,17 @@ static void run_job(job_request req) {
 
   e2a_pack_opts o;
   memset(&o, 0, sizeof o);
+  uint64_t verified_bits[16] = {0};   /* the volumes the pack read back: the final verification skips them */
   o.src_root = src; o.out_dir = dest; o.state_dir = state_dir;
+  o.verified_bits = req.verify ? verified_bits : NULL;   /* no verification wanted: no read-back either */
   o.level = req.level; o.workers = req.workers; o.dedup = req.dedup;
   o.max_pack_size = E2A_MAX_PACK; o.cancel = &g_cancel; o.pause = &g_pause; o.progress = on_progress;
+#ifdef E2A_HOST
+  {   /* the CI: small volumes make a small game roll over, so the read-back of finished volumes is exercised */
+    const char *mp = getenv("E2A_TEST_MAX_PACK_MB");
+    if (mp && atoll(mp) > 0) o.max_pack_size = (uint64_t)atoll(mp) << 20;
+  }
+#endif
   o.test_pause_after = req.test_pause_after;
   if (have_prof && prof.has_runtime) {
     o.rt_decoded = prof.rt_decoded; o.rt_physical = prof.rt_physical; o.rt_workers = prof.rt_workers; o.rt_reserve = prof.rt_reserve;
@@ -1188,6 +1205,38 @@ int job_preflight(const char *path, const char *smp, const char *dest_base, char
                    tid, title, (unsigned long long)source_bytes, (unsigned long long)need_typ, (unsigned long long)need_max,
                    (unsigned long long)(d ? d->avail : 0), (unsigned long long)(d ? d->total : 0), compat, errors, warnings);
   return w > 0 && (size_t)w < cap ? 0 : -1;
+}
+
+bool job_path_busy(const char *path) {
+  pthread_mutex_lock(&g_mx);
+  bool busy = (g_live_src[0] && strcasecmp(g_live_src, path) == 0) || (g_live_dest[0] && strcasecmp(g_live_dest, path) == 0);
+  for (int i = 0; !busy && i < g_qlen; i++) {
+    char qd[700];
+    snprintf(qd, sizeof qd, "%s/%s", g_queue[i].dest_base, g_queue[i].name);
+    busy = strcasecmp(g_queue[i].source, path) == 0 || strcasecmp(qd, path) == 0;
+  }
+  pthread_mutex_unlock(&g_mx);
+  if (busy) return true;
+  /* paused conversions: their saved request names the source */
+  e2a_storage stg[E2A_MAX_STORAGES];
+  int nstg = storage_scan(stg, E2A_MAX_STORAGES, false);
+  for (int s = 0; s < nstg && !busy; s++) {
+    const char *base = stg[s].base;
+    DIR *d = opendir(base);
+    if (!d) continue;
+    struct dirent *de;
+    while (!busy && (de = readdir(d)) != NULL) {
+      if (de->d_name[0] == '.') continue;
+      char dest[700], state_dir[800];
+      snprintf(dest, sizeof dest, "%.299s/%.255s", base, de->d_name);
+      snprintf(state_dir, sizeof state_dir, "%s/.e2a-state", dest);
+      job_request r;
+      if (!e2a_is_dir(state_dir) || request_load(state_dir, &r) != 0) continue;
+      busy = strcasecmp(r.source, path) == 0 || strcasecmp(dest, path) == 0;
+    }
+    closedir(d);
+  }
+  return busy;
 }
 
 int job_list_resumable(char *json, size_t cap) {

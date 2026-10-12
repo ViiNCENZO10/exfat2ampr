@@ -13,6 +13,7 @@ on:
         description: "Version shown on the title card (empty: this commit's)"
         default: ""
   push:
+    branches: ["**"]
     tags: ["v*"]   # a release: the video goes with it
     paths:
       - "presentation/**"
@@ -60,7 +61,9 @@ jobs:
           ffprobe -v error -show_entries format=duration:stream=index,codec_type,codec_name,width,height:stream_tags=language -of compact presentation/out/exfat2ampr-presentation.mp4
       - name: Check the release tag
         if: inputs.tag != ''
-        run: git tag -l | grep -qx "${{ inputs.tag }}"   # an existing release only: a typo would create one
+        env:
+          TAG: ${{ inputs.tag }}
+        run: git tag -l | grep -qxF -- "$TAG"   # an existing release only: a typo would create one
       - name: Attach the video to the release
         if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
         uses: softprops/action-gh-release@v2

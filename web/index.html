@@ -475,7 +475,7 @@ async function loadPlugins(){
   } catch(e) {}
 }
 async function refreshPlugins(){
-  try { await post('/api/plugins/refresh', {all: 1}); if (typeof toast === 'function') toast(t('plug_started')); } catch(e) {}
+  try { await post('/api/plugins/refresh', {all: 1}); document.getElementById('plugins').textContent = t('plug_started'); } catch(e) {}
   setTimeout(loadPlugins, 3000); setTimeout(loadSources, 8000);
 }
 async function init(){

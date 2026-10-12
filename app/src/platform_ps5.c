@@ -283,7 +283,7 @@ int plat_https_get(const char *url0, int (*sink)(void *ctx, const uint8_t *data,
   if (rc >= 0) rc = ssl = sceSslInit(SSL_POOL);
   if (rc >= 0) rc = http = sceHttpInit(pool, ssl, HTTP_POOL);
   if (rc >= 0) rc = tmpl = sceHttpCreateTemplate(http, "exFAT2AMPR", HTTP_1_1, 0);
-  if (rc >= 0) rc = sceHttpSetAutoRedirect(tmpl, follow ? 1 : 0);
+  if (rc >= 0) (void)sceHttpSetAutoRedirect(tmpl, follow ? 1 : 0);   /* optional: the loop below follows by hand */
   if (rc >= 0) rc = sceHttpSetResolveTimeOut(tmpl, 8000000u);
   if (rc >= 0) rc = sceHttpSetConnectTimeOut(tmpl, 8000000u);
   if (rc >= 0) rc = sceHttpSetSendTimeOut(tmpl, 8000000u);
@@ -303,18 +303,20 @@ int plat_https_get(const char *url0, int (*sink)(void *ctx, const uint8_t *data,
     if (sceHttpGetAllResponseHeaders(req, &hdr, &hlen) >= 0 && hdr) {
       for (size_t i = 0; i + 9 < hlen; i++) {
         if (i > 0 && hdr[i - 1] != '\n') continue;
-        if (strncmp(hdr + i, "Location:", 9) != 0 && strncmp(hdr + i, "location:", 9) != 0) continue;
+        bool name = true;   /* "Location:" in any case */
+        for (int c = 0; c < 9 && name; c++) name = (hdr[i + c] | 0x20) == ("location:"[c] | 0x20);
+        if (!name) continue;
         size_t s = i + 9, e;
         while (s < hlen && (hdr[s] == ' ' || hdr[s] == '\t')) s++;
         for (e = s; e < hlen && hdr[e] != '\r' && hdr[e] != '\n'; e++) {}
-        if (e > s && e - s < sizeof url && hdr[s] == 'h') { memcpy(url, hdr + s, e - s); url[e - s] = 0; found = true; }
+        while (e > s && (hdr[e - 1] == ' ' || hdr[e - 1] == '\t')) e--;
+        if (e > s && e - s < sizeof url && (hdr[s] | 0x20) == 'h') { memcpy(url, hdr + s, e - s); url[e - s] = 0; found = true; }
         break;
       }
     }
     sceHttpDeleteRequest(req); req = -1;
     sceHttpDeleteConnection(conn); conn = -1;
-    if (!found) break;   /* the 3xx status is reported as it is */
-    status = 0;
+    if (!found) break;   /* the 3xx status is reported as it is (also after too many hops) */
   }
   if (rc >= 0 && status == 200) {
     static uint8_t buf[64 * 1024];

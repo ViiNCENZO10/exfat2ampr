@@ -180,6 +180,55 @@ static void test_ampr_compat(void) {
   CHECK(e2a_ampr_compat(root, why, sizeof why) == -1, "encrypted eboot: unknown (%s)", why);
 }
 
+/* big games: e2a_plan_budget enlarges the biggest files' blocks until the estimate fits the budget */
+static void test_plan_budget(void) {
+  e2a_list l;
+  memset(&l, 0, sizeof l);
+  char name[64], note[300];
+  /* 10 files of 100 GiB at 64 KiB blocks: 16.4 M blocks, over a 12 M budget (six of them at 128 KiB bring it
+   * under); plus one hot file, one loose */
+  for (int i = 0; i < 10; i++) {
+    snprintf(name, sizeof name, "data/big%02d.dat2", i);
+    e2a_list_add(&l, name, 100ull << 30, 0, false);
+  }
+  e2a_list_add(&l, "audio/bank.dat2", 1ull << 30, 0, false);   /* hot: counted (16 KiB blocks) but never enlarged */
+  l.v[10].hot = true; l.v[10].layout = E2A_LAYOUT_RANDOM; l.v[10].block_shift = 14;
+  e2a_list_add(&l, "movies/intro.mp4", 100ull << 30, 0, false);   /* loose by extension */
+  uint64_t est = e2a_plan_budget(&l, 12ull << 20, note, sizeof note);
+  CHECK(est <= (12ull << 20), "estimate within the budget after planning (%llu)", (unsigned long long)est);
+  CHECK(note[0] != 0, "a note explains the change");
+  int enlarged = 0;
+  for (int i = 0; i < 10; i++) if (l.v[i].block_shift >= 17) enlarged++;
+  CHECK(enlarged > 0 && enlarged < 10, "only as many big files as needed got bigger blocks (%d)", enlarged);
+  CHECK(l.v[10].block_shift == 14 && l.v[11].action == E2A_LOOSE, "hot and loose files untouched");
+  /* under the budget nothing changes */
+  e2a_list s;
+  memset(&s, 0, sizeof s);
+  e2a_list_add(&s, "data/small.dat2", 2ull << 30, 0, false);
+  uint64_t est2 = e2a_plan_budget(&s, 12ull << 20, note, sizeof note);
+  CHECK(est2 == (2ull << 30) / (1u << 16) && !note[0] && s.v[0].block_shift == 0, "small game left alone (%llu)", (unsigned long long)est2);
+  e2a_list_free(&l);
+  e2a_list_free(&s);
+}
+
+/* the slicing-by-8 CRC32 must stay zlib's: known vector, every length and offset, chaining */
+static uint32_t crc_slow(uint32_t crc, const uint8_t *p, size_t n) {
+  crc = ~crc;
+  while (n--) { crc ^= *p++; for (int k = 0; k < 8; k++) crc = (crc & 1) ? 0xEDB88320u ^ (crc >> 1) : crc >> 1; }
+  return ~crc;
+}
+static void test_crc32(void) {
+  CHECK(e2a_crc32(0, "123456789", 9) == 0xCBF43926u, "crc32 check value");
+  uint8_t buf[80];
+  for (int i = 0; i < 80; i++) buf[i] = (uint8_t)(i * 37 + 11);
+  for (size_t off = 0; off < 8; off++)
+    for (size_t len = 0; len <= 64; len++) {
+      uint32_t a = e2a_crc32(0, buf + off, len), b = crc_slow(0, buf + off, len);
+      CHECK(a == b, "crc32 off %zu len %zu: %08x vs %08x", off, len, a, b);
+    }
+  CHECK(e2a_crc32(e2a_crc32(0, buf, 13), buf + 13, 50) == e2a_crc32(0, buf, 63), "crc32 chaining");
+}
+
 int main(void) {
   setenv("E2A_FAKE_ROOT", "", 1);
   test_no_usb();
@@ -187,6 +236,8 @@ int main(void) {
   test_several_usb();
   test_full_and_probe();
   test_ampr_compat();
+  test_plan_budget();
+  test_crc32();
   if (g_fail) { printf("%d check(s) failed\n", g_fail); return 1; }
   printf("all unit tests passed\n");
   return 0;

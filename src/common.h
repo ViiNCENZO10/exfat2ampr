@@ -40,7 +40,9 @@
 #define E2A_CHUNK_ALIGN 64u
 #define E2A_BLOCK_SHIFT 16       /* 64 KiB blocks */
 #define E2A_MAX_PACK (16ull << 30)
-#define E2A_AUTO_LOOSE_MIN (64ull << 20)
+#define E2A_AUTO_LOOSE_MIN (16ull << 20)   /* files this big are sampled: incompressible ones stay loose (no blocks at all) */
+#define E2A_BLOCK_BUDGET (12ull << 20)     /* estimated blocks over which big files get bigger blocks (the emulator keeps */
+#define E2A_BLOCK_LIMIT (16ull << 20)      /* 12 bytes per block in memory) and refuses a pack beyond this many */
 
 static inline uint64_t e2a_align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
@@ -54,6 +56,9 @@ extern void (*e2a_copy_hook)(uint64_t bytes);   /* called per copied buffer (gam
 int  e2a_write_all(int fd, const void *buf, size_t len);
 int  e2a_pwrite_all(int fd, const void *buf, size_t len, uint64_t off);
 int  e2a_pread_all(int fd, void *buf, size_t len, uint64_t off);
+/* the same range read by several threads at once (whole 64 KiB blocks each); ranges under 2 MiB use one */
+int  e2a_pread_parallel(int fd, void *buf, size_t len, uint64_t off, int threads);
+#define E2A_READ_THREADS 4   /* readers per batch: a pfsc image decodes on the calling thread, four keep it busy */
 int  e2a_read_full(int fd, void *buf, size_t len, size_t *got);
 int  e2a_read_text(const char *path, char **out, size_t *len, size_t max);
 int  e2a_write_file_atomic(const char *path, const void *data, size_t len);

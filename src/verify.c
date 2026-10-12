@@ -19,6 +19,14 @@
 
 static pthread_mutex_t g_fail_mx = PTHREAD_MUTEX_INITIALIZER;
 
+/* where an interrupted verification resumes (empty posfile: no state folder) */
+static void verify_pos_write(const char *posfile, const char *bid, uint64_t next) {
+  if (!posfile[0]) return;
+  char line[80];
+  int n = snprintf(line, sizeof line, "%s %llu\n", bid, (unsigned long long)next);
+  if (n > 0) e2a_write_file_atomic(posfile, line, (size_t)n);
+}
+
 static void fail(e2a_verify_stats *vs, const char *fmt, const char *a, unsigned long long b) {
   vs->errors++;
   if (!vs->first_error[0]) snprintf(vs->first_error, sizeof vs->first_error, fmt, a, b);
@@ -52,7 +60,8 @@ typedef struct {
   e2a_verify_stats *vs;
   int tid, nt;
   volatile int *stop;
-  uint64_t bytes, chunks_ok, out_of_memory;
+  const uint64_t *verified;   /* volumes the pack already read back (one bit each), or NULL */
+  uint64_t bytes, chunks_ok, out_of_memory, gone;   /* gone: the destination stopped answering (drive removed) */
 } vjob;
 
 static void *vworker(void *arg) {
@@ -74,9 +83,26 @@ static void *vworker(void *arg) {
       uint64_t off = cr->location & 0xFFFFFFFFFFFFull;
       uint32_t stored_size = (cr->descriptor & 0xFFFFF) + 1;
       uint32_t codec = (cr->descriptor >> 20) & 3;
+      if (j->verified && pack_id < 1024 && ((j->verified[pack_id >> 6] >> (pack_id & 63)) & 1)) {
+        j->bytes += raw_size;   /* this volume was read back and checked while the pack went on */
+        j->chunks_ok++;
+        continue;
+      }
       if (pack_id >= j->h->pack_count || j->pack_fd[pack_id] < 0 || off + stored_size > j->packs[pack_id].file_size) what = "chunk location invalid: %s (%llu)";
-      else if (e2a_pread_all(j->pack_fd[pack_id], stored, stored_size, off) != 0) what = "chunk read failed: %s (%llu)";
       else {
+        int rerr = 0;
+        for (int attempt = 0; attempt < 4; attempt++) {   /* a passing hiccup of a USB drive gets three more tries */
+          if (e2a_pread_all(j->pack_fd[pack_id], stored, stored_size, off) == 0) { rerr = 0; break; }
+          rerr = errno;
+          if (attempt == 3 || !(rerr == EIO || rerr == EAGAIN || rerr == ETIMEDOUT || rerr == EBUSY || rerr == EINTR)) break;
+          sleep(2);
+        }
+        if (rerr) {
+          if (rerr == ENXIO || rerr == ENODEV || rerr == ENOENT || rerr == EBADF || rerr == EIO) { j->gone = 1; *j->stop = 1; break; }   /* pause, not a verdict */
+          what = "chunk read failed: %s (%llu)";
+        }
+      }
+      if (!what && !j->gone) {
         const uint8_t *data = stored;
         if (codec == AMPR_CODEC_LZ4) {
           int n = LZ4_decompress_safe((const char *)stored, (char *)raw, (int)stored_size, (int)raw_size);
@@ -164,15 +190,41 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
 
   uint64_t total = 0;
   for (uint64_t f = 0; f < h.file_count; f++) total += files[f].logical_size;
-  uint64_t done = 0;
-  double last_report = 0;
+  uint64_t done = 0, f0 = 0;
+  double last_report = 0, last_pos = e2a_now();
+  /* an interrupted verification resumes at the file it reached: <state_dir>/verify.pos holds the build id
+   * and the next file index */
+  char posfile[1100] = "", bid[33];
+  for (int i = 0; i < 16; i++) snprintf(bid + i * 2, 3, "%02x", h.build_id[i]);
+  if (o->state_dir) {
+    snprintf(posfile, sizeof posfile, "%s/verify.pos", o->state_dir);
+    FILE *pf = fopen(posfile, "r");
+    if (pf) {
+      char saved[40] = "";
+      unsigned long long idx = 0;
+      if (fscanf(pf, "%39s %llu", saved, &idx) == 2 && strcmp(saved, bid) == 0 && idx <= h.file_count) {
+        f0 = idx;
+        for (uint64_t f = 0; f < f0; f++) {
+          done += files[f].logical_size;
+          if (files[f].flags & AMPR_FILE_PACKED) { vs->files_packed++; vs->chunks += files[f].chunk_count; vs->bytes += files[f].logical_size; }
+          else vs->files_loose++;
+        }
+        e2a_log("verify: resuming at file %llu of %llu", (unsigned long long)f0, (unsigned long long)h.file_count);
+      }
+      fclose(pf);
+    }
+  }
 
-  for (uint64_t f = 0; f < h.file_count; f++) {
+  for (uint64_t f = f0; f < h.file_count; f++) {
     const ampr_file_record *fr = &files[f];
     const char *rel = strings + fr->path_offset;
     if (strncmp(rel, "/app0/", 6) == 0) rel += 6;
     if (o->cancel && *o->cancel) goto out;
-    if (o->pause && *o->pause) { rc = E2A_PACK_PAUSED; goto out; }
+    if (o->pause && *o->pause) {   /* an error already found is never forgotten: the position is kept only when clean */
+      if (vs->errors == 0) verify_pos_write(posfile, bid, f);
+      rc = E2A_PACK_PAUSED;
+      goto out;
+    }
     if (!(fr->flags & AMPR_FILE_PACKED)) {
       snprintf(path, sizeof path, "%s/%s", out_dir, rel);
       struct stat st;
@@ -196,6 +248,7 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
       memset(j, 0, sizeof *j);
       j->h = &h; j->chunks = chunks; j->crcs = crcs; j->packs = packs; j->pack_fd = pack_fd;
       j->fr = fr; j->rel = rel; j->o = o; j->vs = vs; j->tid = t; j->nt = nt; j->stop = &stop;
+      j->verified = o->verified_bits;
     }
     int started = 0;
     if (nt > 1)
@@ -204,15 +257,22 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
     for (int t = started; t < nt; t++) vworker(&jobs[t]);   /* none, or the threads that could not start */
     for (int t = 0; t < started; t++) pthread_join(th[t], NULL);
     uint64_t covered = 0;
-    bool oom = false;
-    for (int t = 0; t < nt; t++) { covered += jobs[t].bytes; vs->chunks += jobs[t].chunks_ok; vs->bytes += jobs[t].bytes; oom |= jobs[t].out_of_memory != 0; }
-    if (oom) goto out;
+    bool oom = false, gone = false;
+    for (int t = 0; t < nt; t++) { covered += jobs[t].bytes; vs->chunks += jobs[t].chunks_ok; vs->bytes += jobs[t].bytes; oom |= jobs[t].out_of_memory != 0; gone |= jobs[t].gone != 0; }
+    if (oom || gone) {   /* not a verdict on the data: pause here, the verification resumes at this file */
+      e2a_pack_set_pause_reason(oom ? "out of memory while verifying: try again later" : "destination unreadable (drive removed?): plug it back in, then resume");
+      if (vs->errors == 0) verify_pos_write(posfile, bid, f);
+      rc = E2A_PACK_PAUSED;
+      goto out;
+    }
     done += covered;
     if (o->cancel && *o->cancel) goto out;
     if (covered != fr->logical_size && vs->errors == 0) fail(vs, "chunk coverage incomplete: %s (%llu)", rel, fr->logical_size - covered);
     double now = e2a_now();
     if (o->progress && now - last_report > 0.5) { last_report = now; o->progress(o->ctx, done, rel); }
+    if (vs->errors == 0 && now - last_pos > 15) { verify_pos_write(posfile, bid, f + 1); last_pos = now; }
   }
+  if (posfile[0]) unlink(posfile);
   if (o->progress) o->progress(o->ctx, total, "");
   rc = vs->errors ? E2A_PACK_ERROR : E2A_PACK_OK;
   e2a_log("verify: %llu packed, %llu loose, %llu chunks, %llu errors", (unsigned long long)vs->files_packed,

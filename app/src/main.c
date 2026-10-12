@@ -256,7 +256,7 @@ static void load_games(void) {
     if (!g->title[0]) scopy(g->title, sizeof g->title, g->title_id[0] ? g->title_id : g->path);
     scopy(g->version, sizeof g->version, json_str(n, "version", ""));
     scopy(g->reason, sizeof g->reason, json_str(n, "reason", ""));
-    g->image = !strcmp(json_str(n, "type", ""), "image");
+    g->image = !strcmp(json_str(n, "type", ""), "image") || json_get(n, "image") != NULL;   /* or a mounted image's folder */
     g->selectable = json_bool(n, "selectable", true);
     g->ampr = json_bool(n, "ampr", false);
     g->partial = json_bool(n, "partial", false);
@@ -494,7 +494,7 @@ static void plugins_refresh_game(const game_t *g) {
     toast(msg);
     snd_cue_frame(SND_SELECT);
   } else {
-    snprintf(msg, sizeof msg, T(S_PLUG_FAILED), st == 409 ? T(S_E_GAME_RUNNING) : d.root ? json_str(d.root, "report", "?") : "?");
+    snprintf(msg, sizeof msg, T(S_PLUG_FAILED), st == 409 ? T(S_E_GAME_RUNNING) : d.root ? json_str(d.root, "error", json_str(d.root, "report", "?")) : "?");
     toast_err(msg);
   }
   json_free(&d);
@@ -1364,7 +1364,8 @@ static void draw_boot(void) {
 
 static void draw_confirm(void) {
   float e = ease_out(anim_t(g_confirm_at, 220));
-  bool detail = g_confirm_detail[0] != 0;   /* a deletion shows what is erased */
+  bool detail = g_confirm_detail[0] != 0;   /* a deletion shows what is erased; a retry shows why it failed */
+  bool del = g_confirm == ACT_DELETE_SOURCE;
   int by = detail ? 330 : 380, bh = detail ? 420 : 300, ty = by + 50, hy = by + bh - 90;
   uint32_t edge = g_confirm == ACT_DELETE_SOURCE ? RGBA(255, 120, 120, 190) : RGBA(110, 180, 255, 170);
   gfx_rect(0, 0, SCREEN_W, SCREEN_H, RGBA(0, 0, 0, (int)(160.0f * e)));
@@ -1372,12 +1373,15 @@ static void draw_confirm(void) {
   gfx_glow(460, by, 1000, bh, 32, RGBA(0, 0, 0, 140), 26);
   gfx_round_rect(460, by, 1000, bh, 32, RGB(24, 30, 46));
   gfx_round_frame(460, by, 1000, bh, 32, 2, edge);
-  if (detail) {
+  if (detail && del) {
     char q[400];
     snprintf(q, sizeof q, T(S_DELETE_Q), g_confirm_text);
     gfx_text_wrap(&FONT_HEAD, 520, ty, q, C_TEXT, 880, 2);
     gfx_text_wrap(&FONT_BODY, 520, ty + 100, T(S_DELETE_NOTE), C_WARN, 880, 2);
     gfx_text_wrap(&FONT_SMALL, 520, ty + 186, g_confirm_detail, C_DIM, 880, 3);
+  } else if (detail) {
+    gfx_text_wrap(&FONT_HEAD, 520, ty, g_confirm_text, C_TEXT, 880, 2);
+    gfx_text_wrap(&FONT_SMALL, 520, ty + 120, g_confirm_detail, C_WARN, 880, 4);
   } else gfx_text_wrap(&FONT_HEAD, 520, ty, g_confirm_text, C_TEXT, 880, 3);
   int x = 520;
   x += gfx_button(ICON_CROSS, x, hy, 44) + 12;

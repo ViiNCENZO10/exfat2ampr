@@ -356,6 +356,7 @@ static void api_plugins_refresh(int fd, const char *body) {
   if (!plugins_path_allowed(path)) { send_json(fd, 400, "{\"error\":\"bad game folder\"}"); return; }
   e2a_game g;
   if (e2a_read_game(path, &g) == 0 && activity_title_running(g.title_id)) { send_json(fd, 409, "{\"error\":\"game_running\"}"); return; }
+  if (job_path_busy(path)) { send_json(fd, 409, "{\"error\":\"a conversion uses this game\"}"); return; }
   int n = plugins_apply(path, rep, sizeof rep);
   e2a_json_escape(rep, er, sizeof er);
   snprintf(out, sizeof out, "{\"ok\":%s,\"written\":%d,\"report\":\"%s\"}", n >= 0 ? "true" : "false", n < 0 ? 0 : n, er);

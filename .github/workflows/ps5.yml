@@ -49,6 +49,13 @@ jobs:
           test -f homebrew/PPSA00001/.e2a-state/state.bin
       - name: Resume and finish (includes on-console style verification)
         run: ./exfat2ampr-host --resume homebrew/PPSA00001
+      - name: "Multi-volume pack (8 MiB volumes: finished volumes read back while packing, the final check skips them)"
+        run: |
+          E2A_TEST_MAX_PACK_MB=8 ./exfat2ampr-host --workers 4 --level 6 testgame homebrew PPSA00002 2>&1 | tee pack2.log
+          test "$(ls homebrew/PPSA00002/ampr_assets-*.pak | wc -l)" -ge 3
+          grep -c "read back:" pack2.log
+          test "$(grep -c "read back:" pack2.log)" -ge 2
+          python3 ampr_emu/tools/ampr_pack.py verify --index homebrew/PPSA00002/ampr_assets.index --root testgame
       - name: Validate with the reference tools
         run: |
           ls -la homebrew/PPSA00001
