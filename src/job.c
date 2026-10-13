@@ -283,6 +283,8 @@ static const char *pause_code(const char *why) {
 
 #define FAIL(c, m) do { err_code = (c); err = (m); goto done; } while (0)
 
+static bool backport_ampr_conflict(const char *tid, char *found, size_t cap);
+
 static void run_job(job_request req) {
   e2a_list entries;
   memset(&entries, 0, sizeof entries);
@@ -367,6 +369,13 @@ static void run_job(job_request req) {
     FAIL("not_game", "not a PS5 game folder (sce_sys/param.json + eboot.bin)");
   }
   covers_put_from_dir(game.title_id, src);   /* the image is open now: its pictures are kept for later */
+  {
+    char bp[400];
+    if (backport_ampr_conflict(game.title_id, bp, sizeof bp))
+      e2a_log("warning: the backport %s brings its own AMPR library: ShadowMountPlus overlays it on the game and it would "
+              "replace the emulator, so the converted game would not start. Rename that file (for example to .off) "
+              "before launching the converted game.", bp);
+  }
   /* a game and its own conversion never run together */
   if (activity_title_running(game.title_id)) {
     if (req.resume) {   /* resumed while its game is still open: wait for it again, nothing is lost */
@@ -1232,6 +1241,24 @@ static void add_code(char *list, size_t cap, const char *code) {
   snprintf(list + n, cap - n, "%s\"%s\"", n ? "," : "", code);
 }
 
+/* A backport (ShadowMountPlus overlays <scan path>/backports/<TITLE_ID>/ on the running game, fakelib included)
+ * that brings its own libSceAmpr.sprx would put the system's AMPR library back in place of the emulator: the
+ * converted game could not read its packed files and would not start. Returns true and the file found. */
+static bool backport_ampr_conflict(const char *tid, char *found, size_t cap) {
+  if (!tid || !tid[0]) return false;
+  static const char *const roots[] = {"/data/homebrew", "/data/etaHEN/games", "/mnt/ext0/homebrew", "/mnt/ext0/etaHEN/games",
+                                      "/mnt/ext1/homebrew", "/mnt/ext1/etaHEN/games", "/mnt/usb0/homebrew", "/mnt/usb0/etaHEN/games",
+                                      "/mnt/usb1/homebrew", "/mnt/usb1/etaHEN/games", NULL};
+  static const char *const names[] = {"libSceAmpr.sprx", "libsceampr.sprx", "libSceAmpr.prx", NULL};
+  char p[400];
+  for (int r = 0; roots[r]; r++)
+    for (int n = 0; names[n]; n++) {
+      snprintf(p, sizeof p, "%s/backports/%.12s/fakelib/%s", roots[r], tid, names[n]);
+      if (e2a_is_file(p)) { snprintf(found, cap, "%s", p); return true; }
+    }
+  return false;
+}
+
 int job_preflight(const char *path, const char *smp, const char *dest_base, char *json, size_t cap) {
   char errors[256] = "", warnings[256] = "", title[256] = "", tid[16] = "", root[600] = "";
   const char *compat = "later";
@@ -1276,6 +1303,10 @@ int job_preflight(const char *path, const char *smp, const char *dest_base, char
     else if (c < 0) add_code(warnings, sizeof warnings, "ampr_unknown");
   }
   if (tid[0] && activity_title_running(tid)) add_code(errors, sizeof errors, "game_running");
+  {
+    char bp[400];
+    if (backport_ampr_conflict(tid, bp, sizeof bp)) add_code(warnings, sizeof warnings, "backport_ampr");
+  }
 
   /* destination: must be a connected, writable storage of the mount table */
   e2a_storage st[E2A_MAX_STORAGES], *d = NULL;

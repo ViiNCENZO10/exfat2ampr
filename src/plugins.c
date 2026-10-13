@@ -334,6 +334,9 @@ int plugins_apply_to(const char *game_src, const char *dest, unsigned *written, 
 const char *plugins_name(int i) { return i >= 0 && i < P_N ? PLUGINS[i].name : NULL; }
 
 /* ----------------------------------------------------------------- emus -- */
+extern unsigned char libSceAmpr_sprx[];   /* the embedded AMPR emulator (gen/libSceAmpr_sprx.c) */
+extern unsigned int libSceAmpr_sprx_len;
+
 int plugins_sync_emus(char *report, size_t cap) {
   report[0] = 0;
   char parent[300];   /* ShadowMountPlus' own folder: without it, there is nobody to feed */
@@ -356,6 +359,29 @@ int plugins_sync_emus(char *report, size_t cap) {
       if (put_file(E2A_EMUS_DIR, p, true, report, cap) == 0) { written++; add_report(report, cap, "%s %s -> %s", p->name, version, p->known[0].version); }
       else rc = -1;
     } else if (st == F_UNKNOWN) add_report(report, cap, "%s: a build we do not know, left alone", p->name);
+  }
+  /* the AMPR emulator too: with update_emulators=1, ShadowMountPlus replaces the libSceAmpr.sprx of every game's
+   * fakelib with the one in this folder at launch. Missing, it would download one at launch time (nothing
+   * without internet); an older one (before 0.4.2.1) cannot read LZ4 packs and the converted game would not start */
+  {
+    char path[1200], hex[65], mine[65];
+    snprintf(path, sizeof path, "%s/libSceAmpr.sprx", E2A_EMUS_DIR);
+    e2a_sha256 c;
+    uint8_t d[32];
+    e2a_sha256_init(&c);
+    e2a_sha256_update(&c, libSceAmpr_sprx, libSceAmpr_sprx_len);
+    e2a_sha256_final(&c, d);
+    for (int i = 0; i < 32; i++) snprintf(mine + i * 2, 3, "%02x", d[i]);
+    if (!e2a_is_file(path)) {
+      if (libSceAmpr_sprx_len > 4096 && e2a_write_file_atomic(path, libSceAmpr_sprx, libSceAmpr_sprx_len) == 0) {
+        written++;
+        add_report(report, cap, "libSceAmpr.sprx %s added", E2A_AMPR_RUNTIME_VERSION);
+      }
+    } else if (e2a_sha256_file(path, hex) == 0 && strcmp(hex, mine) != 0) {
+      e2a_log("ShadowMountPlus' AMPR emulator %s (%lld bytes, sha256 %.16s) is not the one this version packs for (%s, %u "
+              "bytes): converted games receive it at launch; if it is older than 0.4.2.1 they cannot start",
+              path, (long long)e2a_file_size(path), hex, E2A_AMPR_RUNTIME_VERSION, libSceAmpr_sprx_len);
+    }
   }
   if (written) e2a_log("ShadowMountPlus emulators (%s): %s", E2A_EMUS_DIR, report);
   return rc < 0 ? -1 : written;

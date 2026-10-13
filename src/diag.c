@@ -5,7 +5,10 @@
 #include "common.h"
 #include "job.h"
 #include "plugins.h"
+#include "smp.h"
 #include "storage.h"
+
+#include <dirent.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -143,6 +146,79 @@ int diag_build(char **out, size_t *len) {
   if (job_list_resumable(big, bigcap) >= 0) tb_add(&b, "%s\n", big);
   section(&b, "plugins");
   if (plugins_info_json(big, bigcap) >= 0) tb_add(&b, "%s\n", big);
+
+  /* what ShadowMountPlus registered for each title (which copy a home-screen tile starts) and the libraries
+   * each folder game will load: fakelib, or fakelib2 which replaces it while it exists */
+  section(&b, "ShadowMountPlus emulators (" E2A_EMUS_DIR ")");
+  {   /* with update_emulators=1 these replace the same names in every game's fakelib at launch */
+    DIR *d = opendir(E2A_EMUS_DIR);
+    if (!d) tb_add(&b, "(none)\n");
+    else {
+      struct dirent *de;
+      while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char f[600], hex[65] = "";
+        snprintf(f, sizeof f, "%s/%s", E2A_EMUS_DIR, de->d_name);
+        e2a_sha256_file(f, hex);
+        tb_add(&b, "%s %lld bytes sha256 %.16s\n", de->d_name, (long long)e2a_file_size(f), hex);
+      }
+      closedir(d);
+    }
+  }
+
+  section(&b, "ShadowMountPlus titles");
+  {
+    smp_game *games = calloc(256, sizeof *games);
+    int n = games ? smp_list_games(games, 256) : -1;
+    if (n < 0) tb_add(&b, "(ShadowMountPlus not answering)\n");
+    for (int i = 0; i < n; i++) {
+      const smp_game *g = &games[i];
+      tb_add(&b, "%s %s: %s %s%s, fakelib %s, path %s, running from %s\n", g->title_id, g->title, g->source_type, g->image_type,
+             g->mounted ? " mounted" : "", g->fakelib_mode[0] ? g->fakelib_mode : "?", g->path, g->runtime_path[0] ? g->runtime_path : "-");
+      /* a backport ShadowMountPlus overlays on this title, and what its fakelib brings */
+      static const char *const broots[] = {"/data/homebrew", "/data/etaHEN/games", "/mnt/ext0/homebrew", "/mnt/ext0/etaHEN/games",
+                                           "/mnt/usb0/homebrew", "/mnt/usb0/etaHEN/games", NULL};
+      for (int r = 0; broots[r]; r++) {
+        char bdir[700];
+        snprintf(bdir, sizeof bdir, "%s/backports/%.12s", broots[r], g->title_id);
+        if (!e2a_is_dir(bdir)) continue;
+        tb_add(&b, "    backport %s:", bdir);
+        char bf[760];
+        snprintf(bf, sizeof bf, "%s/fakelib", bdir);
+        DIR *bd = opendir(bf);
+        if (bd) {
+          struct dirent *de;
+          while ((de = readdir(bd)) != NULL) if (de->d_name[0] != '.') tb_add(&b, " fakelib/%s", de->d_name);
+          closedir(bd);
+        }
+        DIR *td = opendir(bdir);
+        if (td) {
+          struct dirent *de;
+          while ((de = readdir(td)) != NULL) if (de->d_name[0] != '.' && strcmp(de->d_name, "fakelib") != 0) tb_add(&b, " %s", de->d_name);
+          closedir(td);
+        }
+        tb_add(&b, "\n");
+      }
+      const char *root = strcmp(g->source_type, "folder") == 0 ? g->path : g->runtime_path;
+      for (int k = 0; root[0] == '/' && k < 2; k++) {
+        char dir[800];
+        snprintf(dir, sizeof dir, "%s/%s", root, k ? "fakelib2" : "fakelib");
+        DIR *d = opendir(dir);
+        if (!d) continue;
+        tb_add(&b, "    %s:", k ? "fakelib2" : "fakelib");
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+          if (de->d_name[0] == '.' && strcmp(de->d_name, ".e2a-trace") != 0) continue;
+          char f[1100];
+          snprintf(f, sizeof f, "%s/%s", dir, de->d_name);
+          tb_add(&b, " %s (%lld)", de->d_name, (long long)e2a_file_size(f));
+        }
+        closedir(d);
+        tb_add(&b, "\n");
+      }
+    }
+    free(games);
+  }
 
   section(&b, "settings");
   {

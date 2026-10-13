@@ -64,6 +64,10 @@ Made by **V-10** · LZ4 format: **DLPSGAME** · AMPR emulator: drakmor/ampr_emu 
   the packer does), refined while it packs and shown live (« files → about … »), with the image size beside it
   when the game comes from an image; the time left counts the verification at its own, faster speed; every run
   teaches the next forecasts.
+- **Backports (firmware 9.xx and other older ones)**: not validated yet. A tester on 9.40 reports converted
+  games that do not start. ShadowMountPlus overlays `<scan path>/backports/<TITLE_ID>/` on the running game; a
+  backport that carries its own `fakelib/libSceAmpr.sprx` would replace the AMPR emulator. The checks before a
+  conversion and the engine's log now point such a file out.
 - **A game no longer "launched" by mistake**: a process of the game's title that only flickers (right after
   ShadowMountPlus mounts the image) paused the conversion, then resumed it at once into a "game is running"
   failure. A game now counts as running after about 6 seconds, as closed after 6 seconds without it, the log
