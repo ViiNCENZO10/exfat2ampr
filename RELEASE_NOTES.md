@@ -64,10 +64,18 @@ Made by **V-10** · LZ4 format: **DLPSGAME** · AMPR emulator: drakmor/ampr_emu 
   the packer does), refined while it packs and shown live (« files → about … »), with the image size beside it
   when the game comes from an image; the time left counts the verification at its own, faster speed; every run
   teaches the next forecasts.
-- **Backports (firmware 9.xx and other older ones)**: not validated yet. A tester on 9.40 reports converted
-  games that do not start. ShadowMountPlus overlays `<scan path>/backports/<TITLE_ID>/` on the running game; a
-  backport that carries its own `fakelib/libSceAmpr.sprx` would replace the AMPR emulator. The checks before a
-  conversion and the engine's log now point such a file out.
+- **Converted games that did not start, on every firmware (fixed)**: `ampr_emu.index` was written with the
+  standard FNV-1a hash, while the AMPR emulator looks paths up with the basis of drakmor's `build_ampr_index.py`.
+  The emulator found nothing, called the index invalid, rebuilt it from the folder, and every packed file then
+  pointed at the wrong data (`manifest-mismatch`, the game aborts at start). Converted onto the internal storage,
+  `eboot.bin` and the modules also lacked an execute bit (the console refused to start the game, then to load
+  `libSceAmpr.sprx`). Both are fixed, and folders converted by earlier versions are repaired by the engine at
+  start-up (the index rebuilt from the pack manifest, the previous one kept as `ampr_emu.index.e2a-old`). The
+  trace mode now refuses a converted game: its debug emulator rewrote the index too. Validated on a 12.40 console
+  with a game that had failed this way (Mafia: The Old Country).
+- **Backports**: ShadowMountPlus overlays `<scan path>/backports/<TITLE_ID>/` on the running game; a backport that
+  carries its own `fakelib/libSceAmpr.sprx` would replace the AMPR emulator. The checks before a conversion and
+  the engine's log point such a file out.
 - **A game no longer "launched" by mistake**: a process of the game's title that only flickers (right after
   ShadowMountPlus mounts the image) paused the conversion, then resumed it at once into a "game is running"
   failure. A game now counts as running after about 6 seconds, as closed after 6 seconds without it, the log
@@ -104,7 +112,11 @@ game plugin updates.
 
 exFAT2AMPR convertit les dumps de jeux PS5 au format AMPR LZ4, directement sur la console. Créé par **V-10**,
 format LZ4 : **DLPSGAME**. ✅ **Testé et fonctionnel sur PlayStation 5** par l'auteur (firmware 12.xx & 13.xx,
-kstuff, ShadowMountPlus 1.7). Installation : copier `PPSA99272.ffpkg` dans `homebrew/` (clé USB exFAT) ou dans
+kstuff, ShadowMountPlus 1.7). **Corrigé : les jeux convertis qui ne démarraient pas**, quel que soit le firmware :
+`ampr_emu.index` utilisait une empreinte de chemin différente de celle de l'émulateur AMPR, qui le reconstruisait
+et ne trouvait plus les fichiers compressés ; sur le stockage interne, `eboot.bin` et les modules n'étaient pas
+exécutables. Les dossiers déjà convertis sont réparés automatiquement au démarrage du moteur (l'ancien index est
+gardé en `ampr_emu.index.e2a-old`), et le mode trace refuse désormais un jeu converti. Installation : copier `PPSA99272.ffpkg` dans `homebrew/` (clé USB exFAT) ou dans
 `/data/homebrew/` par FTP, en un seul exemplaire, redémarrer, lancer le jailbreak puis l'app. Les mises à jour
 suivantes s'installent depuis l'app (Réglages › Mises à jour) : la redirection du téléchargement GitHub est
 maintenant suivie par l'app elle-même, avec en secours le package en morceaux depuis une adresse directe

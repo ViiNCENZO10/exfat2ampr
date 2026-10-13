@@ -229,6 +229,27 @@ static void test_crc32(void) {
   CHECK(e2a_crc32(e2a_crc32(0, buf, 13), buf + 13, 50) == e2a_crc32(0, buf, 63), "crc32 chaining");
 }
 
+/* Two hashes, two bases: values read from a pack the AMPR emulator 0.4.2.1 accepts (EA SPORTS FC 27, Lazy_AMPR). */
+static void test_path_hashes(void) {
+  const char *slot = "/app0/Data/Ps5/superbundlelayout/installpackage_03/cas_08.cas";
+  CHECK(e2a_ampridx_hash(slot, strlen(slot)) == 0x7b5a68a1cafac001ull, "ampr_emu.index slot hash (ampr_emu's basis): %016llx",
+        (unsigned long long)e2a_ampridx_hash(slot, strlen(slot)));
+  const char *rec = "/app0/_DUPLEX_/duplex.nfo";
+  CHECK(e2a_fnv1a64_fold(rec, strlen(rec)) == 0x4e969e9969d5087cull, "pack manifest path hash (standard FNV-1a): %016llx",
+        (unsigned long long)e2a_fnv1a64_fold(rec, strlen(rec)));
+  CHECK(e2a_ampridx_hash(rec, strlen(rec)) != e2a_fnv1a64_fold(rec, strlen(rec)), "the two hashes differ");
+}
+
+static void test_executable_names(void) {
+  CHECK(e2a_is_executable_name("/data/homebrew/PPSA14251/eboot.bin"), "eboot.bin");
+  CHECK(e2a_is_executable_name("fakelib/libSceAmpr.sprx"), ".sprx");
+  CHECK(e2a_is_executable_name("sce_module/libc.prx"), ".prx");
+  CHECK(e2a_is_executable_name("EBOOT.BIN") && e2a_is_executable_name("x/tool.ELF") && e2a_is_executable_name("a.self"),
+        "case-insensitive, .elf, .self");
+  CHECK(!e2a_is_executable_name("engine/content/renderer/tessellationtable.bin"), "data .bin");
+  CHECK(!e2a_is_executable_name("ampr_assets-000.pak") && !e2a_is_executable_name("sce_sys/param.json"), "data files");
+}
+
 int main(void) {
   setenv("E2A_FAKE_ROOT", "", 1);
   test_no_usb();
@@ -238,6 +259,8 @@ int main(void) {
   test_ampr_compat();
   test_plan_budget();
   test_crc32();
+  test_path_hashes();
+  test_executable_names();
   if (g_fail) { printf("%d check(s) failed\n", g_fail); return 1; }
   printf("all unit tests passed\n");
   return 0;

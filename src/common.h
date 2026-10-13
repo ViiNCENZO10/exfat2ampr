@@ -69,7 +69,9 @@ int  e2a_is_dir(const char *path);
 int  e2a_is_file(const char *path);
 int64_t e2a_file_size(const char *path);
 uint32_t e2a_crc32(uint32_t crc, const void *buf, size_t len);
-uint64_t e2a_fnv1a64_fold(const void *buf, size_t len);
+uint64_t e2a_fnv1a64_fold(const void *buf, size_t len);   /* pack manifest path hash */
+uint64_t e2a_ampridx_hash(const void *buf, size_t len);   /* ampr_emu.index slot hash (ampr_emu's basis) */
+bool e2a_is_executable_name(const char *path);             /* eboot.bin, .elf, .self, .prx, .sprx */
 void e2a_fold_ascii(char *s);
 double e2a_now(void);
 void e2a_log_tail_copy(char *out, size_t cap);  /* last lines of the in-memory log (for the web UI) */

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
@@ -318,8 +319,10 @@ int e2a_read_text(const char *path, char **out, size_t *len, size_t max) {
 int e2a_write_file_atomic(const char *path, const void *data, size_t len) {
   char tmp[1100];
   snprintf(tmp, sizeof tmp, "%s.e2a-tmp", path);
-  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  bool exec = e2a_is_executable_name(path);
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, exec ? 0755 : 0666);
   if (fd < 0) return -1;
+  if (exec) (void)fchmod(fd, 0755);   /* whatever the umask: the console must be able to load it */
   int rc = e2a_write_all(fd, data, len);
   if (fsync(fd) != 0) rc = -1;
   if (close(fd) != 0) rc = -1;
@@ -339,8 +342,10 @@ int e2a_copy_file(const char *src, const char *dst, int64_t mtime) {
   if (in < 0) { int e = errno; free(buf); errno = e; return -1; }
   char tmp[1100];
   snprintf(tmp, sizeof tmp, "%s.e2a-tmp", dst);
-  int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  bool exec = e2a_is_executable_name(dst);
+  int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, exec ? 0755 : 0666);
   if (out < 0) { int e = errno; close(in); free(buf); errno = e; return -1; }
+  if (exec) (void)fchmod(out, 0755);   /* eboot.bin and modules copied onto UFS keep an execute bit */
   int rc = 0, saved = 0;
   struct stat st;
   uint64_t size = fstat(in, &st) == 0 ? (uint64_t)st.st_size : 0, pos = 0;
@@ -419,6 +424,35 @@ uint64_t e2a_fnv1a64_fold(const void *buf, size_t len) {
     h *= 0x100000001B3ull;
   }
   return h ? h : 1;
+}
+
+/* The AMPRIDX3 slot hash (ampr_emu.index): the same folded FNV-1a, but from the offset basis
+ * 1469598103934665603 that drakmor/ampr_emu's build_ampr_index.py and the runtime use (the standard basis
+ * without its last digit). With the standard basis no lookup matches: the emulator then calls the index
+ * invalid, rebuilds it from the files on disk and every packed fileId points at the wrong file. The pack
+ * manifest (ampr_assets.index) keeps the standard basis: e2a_fnv1a64_fold. */
+uint64_t e2a_ampridx_hash(const void *buf, size_t len) {
+  const uint8_t *p = buf;
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < len; i++) {
+    uint8_t c = p[i];
+    if (c >= 'A' && c <= 'Z') c = (uint8_t)(c - 'A' + 'a');
+    h ^= c;
+    h *= 0x100000001B3ull;
+  }
+  return h ? h : 1;
+}
+
+/* Executables and modules: eboot.bin, *.elf, *.self, *.prx, *.sprx. On UFS (/data) the console loads them
+ * only with an execute bit (spawn fails with errno 13, rtld with "mount flag / attribute error"); exFAT
+ * grants it to every file, so a copy from a dump never had to set it. */
+bool e2a_is_executable_name(const char *path) {
+  const char *base = strrchr(path, '/');
+  base = base ? base + 1 : path;
+  if (strcasecmp(base, "eboot.bin") == 0) return true;
+  const char *dot = strrchr(base, '.');
+  return dot && (strcasecmp(dot, ".elf") == 0 || strcasecmp(dot, ".self") == 0 || strcasecmp(dot, ".prx") == 0 ||
+                 strcasecmp(dot, ".sprx") == 0);
 }
 
 int e2a_sha256_file(const char *path, char hex[65]) {

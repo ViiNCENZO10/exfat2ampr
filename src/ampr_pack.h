@@ -64,6 +64,11 @@ void e2a_pack_clear_checkpoint(const char *state_dir);
 /* AMPRIDX3 for the entry list (sorted). */
 int e2a_write_index(const char *path, const e2a_list *l);
 
+/* A folder converted by an earlier version: rebuilds ampr_emu.index from the pack manifest when it does not
+ * describe it (old slot hash, or replaced by the emulator) and gives the loose executables and the fakelib
+ * modules an execute bit. 0 = nothing to do or not a converted folder, >0 = fixes made, -1 = error (report). */
+int e2a_repair_converted(const char *game_dir, char *report, size_t cap);
+
 /* Copies every E2A_LOOSE entry from src_root into out_dir (already copied files are skipped). */
 int e2a_copy_loose(const e2a_list *l, const e2a_pack_opts *o);
 

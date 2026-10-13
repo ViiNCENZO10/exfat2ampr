@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 V-10 (exFAT2AMPR). GPL-3.0-or-later with additional terms: see NOTICE. */
 #include "plugins.h"
+#include "ampr_pack.h"
 
 #include "activity.h"
 #include "job.h"
@@ -440,6 +441,9 @@ static void visit_game(pass *ps, const char *path) {
   if (activity_title_running(g.title_id)) return;   /* its fakelib is mounted: next time */
   if (job_path_busy(path)) return;   /* the source or destination of a conversion (running, queued or paused) */
   char report[400];
+  /* folders converted by earlier versions: index with the wrong hash, executables without an execute bit */
+  int fixed = e2a_repair_converted(path, report, sizeof report);
+  if (fixed != 0) e2a_log("repair of %s: %s", path, report);
   int n = plugins_apply(path, report, sizeof report);
   if (n > 0) ps->updated++;
   else if (n < 0) { ps->failed++; e2a_log("plugins of %s: %s", path, report); }

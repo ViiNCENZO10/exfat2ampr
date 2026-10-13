@@ -1148,40 +1148,51 @@ static void draw_resume(void) {
 }
 
 static void draw_settings(void) {
-  const int x = 80, y = 230, w = 1060, h = 730, row = 88;
+  const int x = 80, y = 230, w = 1060, h = 730, pad = 24;
   panel(x, y, w, h);
   const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_GAME_MODE), T(S_SOUNDS), T(S_ANIMS), T(S_PAIR), T(S_PLUGINS), T(S_UPDATES), T(S_LOG), T(S_DIAG), T(S_QUIT_APP)};
+  /* every row inside the panel: the rows share its height (88 px at most, 64 at least, so the last one,
+   * Quit, is never pushed off the screen); past that the list scrolls and keeps the selection in view */
+  int row = (h - 2 * pad) / SET_COUNT;
+  if (row > 88) row = 88;
+  if (row < 64) row = 64;
+  const int rows = (h - 2 * pad) / row;
+  static int scroll;
+  if (g_set_sel < scroll) scroll = g_set_sel;
+  if (g_set_sel >= scroll + rows) scroll = g_set_sel - rows + 1;
+  if (scroll > SET_COUNT - rows) scroll = SET_COUNT - rows > 0 ? SET_COUNT - rows : 0;
+  const int head_y = (row - FONT_HEAD.line) / 2, body_y = (row - FONT_BODY.line) / 2, tog_y = (row - 46) / 2;
   static anim_val sel_v, tog[3];
-  float sv = anim_track(&sel_v, (float)g_set_sel, 22.0f, 0.002f);
-  row_push(g_set_sel);
-  draw_focus(x + 12, y + 24 + (int)(sv * (float)row), w - 24, row - 14, 20);
+  float sv = anim_track(&sel_v, (float)(g_set_sel - scroll), 22.0f, 0.002f);
+  row_push(g_set_sel - scroll);
+  draw_focus(x + 12, y + pad + (int)(sv * (float)row) + 4, w - 24, row - 8, 20);
   gfx_pop();
-  for (int i = 0; i < SET_COUNT; i++) {
-    int ry = y + 24 + i * row;
-    row_push(i);
-    gfx_text(&FONT_HEAD, x + 40, ry + 25, labels[i], C_TEXT, i == SET_LANG ? 520 : w - 220);
+  for (int i = scroll; i < SET_COUNT && i < scroll + rows; i++) {
+    int ry = y + pad + (i - scroll) * row;
+    row_push(i - scroll);
+    gfx_text(&FONT_HEAD, x + 40, ry + head_y, labels[i], C_TEXT, i == SET_LANG ? 520 : w - 220);
     if (i == SET_LANG) {   /* the language name slides in from the side it came from */
       float e = ease_out(anim_t(g_lang_at, 240));
       char v[64];
       snprintf(v, sizeof v, "‹  %s  ›", lang_name(i18n_get()));
       gfx_push((int)((1.0f - e) * 28.0f * (float)g_lang_dir), 0, (int)(255.0f * (0.2f + 0.8f * e)));
-      gfx_text_right(&FONT_HEAD, x + w - 40, ry + 25, v, C_ACCENT);
+      gfx_text_right(&FONT_HEAD, x + w - 40, ry + head_y, v, C_ACCENT);
       gfx_pop();
-    } else if (i == SET_GAME_MODE) draw_toggle(x + w - 140, ry + 20, g_st.game_mode_enabled, C_ACCENT, &tog[0]);
-    else if (i == SET_SOUNDS) draw_toggle(x + w - 140, ry + 20, snd_enabled(), C_ACCENT, &tog[1]);
-    else if (i == SET_ANIMS) draw_toggle(x + w - 140, ry + 20, g_anim_enabled, C_ACCENT, &tog[2]);
-    else if (i == SET_PAIR) gfx_text_right(&FONT_HEAD, x + w - 44, ry + 25, "›", C_DIM);
+    } else if (i == SET_GAME_MODE) draw_toggle(x + w - 140, ry + tog_y, g_st.game_mode_enabled, C_ACCENT, &tog[0]);
+    else if (i == SET_SOUNDS) draw_toggle(x + w - 140, ry + tog_y, snd_enabled(), C_ACCENT, &tog[1]);
+    else if (i == SET_ANIMS) draw_toggle(x + w - 140, ry + tog_y, g_anim_enabled, C_ACCENT, &tog[2]);
+    else if (i == SET_PAIR) gfx_text_right(&FONT_HEAD, x + w - 44, ry + head_y, "›", C_DIM);
     else if (i == SET_LOG) {   /* how many lines the app has noted so far */
       char n[32];
       snprintf(n, sizeof n, "%d  ›", app_log_count());
-      gfx_text_right(&FONT_HEAD, x + w - 44, ry + 25, n, C_DIM);
-    } else if (i == SET_DIAG) gfx_text_right(&FONT_HEAD, x + w - 44, ry + 25, "›", C_DIM);
+      gfx_text_right(&FONT_HEAD, x + w - 44, ry + head_y, n, C_DIM);
+    } else if (i == SET_DIAG) gfx_text_right(&FONT_HEAD, x + w - 44, ry + head_y, "›", C_DIM);
     else if (i == SET_PLUGINS) {   /* the embedded releases and the last pass over the games */
       char v[160];
       if (!g_plug.ok) scopy(v, sizeof v, "…");
       else if (g_plug.running) scopy(v, sizeof v, T(S_PLUG_RUNNING));
       else snprintf(v, sizeof v, T(S_PLUG_STATUS), g_plug.pgo, g_plug.dlc, g_plug.games, g_plug.updated);
-      gfx_text_right(&FONT_BODY, x + w - 40, ry + 30, v, g_plug.running ? C_ACCENT : C_DIM);
+      gfx_text_right(&FONT_BODY, x + w - 40, ry + body_y, v, g_plug.running ? C_ACCENT : C_DIM);
     } else if (i == SET_UPDATE) {   /* where the app's own update stands */
       int pct = 0;
       char ver[32], v[96];
@@ -1203,10 +1214,13 @@ static void draw_settings(void) {
         }
         default: scopy(v, sizeof v, T(S_UPD_CHECKING)); break;
       }
-      gfx_text_right(&FONT_BODY, x + w - 40, ry + 30, v, c);
+      gfx_text_right(&FONT_BODY, x + w - 40, ry + body_y, v, c);
     }
     gfx_pop();
   }
+  /* more rows above or below: a hint at the panel's edge */
+  if (scroll > 0) gfx_text_center(&FONT_SMALL, x + w / 2, y + 2, "↑", C_DIM);
+  if (scroll + rows < SET_COUNT) gfx_text_center(&FONT_SMALL, x + w / 2, y + h - FONT_SMALL.line, "↓", C_DIM);
   /* right: the web page and its pairing code, the engine, the licence */
   const int ix = 1180, iw = 660;
   panel(ix, y, iw, h);

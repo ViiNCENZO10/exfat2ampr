@@ -873,6 +873,13 @@ int trace_enable(const char *game_dir, char *err, size_t errcap) {
     snprintf(err, errcap, "debug emulator missing from this build");
     return -1;
   }
+  /* a converted game no longer has its packed files on disk: the debug emulator calls the index stale,
+   * rewrites ampr_emu.index from the folder and the pack's fileIds then point at the wrong files */
+  snprintf(dir, sizeof dir, "%s/ampr_assets.index", game_dir);
+  if (e2a_is_file(dir)) {
+    snprintf(err, errcap, "converted game: record the trace on the original (unconverted) game");
+    return -1;
+  }
   snprintf(dir, sizeof dir, "%s/fakelib2", game_dir);
   snprintf(src_dir, sizeof src_dir, "%s/fakelib", game_dir);
   if (e2a_is_dir(dir) && !trace_enabled(game_dir)) {
