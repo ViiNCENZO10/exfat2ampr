@@ -1,0 +1,11 @@
+{
+ "version": "1.104",
+ "tag": "v1.104",
+ "size": 148897792,
+ "sha256": "9f0dd8a4efcea0c6b014fa64c4e9328b328c9c9531e107208457526490101bd4",
+ "package": "https://github.com/exFAT2AMPR/exfat2ampr/releases/download/v1.104/PPSA99272.ffpkg",
+ "parts": [
+  "https://raw.githubusercontent.com/exFAT2AMPR/exfat2ampr/updates/PPSA99272.ffpkg.part0",
+  "https://raw.githubusercontent.com/exFAT2AMPR/exfat2ampr/updates/PPSA99272.ffpkg.part1"
+ ]
+}
