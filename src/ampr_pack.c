@@ -30,8 +30,19 @@
 #define MAX_VOLS 1024
 
 static char g_pause_reason[160];
-const char *e2a_pack_pause_reason(void) { return g_pause_reason; }
-void e2a_pack_set_pause_reason(const char *why) { snprintf(g_pause_reason, sizeof g_pause_reason, "%s", why ? why : ""); }
+static pthread_mutex_t g_reason_mx = PTHREAD_MUTEX_INITIALIZER;
+const char *e2a_pack_pause_reason(void) {
+  static _Thread_local char copy[160];
+  pthread_mutex_lock(&g_reason_mx);
+  memcpy(copy, g_pause_reason, sizeof copy);
+  pthread_mutex_unlock(&g_reason_mx);
+  return copy;
+}
+void e2a_pack_set_pause_reason(const char *why) {
+  pthread_mutex_lock(&g_reason_mx);
+  snprintf(g_pause_reason, sizeof g_pause_reason, "%s", why ? why : "");
+  pthread_mutex_unlock(&g_reason_mx);
+}
 
 /* write/read errors that mean "the drive is full, gone or read-only": pause (resumable), not fail */
 static bool storage_pause(int err) {
@@ -46,9 +57,10 @@ static bool storage_pause(int err) {
 /* ------------------------------------------------------------ containers -- */
 typedef struct { uint8_t *p; size_t n, cap; } bytebuf;
 static int bb_reserve(bytebuf *b, size_t extra) {
+  if (extra > SIZE_MAX - b->n) return -1;
   if (b->n + extra <= b->cap) return 0;
   size_t nc = b->cap ? b->cap * 2 : 4096;
-  while (nc < b->n + extra) nc *= 2;
+  while (nc < b->n + extra) { if (nc > SIZE_MAX / 2) return -1; nc *= 2; }
   uint8_t *np = realloc(b->p, nc);
   if (!np) return -1;
   b->p = np; b->cap = nc;
@@ -103,6 +115,7 @@ typedef struct __attribute__((packed)) {
 
 /* a volume handed to the read-back thread: its chunk records and CRCs, copied (the main thread keeps appending) */
 typedef struct { uint32_t id; char path[1100]; size_t nrec; ampr_chunk_record *recs; uint32_t *crcs; } bgv_item;
+typedef struct { void *packer; int tid; } pool_arg;
 
 typedef struct {
   const e2a_pack_opts *o;
@@ -120,12 +133,12 @@ typedef struct {
   /* a volume that filled up is read back and checked on its own thread while the next one fills */
   pthread_t bgv_th;
   bool bgv_started, bgv_stop;
-  volatile bool bgv_stop_now;
+  atomic_bool bgv_stop_now;
   pthread_mutex_t bgv_mx;
   pthread_cond_t bgv_cv;
   bgv_item *bgv_queue[MAX_VOLS];
   int bgv_head, bgv_tail;
-  volatile int bgv_err;
+  atomic_int bgv_err;
   char bgv_msg[200];
   uint32_t vol_first_chunk[MAX_VOLS];   /* first chunk record of each volume opened in this run (UINT32_MAX: reopened) */
   /* checkpoint bookkeeping */
@@ -156,6 +169,13 @@ typedef struct {
   double w_at, w_tr, w_tc, w_tw;
   uint64_t w_br, w_bc, w_bw;
   uint64_t autoloose;   /* bytes of files found incompressible and left as they are */
+  pthread_mutex_t workers_mx;
+  pthread_cond_t workers_start, workers_done;
+  pthread_t workers_threads[16];
+  pool_arg workers_args[16];
+  int workers_started, workers_remaining, workers_active, workers_count;
+  unsigned workers_epoch;
+  bool workers_stop, workers_attempted;
   /* worker outputs for the batch being processed */
   const uint8_t *cur_raw;
   const uint32_t *cur_len;
@@ -224,7 +244,7 @@ static int checkpoint(packer *P, uint64_t next_entry, uint64_t cur_offset, uint3
   e2a_ckpt *c = calloc(1, sizeof *c);
   if (!c) return -1;
   memcpy(c->magic, CKPT_MAGIC, 8);
-  c->version = 2; c->level = (uint32_t)P->o->level;
+  c->version = 3; c->level = (uint32_t)P->o->level;
   c->entry_count = entry_count; c->total_bytes = total_bytes; c->entries_hash = P->entries_hash;
   c->next_entry = next_entry; c->cur_offset = cur_offset;
   c->cur_first_chunk = cur_first_chunk; c->cur_nchunks = cur_nchunks;
@@ -237,6 +257,7 @@ static int checkpoint(packer *P, uint64_t next_entry, uint64_t cur_offset, uint3
 
   char final[700];
   snprintf(final, sizeof final, "%s/state.bin", dir);
+  c->reserved = e2a_crc32(0, c, sizeof *c);
   int rc = e2a_write_file_atomic(final, c, sizeof *c);
   free(c);
   if (rc == 0) {
@@ -257,7 +278,19 @@ static int ckpt_read(const char *dir, e2a_ckpt *c) {
   size_t got = 0;
   int rc = e2a_read_full(fd, c, sizeof *c, &got) == 0 && got == sizeof *c ? 0 : -1;
   close(fd);
-  if (rc == 0 && (memcmp(c->magic, CKPT_MAGIC, 8) != 0 || c->version != 2 || c->nvols > MAX_VOLS)) rc = -1;
+  if (rc == 0 && (memcmp(c->magic, CKPT_MAGIC, 8) != 0 || (c->version != 2 && c->version != 3) || c->nvols > MAX_VOLS)) rc = -1;
+  if (rc == 0 && c->version == 3) {
+    uint32_t sum = c->reserved; c->reserved = 0;
+    if (e2a_crc32(0, c, sizeof *c) != sum) rc = -1;
+    c->reserved = sum;
+  }
+  if (rc == 0 && (c->entry_count > (16u << 20) || c->next_entry > c->entry_count ||
+      c->files_len != c->next_entry * sizeof(ampr_file_record) ||
+      c->chunks_len % sizeof(ampr_chunk_record) || c->chunks_len / sizeof(ampr_chunk_record) > E2A_BLOCK_LIMIT ||
+      c->crcs_len != c->chunks_len / sizeof(ampr_chunk_record) * 4 ||
+      c->strings_len > (256u << 20) || c->dedup_len > (512u << 20) || c->dedup_len % sizeof(dd_rec) ||
+      c->cur_first_chunk > c->chunks_len / sizeof(ampr_chunk_record) ||
+      c->cur_nchunks > c->chunks_len / sizeof(ampr_chunk_record) - c->cur_first_chunk)) rc = -1;
   return rc;
 }
 
@@ -365,6 +398,15 @@ static int vol_reopen(packer *P, uint32_t id, uint64_t pos, uint32_t flags) {
   char path[1100];
   vol_path(P, v, path, sizeof path);
   v->fd = open(path, O_WRONLY);
+  if (v->fd < 0 && errno == ENOENT) {
+    char final[1100];
+    snprintf(final, sizeof final, "%s/%s", P->o->out_dir, v->name);
+    if (rename(final, path) == 0 && e2a_sync_parent(path) == 0) v->fd = open(path, O_WRONLY);
+  }
+  struct stat existing;
+  if (v->fd >= 0 && (fstat(v->fd, &existing) != 0 || pos < P->payload_offset || pos > (uint64_t)existing.st_size)) {
+    close(v->fd); v->fd = -1; errno = EINVAL;
+  }
   if (v->fd < 0) { e2a_log("cannot reopen %s: %s", path, strerror(errno)); return -1; }
   if (ftruncate(v->fd, (off_t)pos) != 0) { close(v->fd); v->fd = -1; return -1; }  /* drop bytes written after the checkpoint */
   v->pos = pos; v->flags = flags;
@@ -498,14 +540,14 @@ static int vol_finish(packer *P, volume *v, const uint8_t build_id[16]) {
 }
 
 /* --------------------------------------------------------------- threads -- */
-typedef struct { packer *P; int tid; int count; } wjob;
+typedef struct { packer *P; int tid; int count; int stride; } wjob;
 
 /* compress + fingerprint + crc of the blocks of the current batch */
 static void *worker(void *arg) {
   wjob *w = arg;
   packer *P = w->P;
   int level = P->o->level;
-  for (int i = w->tid; i < w->count; i += P->o->workers) {
+  for (int i = w->tid; i < w->count; i += w->stride) {
     const char *src = (const char *)P->cur_raw + (size_t)i * P->block;
     uint32_t len = P->cur_len[i];
     char *dst = (char *)P->comp + (size_t)i * (size_t)P->bound;
@@ -534,19 +576,65 @@ static void *worker(void *arg) {
   return NULL;
 }
 
+static void *pool_worker(void *arg) {
+  pool_arg *pa = arg;
+  packer *P = pa->packer;
+  unsigned seen = 0;
+  pthread_mutex_lock(&P->workers_mx);
+  for (;;) {
+    while (!P->workers_stop && seen == P->workers_epoch) pthread_cond_wait(&P->workers_start, &P->workers_mx);
+    if (P->workers_stop) break;
+    seen = P->workers_epoch;
+    if (pa->tid >= P->workers_active) continue;
+    wjob job = {P, pa->tid, P->workers_count, P->workers_active};
+    pthread_mutex_unlock(&P->workers_mx);
+    worker(&job);
+    pthread_mutex_lock(&P->workers_mx);
+    if (--P->workers_remaining == 0) pthread_cond_signal(&P->workers_done);
+  }
+  pthread_mutex_unlock(&P->workers_mx);
+  return NULL;
+}
+
+static void pool_init(packer *P) {
+  pthread_mutex_init(&P->workers_mx, NULL);
+  pthread_cond_init(&P->workers_start, NULL);
+  pthread_cond_init(&P->workers_done, NULL);
+}
+
+static void pool_destroy(packer *P) {
+  pthread_mutex_lock(&P->workers_mx);
+  P->workers_stop = true;
+  pthread_cond_broadcast(&P->workers_start);
+  pthread_mutex_unlock(&P->workers_mx);
+  for (int i = 0; i < P->workers_started; i++) pthread_join(P->workers_threads[i], NULL);
+  pthread_cond_destroy(&P->workers_start);
+  pthread_cond_destroy(&P->workers_done);
+  pthread_mutex_destroy(&P->workers_mx);
+}
+
 static int compress_batch(packer *P, int count) {
-  int nt = activity_workers(P->o->workers);   /* 2 while a game is running */
-  if (nt > count) nt = count;
-  pthread_t th[64];
-  wjob jobs[64];
-  for (int t = 0; t < nt; t++) {
-    jobs[t].P = P; jobs[t].tid = t; jobs[t].count = count;
-    if (pthread_create(&th[t], NULL, worker, &jobs[t]) != 0) {
-      for (int k = 0; k < t; k++) pthread_join(th[k], NULL);
-      return -1;
+  if (!P->workers_attempted) {
+    P->workers_attempted = true;
+    int want = P->o->workers;
+    if (want > 16) want = 16;
+    for (int t = 0; t < want; t++) {
+      P->workers_args[t].packer = P; P->workers_args[t].tid = t;
+      if (pthread_create(&P->workers_threads[t], NULL, pool_worker, &P->workers_args[t]) != 0) break;
+      P->workers_started++;
     }
   }
-  for (int t = 0; t < nt; t++) pthread_join(th[t], NULL);
+  int nt = activity_workers(P->o->workers);
+  if (nt > P->workers_started) nt = P->workers_started;
+  if (nt > count) nt = count;
+  if (nt < 1) { wjob job = {P, 0, count, 1}; worker(&job); return 0; }
+  pthread_mutex_lock(&P->workers_mx);
+  P->workers_active = P->workers_remaining = nt;
+  P->workers_count = count;
+  P->workers_epoch++;
+  pthread_cond_broadcast(&P->workers_start);
+  while (P->workers_remaining) pthread_cond_wait(&P->workers_done, &P->workers_mx);
+  pthread_mutex_unlock(&P->workers_mx);
   return 0;
 }
 
@@ -996,6 +1084,7 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
   P->fp = calloc(MAX_SLOTS, 16);
   P->entries_hash = entries_hash(entries);
   P->last_ckpt = e2a_now();
+  pool_init(P);
   pthread_mutex_init(&P->mx, NULL);
   pthread_cond_init(&P->cv, NULL);
   pthread_mutex_init(&P->bgv_mx, NULL);
@@ -1025,6 +1114,8 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
       while (cap < (P->dedup.n / sizeof(dd_rec)) * 2) cap *= 2;
       if (dd_rehash(P, cap) != 0) { free(c); goto out; }
     }
+    if ((c->next_entry == entries->n && c->cur_offset) ||
+        (c->next_entry < entries->n && c->cur_offset > entries->v[c->next_entry].size)) { free(c); goto out; }
     P->nvols = c->nvols;  /* before the loop, so the cleanup closes what was reopened on failure */
     for (uint32_t i = 0; i < c->nvols; i++) {
       if (vol_reopen(P, i, c->vol_pos[i], c->vol_flags[i]) != 0) { free(c); goto out; }
@@ -1085,6 +1176,8 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
   if (bgv_shutdown(P, true) != 0) { e2a_log("%s", P->bgv_msg); goto out; }   /* every queued volume checked before the manifest */
   if (P->nvols == 0 && vol_open(P) != 0) goto out;  /* nothing compressible: still emit a valid empty volume */
 
+  /* A publication interrupted after any rename can roll back to this complete checkpoint. */
+  if (checkpoint(P, entries->n, 0, 0, 0, entries->n, entries->total_bytes) != 0) goto out;
   /* pack records (names into the string table) */
   for (uint32_t i = 0; i < P->nvols; i++) {
     volume *v = &P->vols[i];
@@ -1189,7 +1282,8 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
     char tmp[1100], final[1100];
     snprintf(final, sizeof final, "%s/%s", o->out_dir, P->vols[i].name);
     vol_path(P, &P->vols[i], tmp, sizeof tmp);
-    if (rename(tmp, final) != 0) { e2a_log("rename %s failed", P->vols[i].name); goto out; }
+    if (rename(tmp, final) != 0 || e2a_sync_parent(final) != 0) { e2a_log("rename %s failed", P->vols[i].name); goto out; }
+    e2a_test_crash("publish_volume");
   }
   if (write_out(o->out_dir, "ampr_assets.index.crc", &ch, sizeof ch, P->crcs.p, P->crcs.n) ||
       write_out(o->out_dir, "ampr_assets.index.runtime", &cfg, sizeof cfg, NULL, 0) ||
@@ -1197,6 +1291,7 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
     e2a_log("writing manifest failed: %s", strerror(errno));
     goto out;
   }
+  e2a_test_crash("publish_manifest");
   st->packs = P->nvols;
   e2a_log("pack: %llu files packed, %llu loose, %llu chunks (%llu lz4 / %llu raw / %llu shared), %u volumes",
           (unsigned long long)st->files_packed, (unsigned long long)st->files_loose, (unsigned long long)st->chunks,
@@ -1204,6 +1299,7 @@ int e2a_pack(e2a_list *entries, const e2a_pack_opts *o, e2a_pack_stats *st) {
   rc = E2A_PACK_OK;
 
 out:
+  pool_destroy(P);
   bgv_shutdown(P, false);   /* a pause, a cancel or an error: the read-back still queued is dropped */
   free(payload.p);
   for (uint32_t i = 0; i < P->nvols; i++) {
@@ -1232,31 +1328,65 @@ out:
 
 /* ---------------------------------------------------------------- loose -- */
 int e2a_copy_loose(const e2a_list *l, const e2a_pack_opts *o) {
+  if (l->n > (64u << 20) / sizeof(e2a_loose_record)) return E2A_PACK_ERROR;
+  size_t len = sizeof(e2a_loose_header) + l->n * sizeof(e2a_loose_record);
+  uint8_t *table = calloc(1, len);
+  if (!table) return E2A_PACK_ERROR;
+  e2a_loose_header *h = (e2a_loose_header *)table;
+  e2a_loose_record *records = (e2a_loose_record *)(table + sizeof *h);
+  char manifest[1100];
+  snprintf(manifest, sizeof manifest, "%s/ampr_assets.index", o->out_dir);
+  int fd = open(manifest, O_RDONLY), rc = E2A_PACK_ERROR;
+  ampr_pak_header mh;
+  if (fd < 0) goto out;
+  int read_rc = e2a_pread_all(fd, &mh, sizeof mh, 0);
+  close(fd);
+  if (read_rc != 0 || mh.file_count != l->n) goto out;
+  memcpy(h->magic, "E2ALOOS1", 8); memcpy(h->build_id, mh.build_id, 16); h->count = l->n;
   uint64_t done = 0;
   for (size_t i = 0; i < l->n; i++) {
     const e2a_entry *e = &l->v[i];
-    if (e->action != E2A_LOOSE || e->synthetic) continue;
-    if (o->cancel && *o->cancel) return E2A_PACK_ERROR;
-    if (o->pause && *o->pause) return E2A_PACK_PAUSED;
-    char src[1100], dst[1100];
+    if (e->action != E2A_LOOSE) continue;
+    if (o->cancel && *o->cancel) goto out;
+    if (o->pause && *o->pause) { rc = E2A_PACK_PAUSED; goto out; }
+    char src[1100], dst[1100], expected[65], actual[65];
     snprintf(src, sizeof src, "%s/%s", o->src_root, e->rel);
     snprintf(dst, sizeof dst, "%s/%s", o->out_dir, e->rel);
+    /* the SHA-256 recorded for each loose file is that of the bytes read from the source; the final
+     * verification reads the copy again and compares. One read of the source per file in the normal case:
+     * the source is hashed again only when a copy left by an earlier run is reused */
     struct stat st;
-    if (stat(dst, &st) == 0 && S_ISREG(st.st_mode) && (uint64_t)st.st_size == e->size) {
-      done += e->size;  /* already copied by a previous run */
-      if (o->skip) o->skip(o->ctx, e->size);
-      continue;
+    if (e->synthetic) {   /* written by the conversion itself (emulator, plugins): its own bytes are the reference */
+      if (stat(dst, &st) != 0 || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != e->size || e2a_sha256_file(dst, expected) != 0) {
+        e2a_log("cannot hash %s", e->rel); goto out;
+      }
+    } else {
+      if (stat(src, &st) != 0 || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != e->size) {
+        e2a_log("loose source changed or missing: %s", e->rel); goto out;
+      }
+      bool same = stat(dst, &st) == 0 && S_ISREG(st.st_mode) && (uint64_t)st.st_size == e->size &&
+                  e2a_sha256_file(src, expected) == 0 && e2a_sha256_file(dst, actual) == 0 && !strcmp(expected, actual);
+      if (same && o->skip) o->skip(o->ctx, e->size);   /* reused: no copy now */
+      if (!same) {
+        char *slash = strrchr(dst, '/');
+        if (slash) { *slash = 0; int r = e2a_mkdir_p(dst); *slash = '/'; if (r != 0) goto out; }
+        if (e2a_copy_file_sha(src, dst, e->mtime, expected) != 0) {
+          int err = errno;
+          if (storage_pause(err)) rc = E2A_PACK_PAUSED;
+          e2a_log("loose copy failed: %s", e->rel); goto out;
+        }
+      }
     }
-    char *slash = strrchr(dst, '/');
-    if (slash) { *slash = 0; if (e2a_mkdir_p(dst) != 0) { e2a_log("mkdir failed: %s", dst); return E2A_PACK_ERROR; } *slash = '/'; }
-    if (e2a_copy_file(src, dst, e->mtime) != 0) {
-      int err = errno;
-      e2a_log("copy failed: %s (%s)", e->rel, strerror(err));
-      if (storage_pause(err)) return E2A_PACK_PAUSED;
-      return E2A_PACK_ERROR;
-    }
+    records[i].path_hash = e2a_fnv1a64_fold(e->key, strlen(e->key));
+    memcpy(records[i].sha, expected, 64);
     done += e->size;
     if (o->progress) o->progress(o->ctx, done, e->rel);
   }
-  return E2A_PACK_OK;
+  h->payload_crc = e2a_crc32(0, records, l->n * sizeof *records);
+  snprintf(manifest, sizeof manifest, "%s/ampr_assets.index.loose", o->out_dir);
+  if (e2a_write_file_atomic(manifest, table, len) != 0) goto out;
+  rc = E2A_PACK_OK;
+out:
+  free(table);
+  return rc;
 }

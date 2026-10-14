@@ -4,6 +4,7 @@
 #include "scan.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,7 +183,7 @@ int e2a_list_add(e2a_list *l, const char *rel, uint64_t size, int64_t mtime, boo
   e->rel = strdup(rel);
   size_t klen = 6 + strlen(rel);
   e->key = malloc(klen + 1);
-  if (!e->rel || !e->key) return -1;
+  if (!e->rel || !e->key) { free(e->rel); free(e->key); return -1; }
   memcpy(e->key, "/app0/", 6);
   memcpy(e->key + 6, rel, strlen(rel) + 1);
   e2a_fold_ascii(e->key);
@@ -195,19 +196,26 @@ int e2a_list_add(e2a_list *l, const char *rel, uint64_t size, int64_t mtime, boo
 
 static int walk(const char *root, const char *rel, e2a_list *out, bool clean) {
   char full[1024];
-  if (rel[0]) snprintf(full, sizeof full, "%s/%s", root, rel); else snprintf(full, sizeof full, "%s", root);
+  int fn = rel[0] ? snprintf(full, sizeof full, "%s/%s", root, rel) : snprintf(full, sizeof full, "%s", root);
+  if (fn < 0 || (size_t)fn >= sizeof full) { errno = ENAMETOOLONG; return -1; }
   DIR *d = opendir(full);
   if (!d) { e2a_log("opendir failed: %s", full); return -1; }
   struct dirent *de;
   int rc = 0;
-  while ((de = readdir(d)) != NULL) {
+  for (;;) {
+    errno = 0;
+    de = readdir(d);
+    if (!de) { if (errno) rc = -1; break; }
     if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-    if (strchr(de->d_name, '\t') || strchr(de->d_name, '\n') || strchr(de->d_name, '\r')) continue;
+    if (!e2a_safe_relative(de->d_name)) { e2a_log("unsupported source name in %s", full); rc = -1; break; }
     char child[1024], path[1100];
-    if (rel[0]) snprintf(child, sizeof child, "%s/%s", rel, de->d_name); else snprintf(child, sizeof child, "%s", de->d_name);
-    snprintf(path, sizeof path, "%s/%s", root, child);
+    int cn = rel[0] ? snprintf(child, sizeof child, "%s/%s", rel, de->d_name) : snprintf(child, sizeof child, "%s", de->d_name);
+    int pn = snprintf(path, sizeof path, "%s/%s", root, child);
     struct stat st;
-    if (stat(path, &st) != 0) continue;
+    if (cn < 0 || (size_t)cn >= sizeof child || pn < 0 || (size_t)pn >= sizeof path || lstat(path, &st) != 0) {
+      e2a_log("source inventory failed: %s", path); rc = -1; break;
+    }
+    if (S_ISLNK(st.st_mode)) { e2a_log("source symbolic link refused: %s", path); rc = -1; break; }
     if (S_ISDIR(st.st_mode)) {
       if (strcmp(de->d_name, ".e2a-state") == 0) continue;
       if (!rel[0] && strcasecmp(de->d_name, "fakelib2") == 0) {
@@ -223,9 +231,9 @@ static int walk(const char *root, const char *rel, e2a_list *out, bool clean) {
       if (strcasecmp(child, "ampr_emu.index") == 0 || strcasecmp(child, "ampr_assets.index") == 0) continue;
       if (strncasecmp(child, "ampr_assets.index.", 18) == 0) continue;
       if (strncasecmp(child, "ampr_assets-", 12) == 0 && ends_with_ci(child, ".pak")) continue;
-      if (ends_with_ci(name, ".e2a-tmp") || strcasecmp(name, "exfat2ampr.toml") == 0) continue;
+      if (ends_with_ci(name, ".e2a-tmp") || strstr(name, ".e2a-tmp-") || strcasecmp(name, "exfat2ampr.toml") == 0) continue;
       if (e2a_list_add(out, child, (uint64_t)st.st_size, (int64_t)st.st_mtime, false) != 0) { rc = -1; break; }
-    }
+    } else { e2a_log("unsupported source file: %s", path); rc = -1; break; }
   }
   closedir(d);
   return rc;

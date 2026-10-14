@@ -6,12 +6,15 @@
  *   exfat2ampr-host [--level N] [--workers N] [--no-verify] [--no-dedup] [--pause-after-mb N] SRC DEST_BASE [NAME]
  *   exfat2ampr-host --resume DEST
  *   exfat2ampr-host --trace-profile OUT.toml JOURNAL INDEX [JOURNAL INDEX ...]
+ *   exfat2ampr-host --repair GAME_DIR   (the engine's repair of a converted folder; exit 0 nothing to do or fixed)
  *
  * exit codes: 0 done, 1 error, 3 paused
  */
 #include "common.h"
 #include "job.h"
+#include "ampr_pack.h"
 #include "trace.h"
+#include "verify.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +48,18 @@ static int wait_job(void) {
 }
 
 int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "--verify") == 0) {
+    e2a_pack_opts o = {0};
+    e2a_verify_stats v;
+    o.workers = 4;
+    return e2a_verify(argv[2], &o, &v) == E2A_PACK_OK ? 0 : 1;
+  }
+  if (argc == 3 && strcmp(argv[1], "--repair") == 0) {
+    char report[400];
+    int rc = e2a_repair_converted(argv[2], report, sizeof report);
+    printf("repair: %d %s\n", rc, report);
+    return rc < 0 ? 1 : 0;
+  }
   if (argc >= 5 && strcmp(argv[1], "--trace-profile") == 0 && (argc - 3) % 2 == 0) {
     int pairs = (argc - 3) / 2;
     const char *j[64], *x[64];
@@ -62,6 +77,7 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--level") == 0 && i + 1 < argc) r.level = atoi(argv[++i]);
     else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) r.workers = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--remove-source") == 0) r.remove_source = true;
     else if (strcmp(argv[i], "--no-verify") == 0) r.verify = false;
     else if (strcmp(argv[i], "--no-dedup") == 0) r.dedup = false;
     else if (strcmp(argv[i], "--overwrite") == 0) r.overwrite = true;

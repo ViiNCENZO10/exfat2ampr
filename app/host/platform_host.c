@@ -214,7 +214,14 @@ uint32_t plat_buttons(int *lx, int *ly) {
   if (ly) *ly = 0;
   if (g_press) { g_press = 0; return 0; }
   if (plat_ms() < g_wait_until) return 0;
-  if (g_step >= g_nsteps) { fprintf(stderr, "[host] script finished\n"); exit(0); }
+  if (g_step >= g_nsteps) {
+    /* the recordings closed here, then _exit: exit() would tear libc down under the app's threads that are
+     * still running (covers, engine polling), and the race aborted the process now and then */
+    fprintf(stderr, "[host] script finished\n");
+    host_finish();
+    fflush(NULL);
+    _exit(0);
+  }
   const char *t = g_steps[g_step++];
   if (!strncmp(t, "wait:", 5)) { g_wait_until = plat_ms() + (uint64_t)atoi(t + 5); return 0; }
   if (!strncmp(t, "shot:", 5)) { shot(t + 5); return 0; }

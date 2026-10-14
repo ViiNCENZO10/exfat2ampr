@@ -171,7 +171,7 @@ static int read_mounts(e2a_mnt **out) {
   if (e2a_read_text(path, &doc, NULL, 1 << 20) != 0) return -1;
   int cap = 64, n = 0;
   e2a_mnt *v = calloc((size_t)cap, sizeof *v);
-  for (char *line = strtok(doc, "\n"); line && v && n < cap; line = strtok(NULL, "\n")) {
+  for (char *save = NULL, *line = strtok_r(doc, "\n", &save); line && v && n < cap; line = strtok_r(NULL, "\n", &save)) {
     if (!line[0] || line[0] == '#') continue;
     e2a_mnt *m = &v[n];
     char *f[10] = {0};

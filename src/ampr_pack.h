@@ -22,8 +22,8 @@ typedef struct {
   /* emulator runtime settings written to ampr_assets.index.runtime (0 = defaults 128/32 MiB, 4/1) */
   uint64_t rt_decoded, rt_physical;
   uint32_t rt_workers, rt_reserve;
-  volatile int *cancel;     /* abort, the caller discards the destination */
-  volatile int *pause;      /* checkpoint and return E2A_PACK_PAUSED */
+  atomic_int *cancel;     /* abort, the caller discards the destination */
+  atomic_int *pause;      /* checkpoint and return E2A_PACK_PAUSED */
   /* bytes processed so far in the current phase + the file being handled */
   void (*progress)(void *ctx, uint64_t done_bytes, const char *msg);
   void (*skip)(void *ctx, uint64_t bytes);   /* counted done without being read now (the speed ignores them) */
@@ -68,6 +68,15 @@ int e2a_write_index(const char *path, const e2a_list *l);
  * describe it (old slot hash, or replaced by the emulator) and gives the loose executables and the fakelib
  * modules an execute bit. 0 = nothing to do or not a converted folder, >0 = fixes made, -1 = error (report). */
 int e2a_repair_converted(const char *game_dir, char *report, size_t cap);
+
+/* Private integrity sidecar; the emulator does not consume it. Records follow fileId order. */
+typedef struct __attribute__((packed)) {
+  char magic[8];
+  uint8_t build_id[16];
+  uint64_t count;
+  uint32_t payload_crc, reserved;
+} e2a_loose_header;
+typedef struct __attribute__((packed)) { uint64_t path_hash; char sha[64]; } e2a_loose_record;
 
 /* Copies every E2A_LOOSE entry from src_root into out_dir (already copied files are skipped). */
 int e2a_copy_loose(const e2a_list *l, const e2a_pack_opts *o);

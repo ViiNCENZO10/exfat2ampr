@@ -3,6 +3,7 @@
  * AMPRIDX3 writer (port of drakmor/ampr_emu tools/build_ampr_index.py), and the repair of folders converted
  * before the index used ampr_emu's hash. */
 #include "ampr_pack.h"
+#include "manifest_validate.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -74,8 +75,9 @@ int e2a_write_index(const char *path, const e2a_list *l) {
         e2a_write_all(fd, blob, at) || e2a_write_all(fd, zeros, (size_t)(hash_offset - path_end)) ||
         e2a_write_all(fd, table, (size_t)slots * sizeof *table))
       rc = -1;
+    if (fsync(fd) != 0) rc = -1;
     if (close(fd) != 0) rc = -1;
-    if (rc == 0 && rename(tmp, path) != 0) rc = -1;
+    if (rc == 0 && (rename(tmp, path) != 0 || e2a_sync_parent(path) != 0)) rc = -1;
     if (rc != 0) unlink(tmp);
   }
   free(recs); free(blob); free(table);
@@ -87,41 +89,26 @@ int e2a_write_index(const char *path, const e2a_list *l) {
 /* The pack manifest's file records in fileId order, as entries (rel without "/app0/"); packed[i] = 1 for the
  * files that live in the volumes. */
 static int manifest_entries(const char *manifest, e2a_list *l, uint8_t **packed_out) {
-  int fd = open(manifest, O_RDONLY);
-  if (fd < 0) return -1;
+  char *doc = NULL;
+  size_t len = 0;
   int rc = -1;
-  ampr_file_record *files = NULL;
-  char *strings = NULL;
   uint8_t *packed = NULL;
-  struct stat st;
+  if (e2a_read_text(manifest, &doc, &len, 1u << 30) != 0 || !e2a_manifest_valid(doc, len)) goto out;
   ampr_pak_header h;
-  if (fstat(fd, &st) != 0 || e2a_pread_all(fd, &h, sizeof h, 0) != 0) goto out;
-  if (memcmp(h.magic, AMPR_MAGIC_PAK, 8) != 0 || h.file_record_size != sizeof(ampr_file_record) || h.file_count == 0 ||
-      h.file_count > (16u << 20) || h.strings_size > (256u << 20))
-    goto out;
-  uint64_t fbytes = h.file_count * sizeof(ampr_file_record);
-  if (h.files_offset + fbytes > (uint64_t)st.st_size || h.strings_offset + h.strings_size > (uint64_t)st.st_size) goto out;
-  files = malloc(fbytes);
-  strings = malloc(h.strings_size + 1);
+  memcpy(&h, doc, sizeof h);
+  if (!h.file_count || h.file_count > (16u << 20)) goto out;
+  const ampr_file_record *files = (const ampr_file_record *)(doc + h.files_offset);
+  const char *strings = doc + h.strings_offset;
   packed = calloc(h.file_count, 1);
-  if (!files || !strings || !packed) goto out;
-  if (e2a_pread_all(fd, files, fbytes, h.files_offset) != 0 || e2a_pread_all(fd, strings, h.strings_size, h.strings_offset) != 0)
-    goto out;
+  if (!packed) goto out;
   for (uint64_t i = 0; i < h.file_count; i++) {
     const ampr_file_record *fr = &files[i];
-    char path[1024];
-    if ((uint64_t)fr->path_offset + fr->path_length > h.strings_size || fr->path_length <= 6 || fr->path_length >= sizeof path)
-      goto out;
-    memcpy(path, strings + fr->path_offset, fr->path_length);
-    path[fr->path_length] = 0;
-    if (strncasecmp(path, "/app0/", 6) != 0 || e2a_list_add(l, path + 6, fr->logical_size, fr->mtime, true) != 0) goto out;
+    if (e2a_list_add(l, strings + fr->path_offset + 6, fr->logical_size, fr->mtime, true) != 0) goto out;
     packed[i] = (fr->flags & AMPR_FILE_PACKED) ? 1 : 0;
   }
   rc = 0;
 out:
-  close(fd);
-  free(files);
-  free(strings);
+  free(doc);
   if (rc == 0) *packed_out = packed;
   else free(packed);
   return rc;
@@ -189,6 +176,16 @@ int e2a_repair_converted(const char *game_dir, char *report, size_t cap) {
     e2a_list_free(&l);
     return -1;
   }
+  /* Resolve every existing loose path before changing either the index or permissions. */
+  for (size_t i = 0; i < l.n; i++) {
+    if (packed[i]) continue;
+    char p[1400];
+    int n = snprintf(p, sizeof p, "%s/%s", game_dir, l.v[i].rel);
+    if (n < 0 || (size_t)n >= sizeof p || !e2a_path_inside(game_dir, p)) {
+      snprintf(report, cap, "missing or unsafe loose path: %.150s", l.v[i].rel);
+      e2a_list_free(&l); free(packed); return -1;
+    }
+  }
   int fixes = 0, failed = 0;
   size_t at = 0;
   snprintf(index, sizeof index, "%s/ampr_emu.index", game_dir);
@@ -196,7 +193,10 @@ int e2a_repair_converted(const char *game_dir, char *report, size_t cap) {
     /* the previous one stays next to it (the emulator never opens it); the new one replaces it atomically */
     snprintf(old, sizeof old, "%s.e2a-old", index);
     struct stat st;
-    if (stat(index, &st) == 0) e2a_copy_file(index, old, (int64_t)st.st_mtime);
+    if (stat(index, &st) == 0 && e2a_copy_file(index, old, (int64_t)st.st_mtime) != 0) {
+      snprintf(report, cap, "cannot back up previous index");
+      e2a_list_free(&l); free(packed); return -1;
+    }
     if (e2a_write_index(index, &l) == 0) fixes++;
     else failed++;
     snprintf(report, cap, "%s", failed ? "cannot rewrite ampr_emu.index" : "ampr_emu.index rebuilt from the pack manifest");
@@ -223,7 +223,7 @@ int e2a_repair_converted(const char *game_dir, char *report, size_t cap) {
       if (de->d_name[0] == '.' || !e2a_is_executable_name(de->d_name)) continue;
       char p[1500];
       snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
-      int r = exec_bit(p);
+      int r = e2a_path_inside(game_dir, p) ? exec_bit(p) : -1;
       if (r > 0) modes++;
       else if (r < 0) failed++;
     }

@@ -247,6 +247,7 @@ static const char *code_text(const char *c) {
     {"already_ampr", S_W_ALREADY_AMPR},
     /* the engine's result codes (Progress tab, start refusals) */
     {"dest_unavailable", S_E_DEST_MISSING}, {"dest_exists", S_W_EXISTS}, {"dest_is_source", S_X_DEST_IS_SOURCE},
+    {"dest_not_converted", S_X_DEST_NOT_CONVERTED},
     {"nothing_to_resume", S_X_NOTHING_TO_RESUME}, {"dest_create", S_X_DEST_CREATE}, {"scan_failed", S_X_SCAN_FAILED},
     {"fakelib_failed", S_X_FAKELIB_FAILED}, {"index_failed", S_X_INDEX_FAILED}, {"pack_failed", S_X_PACK_FAILED},
     {"copy_failed", S_X_COPY_FAILED}, {"verify_failed", S_X_VERIFY_FAILED}, {"manifest_mismatch", S_X_MANIFEST},
@@ -370,7 +371,12 @@ static void draw_checks(void) {
     draw_storage_icon(d->kind, dx + 32, cy + 40, 56, RGB(225, 232, 245));
     gfx_text(&FONT_HEAD, dx + 108, cy + 38, name, C_TEXT, dw - 140);
     gfx_text(&FONT_SMALL, dx + 108, cy + 82, space, C_DIM, dw - 140);
-    cy += 140;
+    /* the folder each game goes to (named after its title ID), in full and in the theme's colour */
+    char where[400];
+    const char *tid = g_nchecks == 1 ? g_games[g_checks[0].game].title_id : "";
+    snprintf(where, sizeof where, "→ %s/%s", d->path, tid[0] ? tid : "<ID>");
+    gfx_text_wrap(&FONT_SMALL, dx + 32, cy + 120, where, C_ACCENT, dw - 64, 2);
+    cy += 176;
   }
   double typ = 0, max = 0, avail = g_ndests ? g_dests[g_opt.dest].free : 0;
   for (int i = 0; i < g_nchecks; i++)

@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <errno.h>
+#include <math.h>
 
 #if defined(__has_include)
 #if __has_include("update_config.h")
@@ -36,9 +39,16 @@ static unsigned g_rev, g_seen;
 static void set_state(upd_state s, const char *err) {
   pthread_mutex_lock(&g_mx);
   g_state = s;
-  if (err) snprintf(g_err, sizeof g_err, "%s", err);
+  snprintf(g_err, sizeof g_err, "%s", err ? err : "");
   g_rev++;
   pthread_mutex_unlock(&g_mx);
+}
+
+static bool package_url(const char *url) {
+#ifdef E2A_APP_HOST
+  if (!strncmp(url, "http://127.0.0.1:", 16)) return true; /* local CI mock only */
+#endif
+  return !strncmp(url, "https://", 8) && url[8] != 0;
 }
 
 static const char *manifest_url(char *buf, size_t cap) {
@@ -58,11 +68,15 @@ static const char *manifest_url(char *buf, size_t cap) {
 /* "1.45" -> comparable number; -1 when it is not a version ("dev") */
 static long vnum(const char *v) {
   char *e;
+  if (!v || *v < '0' || *v > '9') return -1;
+  errno = 0;
   long a = strtol(v, &e, 10);
-  if (e == v || *e != '.') return -1;
+  if (errno || e == v || *e != '.') return -1;
   const char *m = e + 1;
+  if (*m < '0' || *m > '9') return -1;
+  errno = 0;
   long b = strtol(m, &e, 10);
-  if (e == m) return -1;
+  if (errno || e == m || *e || b >= 100000 || a > (LONG_MAX - b) / 100000) return -1;
   return a * 100000 + b;
 }
 
@@ -106,18 +120,31 @@ static void *check_thread(void *arg) {
   snprintf(g_version, sizeof g_version, "%s", json_str(d.root, "version", ""));
   snprintf(g_package, sizeof g_package, "%s", json_str(d.root, "package", ""));
   snprintf(g_sha, sizeof g_sha, "%s", json_str(d.root, "sha256", ""));
-  g_size = (uint64_t)json_num(d.root, "size", 0);
+  const jnode *size_node = json_get(d.root, "size");
+  double raw_size = size_node && size_node->type == J_NUM ? size_node->num : 0;
+  g_size = isfinite(raw_size) && raw_size > 0 && raw_size <= (2ULL << 30) && floor(raw_size) == raw_size ? (uint64_t)raw_size : 0;
   g_nparts = 0;
   const jnode *parts = json_get(d.root, "parts");
   if (parts && parts->type == J_ARR)
     for (const jnode *p = parts->child; p && g_nparts < MAX_PARTS; p = p->next)
-      if (p->type == J_STR && p->str && strncmp(p->str, "https://", 8) == 0) snprintf(g_parts[g_nparts++], sizeof g_parts[0], "%s", p->str);
+      if (p->type == J_STR && p->str && package_url(p->str) && strlen(p->str) < sizeof g_parts[0]) snprintf(g_parts[g_nparts++], sizeof g_parts[0], "%s", p->str);
   long have = vnum(g_current), found = vnum(g_version);
-  bool usable = (g_package[0] || g_nparts) && strlen(g_sha) == 64 && g_size > 0;
+  bool usable = (g_package[0] || g_nparts) && strlen(g_sha) == 64 && g_size > 0 && found >= 0;
+  if (g_package[0] && !package_url(g_package)) usable = false;
+  if (strlen(json_str(d.root, "version", "")) >= sizeof g_version ||
+      strlen(json_str(d.root, "package", "")) >= sizeof g_package ||
+      strlen(json_str(d.root, "sha256", "")) != 64) usable = false;
+  for (int i = 0; usable && i < 64; i++) if (!((g_sha[i] >= '0' && g_sha[i] <= '9') || (g_sha[i] >= 'a' && g_sha[i] <= 'f'))) usable = false;
+  if (parts && (parts->type != J_ARR || parts->count != g_nparts)) usable = false;
   app_log("update: %.20s published (this app: %.20s), %d piece(s)%s", g_version, g_current, g_nparts, usable ? "" : ", manifest unusable");
   pthread_mutex_unlock(&g_mx);
   json_free(&d);
-  set_state(have >= 0 && found > have && usable ? UPD_AVAILABLE : UPD_LATEST, NULL);
+  if (!usable || have < 0) {
+    pthread_mutex_lock(&g_mx);
+    g_package[0] = 0; g_nparts = 0;
+    pthread_mutex_unlock(&g_mx);
+    set_state(UPD_UNREACHABLE, have < 0 ? "current version cannot be compared" : "invalid update manifest");
+  } else set_state(found > have ? UPD_AVAILABLE : UPD_LATEST, NULL);
   return NULL;
 }
 

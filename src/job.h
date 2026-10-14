@@ -58,7 +58,10 @@ typedef struct {
   char queue[E2A_QUEUE_MAX][96];
 } job_status;
 
-int  job_init(void);                        /* scheduler thread + runtime detection */
+int  job_init(void);
+/* Reserve a path against new conversions while maintenance or deletion uses it. */
+bool job_claim_path(const char *path, bool protect_paused);
+void job_release_path(void);                        /* scheduler thread + runtime detection */
 int  job_enqueue(const job_request *req);   /* position in queue (0 = starts now), -1 when full */
 int  job_resume(const char *dest);          /* enqueue the request saved in <dest>/.e2a-state */
 /* level 1..12: the LZ4 level for what is left (0 keeps it); -1 nothing to resume, -2 already running or queued, -3 queue full */
@@ -80,6 +83,8 @@ int  job_dismiss(void);                     /* forget the last result (done, err
  * level inside the homebrew folders, or an image ShadowMountPlus lists; refused (code set) when a
  * conversion, a running title, this app or ShadowMountPlus uses it. Runs on its own thread. */
 int  job_delete_source(const char *path, char *code, size_t cap);
+/* an image renamed <name>.off so that ShadowMountPlus leaves it alone (a duplicate, an old version) */
+int  job_set_aside(const char *path, char *code, size_t cap);
 /* the last deletion, as JSON members for /api/state ("deleting":...,"delete_seq":...) */
 void job_delete_status_json(char *out, size_t cap);
 

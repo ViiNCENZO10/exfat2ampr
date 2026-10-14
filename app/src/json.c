@@ -4,6 +4,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 typedef struct {
   const char *p, *end;
@@ -26,7 +27,8 @@ static void put_utf8(parser *P, unsigned cp) {
   int n;
   if (cp < 0x80) { b[0] = (char)cp; n = 1; }
   else if (cp < 0x800) { b[0] = (char)(0xc0 | (cp >> 6)); b[1] = (char)(0x80 | (cp & 63)); n = 2; }
-  else { b[0] = (char)(0xe0 | (cp >> 12)); b[1] = (char)(0x80 | ((cp >> 6) & 63)); b[2] = (char)(0x80 | (cp & 63)); n = 3; }
+  else if (cp < 0x10000) { b[0] = (char)(0xe0 | (cp >> 12)); b[1] = (char)(0x80 | ((cp >> 6) & 63)); b[2] = (char)(0x80 | (cp & 63)); n = 3; }
+  else { b[0] = (char)(0xf0 | (cp >> 18)); b[1] = (char)(0x80 | ((cp >> 12) & 63)); b[2] = (char)(0x80 | ((cp >> 6) & 63)); b[3] = (char)(0x80 | (cp & 63)); n = 4; }
   for (int i = 0; i < n && P->sn < P->scap; i++) P->str[P->sn++] = b[i];
 }
 
@@ -49,6 +51,7 @@ static const char *string(parser *P) {
   char *out = P->str + P->sn;
   while (P->p < P->end && *P->p != '"') {
     char c = *P->p++;
+    if ((unsigned char)c < 0x20) return NULL;
     if (c == '\\' && P->p < P->end) {
       char e = *P->p++;
       switch (e) {
@@ -62,10 +65,19 @@ static const char *string(parser *P) {
           int v = hex4(P->p);
           if (v < 0) return NULL;
           P->p += 4;
-          put_utf8(P, v >= 0xd800 && v < 0xe000 ? '?' : (unsigned)v);
+          if (v >= 0xd800 && v <= 0xdbff) {
+            if (P->end - P->p < 6 || P->p[0] != '\\' || P->p[1] != 'u') return NULL;
+            int low = hex4(P->p + 2);
+            if (low < 0xdc00 || low > 0xdfff) return NULL;
+            P->p += 6;
+            v = 0x10000 + ((v - 0xd800) << 10) + low - 0xdc00;
+          } else if (v >= 0xdc00 && v <= 0xdfff) return NULL;
+          if (v == 0) return NULL; /* C-string API cannot represent embedded NUL. */
+          put_utf8(P, (unsigned)v);
           continue;
         }
-        default: c = e; break;
+        case '"': case '\\': case '/': c = e; break;
+        default: return NULL;
       }
     }
     if (P->sn < P->scap) P->str[P->sn++] = c;
@@ -119,25 +131,41 @@ static jnode *value(parser *P) {
   if (P->end - P->p >= 4 && !strncmp(P->p, "true", 4)) { n->type = J_BOOL; n->num = 1; P->p += 4; return n; }
   if (P->end - P->p >= 5 && !strncmp(P->p, "false", 5)) { n->type = J_BOOL; P->p += 5; return n; }
   if (P->end - P->p >= 4 && !strncmp(P->p, "null", 4)) { n->type = J_NULL; P->p += 4; return n; }
-  /* number: sign, digits, fraction, exponent */
-  double v = 0, sign = 1, frac = 0.1;
-  if (*P->p == '-') { sign = -1; P->p++; }
-  bool any = false;
-  while (P->p < P->end && *P->p >= '0' && *P->p <= '9') { v = v * 10 + (*P->p++ - '0'); any = true; }
+  /* Strict JSON number, bounded work even for an enormous exponent. */
+  const char *start = P->p;
+  if (*P->p == '-') P->p++;
+  if (P->p == P->end) return NULL;
+  if (*P->p == '0') P->p++;
+  else {
+    if (*P->p < '1' || *P->p > '9') return NULL;
+    while (P->p < P->end && *P->p >= '0' && *P->p <= '9') P->p++;
+  }
   if (P->p < P->end && *P->p == '.') {
     P->p++;
-    while (P->p < P->end && *P->p >= '0' && *P->p <= '9') { v += (*P->p++ - '0') * frac; frac /= 10; any = true; }
+    const char *digits = P->p;
+    while (P->p < P->end && *P->p >= '0' && *P->p <= '9') P->p++;
+    if (digits == P->p) return NULL;
   }
   if (P->p < P->end && (*P->p == 'e' || *P->p == 'E')) {
     P->p++;
-    int es = 1, e = 0;
-    if (P->p < P->end && (*P->p == '-' || *P->p == '+')) es = *P->p++ == '-' ? -1 : 1;
-    while (P->p < P->end && *P->p >= '0' && *P->p <= '9') e = e * 10 + (*P->p++ - '0');
-    while (e-- > 0) v = es > 0 ? v * 10 : v / 10;
+    if (P->p < P->end && (*P->p == '-' || *P->p == '+')) P->p++;
+    const char *digits = P->p;
+    unsigned exponent = 0;
+    while (P->p < P->end && *P->p >= '0' && *P->p <= '9') {
+      exponent = exponent * 10 + (unsigned)(*P->p++ - '0');
+      if (exponent > 308) return NULL;
+    }
+    if (digits == P->p) return NULL;
   }
-  if (!any) return NULL;
+  size_t count = (size_t)(P->p - start);
+  char number[128];
+  if (!count || count >= sizeof number) return NULL;
+  memcpy(number, start, count); number[count] = 0;
+  char *end;
+  double v = strtod(number, &end);
+  if (*end || !isfinite(v)) return NULL;
   n->type = J_NUM;
-  n->num = v * sign;
+  n->num = v;
   return n;
 }
 
@@ -149,7 +177,8 @@ int json_parse(const char *text, size_t len, jdoc *doc) {
   if (!mem) return -1;
   parser P = {text, text + len, mem, 0, ncap, (char *)mem + ncap * sizeof(jnode), 0, scap, 0};
   jnode *root = value(&P);
-  if (!root) { free(mem); return -1; }
+  ws(&P);
+  if (!root || P.p != P.end) { free(mem); return -1; }
   doc->root = root; doc->mem = mem;
   return 0;
 }

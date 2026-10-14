@@ -38,7 +38,7 @@ static int read_file(const char *path, uint8_t **out, size_t *len) {
   int fd = open(path, O_RDONLY);
   if (fd < 0) return -1;
   struct stat st;
-  if (fstat(fd, &st) != 0 || st.st_size > (1ll << 31)) { close(fd); return -1; }
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > (1ll << 31)) { close(fd); return -1; }
   uint8_t *buf = malloc((size_t)st.st_size + 1);
   size_t got = 0;
   if (!buf || e2a_read_full(fd, buf, (size_t)st.st_size, &got) != 0 || got != (size_t)st.st_size) { free(buf); close(fd); return -1; }
@@ -60,7 +60,7 @@ typedef struct {
   const e2a_pack_opts *o;
   e2a_verify_stats *vs;
   int tid, nt;
-  volatile int *stop;
+  atomic_int *stop;
   const uint64_t *verified;   /* volumes the pack already read back (one bit each), or NULL */
   uint64_t bytes, chunks_ok, out_of_memory, gone;   /* gone: the destination stopped answering (drive removed) */
   uint64_t skipped;   /* bytes of volumes checked while packing: counted, not read again */
@@ -134,7 +134,7 @@ static void *vworker(void *arg) {
 int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs) {
   memset(vs, 0, sizeof *vs);
   char path[1100];
-  uint8_t *idx = NULL, *crcf = NULL;
+  uint8_t *idx = NULL, *crcf = NULL, *loose = NULL;
   size_t idx_len = 0, crc_len = 0;
   int rc = E2A_PACK_ERROR;
   int *pack_fd = NULL;
@@ -144,6 +144,7 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
   snprintf(path, sizeof path, "%s/ampr_assets.index", out_dir);
   if (read_file(path, &idx, &idx_len) != 0 || idx_len < sizeof(ampr_pak_header)) { fail(vs, "cannot read %s (%llu)", path, 0); goto out; }
   memcpy(&h, idx, sizeof h);
+  if (!e2a_manifest_valid(idx, idx_len)) { fail(vs, "invalid manifest %s (%llu)", path, 0); goto out; }
   {
     ampr_pak_header hc = h;
     hc.header_crc = 0;
@@ -194,6 +195,21 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
   }
   const uint32_t *crcs = (const uint32_t *)(crcf + 48);
 
+  /* Loose files have their own SHA-256 table, bound to this manifest's build id. */
+  size_t loose_len = 0;
+  snprintf(path, sizeof path, "%s/ampr_assets.index.loose", out_dir);
+  if (read_file(path, &loose, &loose_len) != 0 || loose_len < sizeof(e2a_loose_header)) {
+    fail(vs, "loose integrity table missing %s (%llu)", path, 0); goto out;
+  }
+  e2a_loose_header lh;
+  memcpy(&lh, loose, sizeof lh);
+  const e2a_loose_record *lr = (const e2a_loose_record *)(loose + sizeof lh);
+  if (memcmp(lh.magic, "E2ALOOS1", 8) || memcmp(lh.build_id, h.build_id, 16) || lh.count != h.file_count ||
+      lh.count > (loose_len - sizeof lh) / sizeof *lr || loose_len != sizeof lh + lh.count * sizeof *lr ||
+      e2a_crc32(0, lr, loose_len - sizeof lh) != lh.payload_crc) {
+    fail(vs, "loose integrity table invalid %s (%llu)", path, 0); goto out;
+  }
+
   /* volumes */
   pack_fd = malloc(sizeof(int) * (h.pack_count ? h.pack_count : 1));
   if (!pack_fd) goto out;
@@ -217,29 +233,11 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
   for (uint64_t f = 0; f < h.file_count; f++) total += files[f].logical_size;
   uint64_t done = 0, f0 = 0;
   double last_report = 0, last_pos = e2a_now();
-  /* an interrupted verification resumes at the file it reached: <state_dir>/verify.pos holds the build id
-   * and the next file index */
+  /* Recheck all files after a restart: persisted progress cannot attest that the
+   * destination stayed unchanged while the job was paused. */
   char posfile[1100] = "", bid[33];
   for (int i = 0; i < 16; i++) snprintf(bid + i * 2, 3, "%02x", h.build_id[i]);
-  if (o->state_dir) {
-    snprintf(posfile, sizeof posfile, "%s/verify.pos", o->state_dir);
-    FILE *pf = fopen(posfile, "r");
-    if (pf) {
-      char saved[40] = "";
-      unsigned long long idx = 0;
-      if (fscanf(pf, "%39s %llu", saved, &idx) == 2 && strcmp(saved, bid) == 0 && idx <= h.file_count) {
-        f0 = idx;
-        for (uint64_t f = 0; f < f0; f++) {
-          done += files[f].logical_size;
-          if (files[f].flags & AMPR_FILE_PACKED) { vs->files_packed++; vs->chunks += files[f].chunk_count; vs->bytes += files[f].logical_size; }
-          else vs->files_loose++;
-        }
-        e2a_log("verify: resuming at file %llu of %llu", (unsigned long long)f0, (unsigned long long)h.file_count);
-        if (o->skip) o->skip(o->ctx, done);   /* checked by the previous run */
-      }
-      fclose(pf);
-    }
-  }
+  if (o->state_dir) snprintf(posfile, sizeof posfile, "%s/verify.pos", o->state_dir);
 
   for (uint64_t f = f0; f < h.file_count; f++) {
     const ampr_file_record *fr = &files[f];
@@ -255,9 +253,13 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
       snprintf(path, sizeof path, "%s/%s", out_dir, rel);
       struct stat st;
       if (stat(path, &st) != 0 || (uint64_t)st.st_size != fr->logical_size) fail(vs, "loose file missing or wrong size: %s (%llu)", rel, fr->logical_size);
+      char hex[65];
+      if (lr[f].path_hash != fr->path_hash || !e2a_path_inside(out_dir, path) ||
+          e2a_sha256_file(path, hex) != 0 || memcmp(hex, lr[f].sha, 64))
+        fail(vs, "loose SHA-256 mismatch: %s (%llu)", rel, fr->logical_size);
       vs->files_loose++;
       done += fr->logical_size;
-      if (o->skip) o->skip(o->ctx, fr->logical_size);   /* only its size is checked: nothing is read */
+      if (o->progress) o->progress(o->ctx, done, rel);
       continue;
     }
     vs->files_packed++;
@@ -267,7 +269,7 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
     int nt = activity_workers(o->workers);
     if (nt > VERIFY_THREADS) nt = VERIFY_THREADS;
     if (nt < 1 || fr->chunk_count < 32) nt = 1;
-    volatile int stop = 0;
+    atomic_int stop = 0;
     vjob jobs[VERIFY_THREADS];
     pthread_t th[VERIFY_THREADS];
     for (int t = 0; t < nt; t++) {
@@ -312,7 +314,7 @@ int e2a_verify(const char *out_dir, const e2a_pack_opts *o, e2a_verify_stats *vs
 
 out:
   if (pack_fd) { for (uint32_t p = 0; p < h.pack_count; p++) if (pack_fd[p] >= 0) close(pack_fd[p]); free(pack_fd); }
-  free(idx); free(crcf);
+  free(idx); free(crcf); free(loose);
   return rc;
 }
 
@@ -324,6 +326,7 @@ int e2a_manifest_actions(const char *out_dir, e2a_list *l) {
   if (read_file(path, &idx, &idx_len) != 0 || idx_len < sizeof(ampr_pak_header)) { free(idx); return -1; }
   ampr_pak_header h;
   memcpy(&h, idx, sizeof h);
+  if (!e2a_manifest_valid(idx, idx_len)) { free(idx); return -1; }
   ampr_pak_header hc = h;   /* a resume trusts this manifest: the same checks as the verification */
   hc.header_crc = 0;
   if (memcmp(h.magic, AMPR_MAGIC_PAK, 8) != 0 || h.version != 4 || h.header_size != 128 || h.file_count != l->n ||

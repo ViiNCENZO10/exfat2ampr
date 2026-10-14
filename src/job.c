@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#ifdef __linux__
+#if defined(__linux__) || defined(__CYGWIN__)
 #include <sys/statfs.h>
 #else
 #include <sys/param.h>
@@ -39,10 +39,53 @@ extern unsigned int libSceAmpr_sprx_len;
 
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_op_mx = PTHREAD_MUTEX_INITIALIZER;
+static char g_op_path[1100];
+
+static char *resolve_future(const char *path) {
+  char *r = realpath(path, NULL);
+  if (r) return r;
+  char prefix[1100], suffix[1100] = "";
+  if (snprintf(prefix, sizeof prefix, "%s", path) >= (int)sizeof prefix) return NULL;
+  for (;;) {
+    char *slash = strrchr(prefix, '/');
+    char tail[1100];
+    if (snprintf(tail, sizeof tail, "/%s%s", slash ? slash + 1 : prefix, suffix) >= (int)sizeof tail) return NULL;
+    memcpy(suffix, tail, strlen(tail) + 1);
+    if (!slash) strcpy(prefix, ".");
+    else if (slash == prefix) slash[1] = 0;
+    else *slash = 0;
+    r = realpath(prefix, NULL);
+    if (r) {
+      size_t n = strlen(r) + strlen(suffix) + 1;
+      char *out = malloc(n);
+      if (out) snprintf(out, n, "%s%s", r, suffix);
+      free(r); return out;
+    }
+    if (!slash || !strcmp(prefix, "/")) return NULL;
+  }
+}
+
+static bool paths_overlap(const char *a, const char *b) {
+  if (!a || !*a || !b || !*b) return false;
+  char *ar = resolve_future(a), *br = resolve_future(b);
+  if (ar) a = ar;
+  if (br) b = br;
+  size_t an = strlen(a), bn = strlen(b);
+  while (an > 1 && a[an - 1] == '/') an--;
+  while (bn > 1 && b[bn - 1] == '/') bn--;
+  size_t n = an < bn ? an : bn;
+  bool same = !strncasecmp(a, b, n) && (an == bn || (an > bn ? a[n] : b[n]) == '/');
+  free(ar); free(br);
+  return same;
+}
+
+static bool active_path_busy(const char *path);
+
 static job_status g_status;
 static job_request g_queue[E2A_QUEUE_MAX];
 static int g_qlen;
-static volatile int g_cancel, g_pause;
+static atomic_int g_cancel, g_pause;
 /* source and destination of the running job, watched for drive removal */
 static char g_live_dest[600], g_live_src[600];
 static pthread_t g_sched;
@@ -218,7 +261,8 @@ static int install_runtime(const char *out_dir) {
   snprintf(dir, sizeof dir, "%s/fakelib", out_dir);
   if (e2a_mkdir_p(dir) != 0) return -1;
   snprintf(dst, sizeof dst, "%s/libSceAmpr.sprx", dir);
-  if (e2a_is_file(dst)) return 0;  /* resumed run */
+  char existing[65];
+  if (e2a_is_file(dst) && e2a_sha256_file(dst, existing) == 0 && !strcmp(existing, g_runtime_sha)) return 0;
   if (strcmp(g_runtime_source, "shadowmount") == 0 && e2a_copy_file(E2A_SPRX_SMP, dst, time(NULL)) == 0) {
     e2a_log("fakelib: copied %s", E2A_SPRX_SMP);
     return 0;
@@ -232,13 +276,13 @@ static int install_runtime(const char *out_dir) {
 static int request_save(const char *state_dir, const job_request *r) {
   job_request copy = *r;
   memcpy(copy.magic, E2A_REQ_MAGIC, 8);
-  char path[700];
+  char path[800];
   snprintf(path, sizeof path, "%s/request.bin", state_dir);
   return e2a_write_file_atomic(path, &copy, sizeof copy);
 }
 
 static int request_load(const char *state_dir, job_request *r) {
-  char path[700];
+  char path[800];
   snprintf(path, sizeof path, "%s/request.bin", state_dir);
   int fd = open(path, O_RDONLY);
   if (fd < 0) return -1;
@@ -254,13 +298,22 @@ static int request_load(const char *state_dir, job_request *r) {
     }
   }
   close(fd);
+  const size_t boolean_fields[] = {offsetof(job_request, clean_leftovers), offsetof(job_request, overwrite),
+    offsetof(job_request, remove_source), offsetof(job_request, resume), offsetof(job_request, verify),
+    offsetof(job_request, dedup), offsetof(job_request, force)};
+  for (size_t i = 0; i < sizeof boolean_fields / sizeof boolean_fields[0]; i++)
+    if (((const unsigned char *)r)[boolean_fields[i]] > 1) rc = -1;
+  if (rc == 0 && (!memchr(r->source, 0, sizeof r->source) || !r->source[0] ||
+      !memchr(r->dest_base, 0, sizeof r->dest_base) || !memchr(r->name, 0, sizeof r->name) ||
+      !memchr(r->smp_title, 0, sizeof r->smp_title) || !e2a_safe_relative(r->name) || strchr(r->name, '/') ||
+      r->level < 1 || r->level > 12 || r->workers < 1 || r->workers > 16 || r->cache_mode < 0 || r->cache_mode > 1)) rc = -1;
   return rc;
 }
 
-static void stage_set(const char *state_dir, const char *stage) {
+static int stage_set(const char *state_dir, const char *stage) {
   char path[700];
   snprintf(path, sizeof path, "%s/stage", state_dir);
-  e2a_write_file_atomic(path, stage, strlen(stage));
+  return e2a_write_file_atomic(path, stage, strlen(stage));
 }
 
 static void stage_get(const char *state_dir, char *out, size_t cap) {
@@ -279,6 +332,25 @@ static const char *pause_code(const char *why) {
   if (strstr(why, "destination storage disconnected") || strstr(why, "storage disconnected or read-only")) return "paused_dest";
   if (strstr(why, "source disconnected")) return "paused_source";
   return "paused_user";
+}
+
+/* What "replace" may erase at the destination: a game this tool converted (its pack manifest), a conversion
+ * left unfinished (its state folder), or an empty folder. Never anything else: a folder of the same name can be
+ * the original game itself, or another dump, and "replace" must not cost the only copy of a game. */
+static bool dest_replaceable(const char *dest) {
+  char p[800];
+  snprintf(p, sizeof p, "%s/ampr_assets.index", dest);
+  if (e2a_is_file(p)) return true;
+  snprintf(p, sizeof p, "%s/.e2a-state", dest);
+  if (e2a_is_dir(p)) return true;
+  DIR *d = opendir(dest);
+  if (!d) return false;
+  bool empty = true;
+  struct dirent *de;
+  while (empty && (de = readdir(d)))
+    if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..")) empty = false;
+  closedir(d);
+  return empty;
 }
 
 #define FAIL(c, m) do { err_code = (c); err = (m); goto done; } while (0)
@@ -368,6 +440,11 @@ static void run_job(job_request req) {
     if (req.resume) FAIL("source_missing", "source not available (plug the USB drive / mount the image, then resume)");
     FAIL("not_game", "not a PS5 game folder (sce_sys/param.json + eboot.bin)");
   }
+  {
+    char manifest[700];
+    snprintf(manifest, sizeof manifest, "%s/ampr_assets.index", src);
+    if (e2a_is_file(manifest)) FAIL("already_ampr", "source is already converted: copy or repair it instead");
+  }
   covers_put_from_dir(game.title_id, src);   /* the image is open now: its pictures are kept for later */
   {
     char bp[400];
@@ -414,21 +491,24 @@ static void run_job(job_request req) {
   if (req.level >= 10)   /* LZ4HC 10-12 switch to the optimal parser: measured 35 MB/s against 150-190 at level 9 */
     e2a_log("note: LZ4 level %d is several times slower to compress than 9 for about 1%% of space", req.level);
 
-  if (strncmp(src, dest, strlen(dest)) == 0 && (src[strlen(dest)] == 0 || src[strlen(dest)] == '/')) {
-    FAIL("dest_is_source", "destination is the source itself");
+  if (paths_overlap(src, dest)) {
+    FAIL("dest_is_source", "source and destination overlap");
   }
   if (req.resume) {
     if (!e2a_is_dir(state_dir)) FAIL("nothing_to_resume", "nothing to resume in the destination");
     stage_get(state_dir, stage, sizeof stage);
+    if (strcmp(stage, "pack") && strcmp(stage, "copy") && strcmp(stage, "verify")) FAIL("state_invalid", "unknown conversion stage");
   } else {
     if (e2a_is_dir(dest)) {
       if (!req.overwrite) FAIL("dest_exists", "destination already exists (tick 'replace' to overwrite)");
+      if (!dest_replaceable(dest))
+        FAIL("dest_not_converted", "a folder that is not a converted game has this name at the destination (the original?): never replaced");
       set_phase("cleanup", 0, "removing previous destination");
-      e2a_rm_rf(dest);
+      if (e2a_rm_rf(dest) != 0) FAIL("cleanup_failed", "cannot remove previous destination");
     }
     if (e2a_mkdir_p(state_dir) != 0) FAIL("dest_create", "cannot create destination (storage not mounted or read-only?)");
     created = true;
-    stage_set(state_dir, "pack");
+    if (stage_set(state_dir, "pack") != 0) FAIL("state_write", "cannot persist conversion state");
   }
   pthread_mutex_lock(&g_mx);
   snprintf(g_live_dest, sizeof g_live_dest, "%s", dest);
@@ -453,7 +533,7 @@ static void run_job(job_request req) {
       pthread_mutex_unlock(&g_mx);
     }
   }
-  if (!req.resume) request_save(state_dir, &req);  /* persisted with the effective level */
+  if (request_save(state_dir, &req) != 0) FAIL("state_write", "cannot persist conversion request");
 
   /* fakelib/libSceAmpr.sprx is part of the deployed set: make sure it is in the index with its real size/mtime */
   set_phase("fakelib", 0, "installing libSceAmpr.sprx");
@@ -571,16 +651,33 @@ static void run_job(job_request req) {
     if (entries.v[i].action != E2A_LOOSE) packed_total += entries.v[i].size; else loose_total += entries.v[i].size;
   }
 
+  /* A final manifest is the publication commit record (written after every volume).
+   * A crash before stage=copy must not recompress an already committed pack. */
+  if (req.resume && strcmp(stage, "pack") == 0) {
+    char published[700];
+    snprintf(published, sizeof published, "%s/ampr_assets.index", dest);
+    if (e2a_is_file(published)) {
+      resumable_error = true;
+      if (e2a_manifest_actions(dest, &entries) != 0) FAIL("manifest_mismatch", "published manifest invalid; source kept");
+      if (stage_set(state_dir, "copy") != 0) FAIL("state_write", "cannot persist recovered publication");
+      e2a_pack_clear_checkpoint(state_dir);
+      snprintf(stage, sizeof stage, "copy");
+    }
+  }
   if (strcmp(stage, "pack") == 0) {
     resumable_error = true;
     o.resume = req.resume && e2a_pack_has_checkpoint(state_dir);
+    char cp[800];
+    snprintf(cp, sizeof cp, "%s/state.bin", state_dir);
+    if (req.resume && e2a_is_file(cp) && !o.resume) FAIL("state_invalid", "checkpoint damaged; source kept");
     begin_phase("pack", "compressing (LZ4)", 0);
     o.ctx = (void *)"pack";
     int r = e2a_pack(&entries, &o, &st);
     if (r == E2A_PACK_PAUSED) { paused = true; goto done; }
     if (r != E2A_PACK_OK) FAIL(g_cancel ? "cancelled" : "pack_failed", g_cancel ? "cancelled" : "pack failed (see log)");
+    if (stage_set(state_dir, "copy") != 0) FAIL("state_write", "cannot persist copy stage; resume to recover");
+    e2a_test_crash("copy_committed");
     e2a_pack_clear_checkpoint(state_dir);
-    stage_set(state_dir, "copy");
     snprintf(stage, sizeof stage, "copy");
   } else {
     /* pack already finished in a previous run: recover the final per-file actions from the manifest */
@@ -593,6 +690,11 @@ static void run_job(job_request req) {
     if (entries.v[i].action != E2A_LOOSE) packed_total += entries.v[i].size; else loose_total += entries.v[i].size;
   }
 
+  if (req.resume && !strcmp(stage, "verify")) {
+    char integrity[700];
+    snprintf(integrity, sizeof integrity, "%s/ampr_assets.index.loose", dest);
+    if (!e2a_is_file(integrity)) snprintf(stage, sizeof stage, "copy");
+  }
   if (strcmp(stage, "copy") == 0) {
     resumable_error = true;
     begin_phase("copy", "copying loose files", packed_total);
@@ -600,7 +702,7 @@ static void run_job(job_request req) {
     int r = e2a_copy_loose(&entries, &o);
     if (r == E2A_PACK_PAUSED) { paused = true; goto done; }
     if (r != E2A_PACK_OK) FAIL(g_cancel ? "cancelled" : "copy_failed", g_cancel ? "cancelled" : "loose copy failed (see log)");
-    stage_set(state_dir, "verify");
+    if (stage_set(state_dir, "verify") != 0) FAIL("state_write", "cannot persist verification stage; resume to recover");
     snprintf(stage, sizeof stage, "verify");
   }
 
@@ -608,6 +710,7 @@ static void run_job(job_request req) {
     resumable_error = true;
     begin_phase("verify", "checking every block", packed_total + loose_total);
     o.ctx = (void *)"verify";
+    e2a_test_crash("verify_start");
     double vt0 = e2a_now();
     int r = e2a_verify(dest, &o, &vs);
     double vel = e2a_now() - vt0;   /* its speed, for the next forecasts (a long enough run only) */
@@ -668,6 +771,8 @@ static void run_job(job_request req) {
       if (smp_unmount(req.smp_title, e2, sizeof e2) == 0) smp_mounted = false;
       if (!smp_mounted && unlink(req.source) != 0) e2a_log("could not remove image %s", req.source);
     } else if (e2a_rm_rf(req.source) != 0) e2a_log("could not remove source %s", req.source);
+    if (!e2a_is_dir(req.source) && !e2a_is_file(req.source))
+      e2a_log("source removed as asked, after a verified conversion: %s (the game is now %s)", req.source, dest);
   }
   rc = 0;
 
@@ -745,6 +850,8 @@ static void *scheduler(void *arg) {
     g_qlen--;
     memset(&g_status, 0, sizeof g_status);
     g_status.state = JOB_RUNNING;
+    g_last_req = req;
+    snprintf(g_status.dest, sizeof g_status.dest, "%s/%s", req.dest_base, req.name);
     g_status.eta_seconds = -1;
     g_status.started = (uint64_t)time(NULL);
     snprintf(g_status.phase, sizeof g_status.phase, "starting");
@@ -764,8 +871,30 @@ int job_init(void) {
 }
 
 int job_enqueue(const job_request *req) {
+  job_request normalized = *req;
+  if (!normalized.dest_base[0]) snprintf(normalized.dest_base, sizeof normalized.dest_base, "%s", E2A_HOMEBREW_DIR);
+  if (!normalized.name[0]) {
+    e2a_game game;
+    if (normalized.smp_title[0]) snprintf(normalized.name, sizeof normalized.name, "%s", normalized.smp_title);
+    else if (e2a_read_game(normalized.source, &game) == 0) snprintf(normalized.name, sizeof normalized.name, "%s", game.title_id);
+  }
+  if (!e2a_safe_relative(normalized.name) || strchr(normalized.name, '/')) return -1;
+  req = &normalized;
+  char dest[700];
+  snprintf(dest, sizeof dest, "%s/%s", req->dest_base, req->name);
+  pthread_mutex_lock(&g_op_mx);
+  if (g_op_path[0] && (paths_overlap(g_op_path, req->source) || paths_overlap(g_op_path, dest))) {
+    pthread_mutex_unlock(&g_op_mx); return -2;
+  }
   pthread_mutex_lock(&g_mx);
-  if (g_qlen >= E2A_QUEUE_MAX) { pthread_mutex_unlock(&g_mx); return -1; }
+  bool dup = g_status.state == JOB_RUNNING && paths_overlap(g_status.dest, dest);
+  for (int i = 0; !dup && i < g_qlen; i++) {
+    char queued[700];
+    snprintf(queued, sizeof queued, "%s/%s", g_queue[i].dest_base, g_queue[i].name);
+    dup = paths_overlap(queued, dest);
+  }
+  if (dup) { pthread_mutex_unlock(&g_mx); pthread_mutex_unlock(&g_op_mx); return -2; }
+  if (g_qlen >= E2A_QUEUE_MAX) { pthread_mutex_unlock(&g_mx); pthread_mutex_unlock(&g_op_mx); return -1; }
   job_request r = *req;
   if (r.level < 1) r.level = 1;
   if (r.level > 12) r.level = 12;
@@ -776,6 +905,7 @@ int job_enqueue(const job_request *req) {
   int pos = g_qlen - 1 + (g_status.state == JOB_RUNNING ? 1 : 0);
   pthread_cond_broadcast(&g_cv);
   pthread_mutex_unlock(&g_mx);
+  pthread_mutex_unlock(&g_op_mx);
   return pos;
 }
 
@@ -784,11 +914,16 @@ int job_resume_level(const char *dest, int level) {
   snprintf(state_dir, sizeof state_dir, "%s/.e2a-state", dest);
   job_request r;
   if (request_load(state_dir, &r) != 0) return -1;
+  char expected[700];
+  snprintf(expected, sizeof expected, "%s/%s", r.dest_base, r.name);
+  char *saved_path = realpath(expected, NULL), *requested_path = realpath(dest, NULL);
+  bool same_dest = saved_path && requested_path && !strcmp(saved_path, requested_path);
+  free(saved_path); free(requested_path);
+  if (!same_dest) return -1;
   /* the level can change on a resume: every block is compressed on its own, blocks of both levels mix */
   if (level >= 1 && level <= 12 && level != r.level) {
     e2a_log("resume of %s: LZ4 level %d -> %d", dest, r.level, level);
     r.level = level;
-    request_save(state_dir, &r);
   }
   r.resume = true;
   r.overwrite = false;
@@ -815,9 +950,11 @@ int job_discard(const char *dest) {
   pthread_mutex_lock(&g_mx);
   bool busy = g_status.state == JOB_RUNNING && strcmp(g_status.dest, dest) == 0;
   pthread_mutex_unlock(&g_mx);
-  if (busy) return -1;
+  if (busy || !job_claim_path(dest, false)) return -1;
   e2a_log("discarding %s", dest);
-  return e2a_rm_rf(dest);
+  int rc = e2a_rm_rf(dest);
+  job_release_path();
+  return rc;
 }
 
 void job_cancel(void) { g_cancel = 1; }
@@ -963,6 +1100,7 @@ static void *del_thread(void *arg) {
     snprintf(report, sizeof report, "%s.exfat2ampr.json", path);
     unlink(report);
   }
+  job_release_path();
   e2a_log("delete %s: %s", path, rc == 0 ? "done" : "failed");
   pthread_mutex_lock(&g_del_mx);
   g_del_active = false;
@@ -983,28 +1121,31 @@ static bool path_in(const char *path, const char *root) {
 
 static bool is_image_name(const char *name);
 
-int job_delete_source(const char *path, char *code, size_t cap) {
+/* A copy the user wants gone or set aside: a game or app folder, or an image ShadowMountPlus knows, inside the
+ * scan roots, used by nothing (the conversion, a running title, this app, a mounted image). title/tid filled. */
+enum { SRC_TITLE_CAP = 128, SRC_TID_CAP = 16 };
+static int source_action_check(const char *path, bool *dir_out, char title[SRC_TITLE_CAP], char tid[SRC_TID_CAP], char *code, size_t cap) {
 #define REFUSE(c) do { snprintf(code, cap, "%s", (c)); return -1; } while (0)
   struct stat st;
   if (!path || !path[0] || strstr(path, "..") || strlen(path) >= sizeof g_del_path) REFUSE("not_deletable");
   if (lstat(path, &st) != 0) REFUSE("source_missing");
   if (S_ISLNK(st.st_mode)) REFUSE("not_deletable");
   bool dir = S_ISDIR(st.st_mode);
+  *dir_out = dir;
   const char *base = strrchr(path, '/');
   base = base ? base + 1 : path;
   bool placed = false;
   for (int r = 0; SCAN_ROOTS[r] && !placed; r++)   /* never inside ShadowMountPlus' mounted images */
     if (strcmp(SCAN_ROOTS[r], E2A_SMP_MOUNT_DIR) != 0) placed = path_in(path, SCAN_ROOTS[r]);
-  char title[128] = "", tid[16] = "";
   if (dir) {
     e2a_game g;
     if (e2a_read_game(path, &g) != 0) REFUSE("not_deletable");   /* only a game or app folder */
     const char *name = g.title[0] ? g.title : g.title_id;
-    size_t nl = strnlen(name, sizeof title - 1);
+    size_t nl = strnlen(name, SRC_TITLE_CAP - 1);
     memcpy(title, name, nl);
     title[nl] = 0;
-    memcpy(tid, g.title_id, sizeof tid);
-    tid[sizeof tid - 1] = 0;
+    memcpy(tid, g.title_id, SRC_TID_CAP);
+    tid[SRC_TID_CAP - 1] = 0;
   } else {
     if (!S_ISREG(st.st_mode) || !is_image_name(base)) REFUSE("not_deletable");
     /* an image ShadowMountPlus knows (manual.lst, other roots): its title, and a place to delete it from */
@@ -1013,12 +1154,12 @@ int job_delete_source(const char *path, char *code, size_t cap) {
     for (int i = 0; i < n; i++)
       if (strcmp(games[i].source_type, "image") == 0 && strcmp(games[i].path, path) == 0) {
         placed = true;
-        memcpy(title, games[i].title, sizeof title);
-        memcpy(tid, games[i].title_id, sizeof tid);
-        title[sizeof title - 1] = tid[sizeof tid - 1] = 0;
+        memcpy(title, games[i].title, SRC_TITLE_CAP);
+        memcpy(tid, games[i].title_id, SRC_TID_CAP);
+        title[SRC_TITLE_CAP - 1] = tid[SRC_TID_CAP - 1] = 0;
       }
     free(games);
-    if (!title[0]) snprintf(title, sizeof title, "%.100s", base);
+    if (!title[0]) snprintf(title, SRC_TITLE_CAP, "%.100s", base);
   }
   if (!placed) REFUSE("not_deletable");
   /* nothing in use: the conversion (running or queued), a running title, this app, a mounted image */
@@ -1032,13 +1173,23 @@ int job_delete_source(const char *path, char *code, size_t cap) {
     used = !strcmp(g_queue[i].source, path) || !strcmp(qd, path);
   }
   pthread_mutex_unlock(&g_mx);
-  if (used) REFUSE("in_use");
+  if (used || job_path_busy(path)) REFUSE("in_use");
   if (tid[0] && activity_title_running(tid)) REFUSE("game_running");
   if (!strcmp(tid, E2A_APP_TITLE_ID) && activity_app_alive()) REFUSE("app_in_use");
   char mp[600];
   if (!dir && smp_image_mount_point(path, mp, sizeof mp)) REFUSE("source_mounted");
+  return 0;
+#undef REFUSE
+}
+
+int job_delete_source(const char *path, char *code, size_t cap) {
+#define REFUSE(c) do { snprintf(code, cap, "%s", (c)); return -1; } while (0)
+  char title[128] = "", tid[16] = "";
+  bool dir = false;
+  if (source_action_check(path, &dir, title, tid, code, cap) != 0) return -1;
+  if (!job_claim_path(path, true)) REFUSE("in_use");
   pthread_mutex_lock(&g_del_mx);
-  if (g_del_active) { pthread_mutex_unlock(&g_del_mx); REFUSE("delete_busy"); }
+  if (g_del_active) { pthread_mutex_unlock(&g_del_mx); job_release_path(); REFUSE("delete_busy"); }
   g_del_active = true;
   memcpy(g_del_path, path, strlen(path) + 1);
   memcpy(g_del_title, title, sizeof g_del_title);
@@ -1053,6 +1204,25 @@ int job_delete_source(const char *path, char *code, size_t cap) {
   pthread_attr_destroy(&at);
   return 0;
 #undef REFUSE
+}
+
+/* An image set aside rather than deleted: renamed <name>.off, which ShadowMountPlus no longer mounts (two copies
+ * of one title make it remount them in turn every scan). Undone by renaming it back. Folders are not concerned:
+ * ShadowMountPlus finds a game folder whatever its name. */
+int job_set_aside(const char *path, char *code, size_t cap) {
+  char title[128] = "", tid[16] = "", to[1100];
+  bool dir = false;
+  if (source_action_check(path, &dir, title, tid, code, cap) != 0) return -1;
+  if (dir) { snprintf(code, cap, "not_deletable"); return -1; }
+  snprintf(to, sizeof to, "%s.off", path);
+  struct stat tst;
+  if (lstat(to, &tst) == 0) { snprintf(code, cap, "exists"); return -1; }
+  if (!job_claim_path(path, true)) { snprintf(code, cap, "in_use"); return -1; }
+  int moved = rename(path, to);
+  job_release_path();
+  if (moved != 0) { snprintf(code, cap, "delete_failed"); return -1; }
+  e2a_log("set aside %s (%s): renamed %s", path, title, to);
+  return 0;
 }
 
 void job_delete_status_json(char *out, size_t cap) {
@@ -1291,7 +1461,7 @@ int job_preflight(const char *path, const char *smp, const char *dest_base, char
     e2a_json_escape(g.title, title, sizeof title);
     char ai[700];
     snprintf(ai, sizeof ai, "%s/ampr_assets.index", path);
-    if (e2a_is_file(ai)) add_code(warnings, sizeof warnings, "already_ampr");
+    if (e2a_is_file(ai)) add_code(errors, sizeof errors, "already_ampr");
     smp_game sg;
     if (smp_game_info(g.title_id, &sg) == 0 && strcmp(sg.fakelib_mode, "disabled") == 0) add_code(warnings, sizeof warnings, "fakelib_disabled");
   }
@@ -1329,7 +1499,10 @@ int job_preflight(const char *path, const char *smp, const char *dest_base, char
     else if (source_bytes && d->avail < need_max) add_code(warnings, sizeof warnings, "space_low");
     char out[700];
     snprintf(out, sizeof out, "%s/%s", want, tid);
-    if (tid[0] && e2a_is_dir(out)) add_code(warnings, sizeof warnings, "already_exists");
+    if (tid[0] && e2a_is_dir(out)) {
+      if (dest_replaceable(out)) add_code(warnings, sizeof warnings, "already_exists");
+      else add_code(errors, sizeof errors, "dest_not_converted");   /* the original, another dump: never replaced */
+    }
   }
   int w = snprintf(json, cap,
                    "{\"title_id\":\"%s\",\"title\":\"%s\",\"source_bytes\":%llu,\"image_bytes\":%llu,\"estimate\":\"%s\","
@@ -1341,15 +1514,21 @@ int job_preflight(const char *path, const char *smp, const char *dest_base, char
   return w > 0 && (size_t)w < cap ? 0 : -1;
 }
 
-bool job_path_busy(const char *path) {
+static bool active_path_busy(const char *path) {
   pthread_mutex_lock(&g_mx);
-  bool busy = (g_live_src[0] && strcasecmp(g_live_src, path) == 0) || (g_live_dest[0] && strcasecmp(g_live_dest, path) == 0);
+  bool busy = paths_overlap(g_live_src, path) || paths_overlap(g_live_dest, path) ||
+              (g_status.state == JOB_RUNNING && (paths_overlap(g_last_req.source, path) || paths_overlap(g_status.dest, path)));
   for (int i = 0; !busy && i < g_qlen; i++) {
     char qd[700];
     snprintf(qd, sizeof qd, "%s/%s", g_queue[i].dest_base, g_queue[i].name);
-    busy = strcasecmp(g_queue[i].source, path) == 0 || strcasecmp(qd, path) == 0;
+    busy = paths_overlap(g_queue[i].source, path) || paths_overlap(qd, path);
   }
   pthread_mutex_unlock(&g_mx);
+  return busy;
+}
+
+bool job_path_busy(const char *path) {
+  bool busy = active_path_busy(path);
   if (busy) return true;
   /* paused conversions: their saved request names the source */
   e2a_storage stg[E2A_MAX_STORAGES];
@@ -1366,11 +1545,25 @@ bool job_path_busy(const char *path) {
       snprintf(state_dir, sizeof state_dir, "%s/.e2a-state", dest);
       job_request r;
       if (!e2a_is_dir(state_dir) || request_load(state_dir, &r) != 0) continue;
-      busy = strcasecmp(r.source, path) == 0 || strcasecmp(dest, path) == 0;
+      busy = paths_overlap(r.source, path) || paths_overlap(dest, path);
     }
     closedir(d);
   }
   return busy;
+}
+
+bool job_claim_path(const char *path, bool protect_paused) {
+  pthread_mutex_lock(&g_op_mx);
+  bool busy = g_op_path[0] || (protect_paused ? job_path_busy(path) : active_path_busy(path));
+  if (!busy) snprintf(g_op_path, sizeof g_op_path, "%s", path);
+  pthread_mutex_unlock(&g_op_mx);
+  return !busy;
+}
+
+void job_release_path(void) {
+  pthread_mutex_lock(&g_op_mx);
+  g_op_path[0] = 0;
+  pthread_mutex_unlock(&g_op_mx);
 }
 
 int job_list_resumable(char *json, size_t cap) {

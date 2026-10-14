@@ -187,9 +187,16 @@ void e2a_json_escape(const char *in, char *out, size_t cap) {
   out[o] = 0;
 }
 
-double e2a_now(void) { struct timeval tv; gettimeofday(&tv, NULL); return (double)tv.tv_sec + tv.tv_usec / 1e6; }
+double e2a_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + ts.tv_nsec / 1e9; }
 
 /* ------------------------------------------------------------------ files -- */
+#ifdef E2A_HOST
+void e2a_test_crash(const char *point) {
+  const char *want = getenv("E2A_TEST_CRASH");
+  if (want && !strcmp(want, point)) _exit(86);
+}
+#endif
+
 int e2a_is_dir(const char *path) { struct stat st; return stat(path, &st) == 0 && S_ISDIR(st.st_mode); }
 int e2a_is_file(const char *path) { struct stat st; return stat(path, &st) == 0 && S_ISREG(st.st_mode); }
 int64_t e2a_file_size(const char *path) { struct stat st; return stat(path, &st) == 0 ? (int64_t)st.st_size : -1; }
@@ -210,19 +217,65 @@ int e2a_mkdir_p(const char *path) {
   return 0;
 }
 
-int e2a_rm_rf(const char *path) {
-  DIR *d = opendir(path);
-  if (!d) return unlink(path) == 0 ? 0 : -1;
-  struct dirent *de;
-  while ((de = readdir(d)) != NULL) {
-    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-    char child[1100];
-    snprintf(child, sizeof child, "%s/%s", path, de->d_name);
-    struct stat st;
-    if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode)) e2a_rm_rf(child); else unlink(child);
+bool e2a_safe_relative(const char *path) {
+  if (!path || !*path || *path == '/' || strchr(path, '\\')) return false;
+  for (const char *p = path; *p;) {
+    const char *end = strchr(p, '/');
+    size_t n = end ? (size_t)(end - p) : strlen(p);
+    if (!n || (n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.')) return false;
+    for (size_t i = 0; i < n; i++) if ((unsigned char)p[i] < 32) return false;
+    if (!end) break;
+    p = end + 1;
+    if (!*p) return false;
   }
-  closedir(d);
-  return rmdir(path);
+  return true;
+}
+
+bool e2a_path_inside(const char *root, const char *path) {
+  char *r = realpath(root, NULL), *p = realpath(path, NULL);
+  bool ok = r && p && !strncmp(r, p, strlen(r)) && p[strlen(r)] == '/';
+  free(r); free(p);
+  return ok;
+}
+
+int e2a_sync_parent(const char *path) {
+  char dir[1100];
+  int n = snprintf(dir, sizeof dir, "%s", path);
+  if (n < 0 || (size_t)n >= sizeof dir) { errno = ENAMETOOLONG; return -1; }
+  char *slash = strrchr(dir, '/');
+  if (!slash) strcpy(dir, ".");
+  else if (slash == dir) slash[1] = 0;
+  else *slash = 0;
+  /* best effort: the file itself was fsync'ed before its rename. A folder that cannot be opened or synced
+   * (exFAT drives, the console's nullfs /data, sandboxed paths) must never turn a good write into a failure,
+   * or every settings file, checkpoint and copy would fail there; it is noted once */
+  int fd = open(dir, O_RDONLY | O_DIRECTORY);
+  int rc = fd >= 0 ? fsync(fd) : -1, saved = errno;
+  if (fd >= 0) close(fd);
+  static int noted;
+  if (rc != 0 && !__atomic_exchange_n(&noted, 1, __ATOMIC_RELAXED))
+    e2a_log("note: folders cannot be synced on this storage (%s): files are still synced one by one", strerror(saved));
+  return 0;
+}
+
+int e2a_rm_rf(const char *path) {
+  struct stat st;
+  if (lstat(path, &st) != 0) return -1;
+  if (!S_ISDIR(st.st_mode)) return unlink(path);
+  DIR *d = opendir(path);
+  if (!d) return -1;
+  int rc = 0;
+  for (;;) {
+    errno = 0;
+    struct dirent *de = readdir(d);
+    if (!de) { if (errno) rc = -1; break; }
+    if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+    char child[1100];
+    int n = snprintf(child, sizeof child, "%s/%s", path, de->d_name);
+    if (n < 0 || (size_t)n >= sizeof child || e2a_rm_rf(child) != 0) { rc = -1; break; }
+  }
+  if (closedir(d) != 0) rc = -1;
+  return rc == 0 ? rmdir(path) : -1;
 }
 
 int e2a_write_all(int fd, const void *buf, size_t len) {
@@ -230,6 +283,7 @@ int e2a_write_all(int fd, const void *buf, size_t len) {
   while (len) {
     ssize_t w = write(fd, p, len);
     if (w < 0) { if (errno == EINTR) continue; return -1; }
+    if (w == 0) { errno = EIO; return -1; }
     p += w; len -= (size_t)w;
   }
   return 0;
@@ -240,6 +294,7 @@ int e2a_pwrite_all(int fd, const void *buf, size_t len, uint64_t off) {
   while (len) {
     ssize_t w = pwrite(fd, p, len, (off_t)off);
     if (w < 0) { if (errno == EINTR) continue; return -1; }
+    if (w == 0) { errno = EIO; return -1; }
     p += w; len -= (size_t)w; off += (uint64_t)w;
   }
   return 0;
@@ -250,7 +305,7 @@ int e2a_pread_all(int fd, void *buf, size_t len, uint64_t off) {
   while (len) {
     ssize_t r = pread(fd, p, len, (off_t)off);
     if (r < 0) { if (errno == EINTR) continue; return -1; }
-    if (r == 0) return -1;
+    if (r == 0) { errno = EIO; return -1; }
     p += r; len -= (size_t)r; off += (uint64_t)r;
   }
   return 0;
@@ -306,6 +361,9 @@ int e2a_read_full(int fd, void *buf, size_t len, size_t *got) {
 int e2a_read_text(const char *path, char **out, size_t *len, size_t max) {
   int fd = open(path, O_RDONLY);
   if (fd < 0) return -1;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t)st.st_size > max) { close(fd); errno = EFBIG; return -1; }
+  max = (size_t)st.st_size;
   char *buf = malloc(max + 1);
   size_t got = 0;
   if (!buf || e2a_read_full(fd, buf, max, &got) != 0) { close(fd); free(buf); return -1; }
@@ -318,15 +376,17 @@ int e2a_read_text(const char *path, char **out, size_t *len, size_t max) {
 
 int e2a_write_file_atomic(const char *path, const void *data, size_t len) {
   char tmp[1100];
-  snprintf(tmp, sizeof tmp, "%s.e2a-tmp", path);
+  int n = snprintf(tmp, sizeof tmp, "%s.e2a-tmp-XXXXXX", path);
+  if (n < 0 || (size_t)n >= sizeof tmp) { errno = ENAMETOOLONG; return -1; }
   bool exec = e2a_is_executable_name(path);
-  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, exec ? 0755 : 0666);
+  int fd = mkstemp(tmp);
   if (fd < 0) return -1;
-  if (exec) (void)fchmod(fd, 0755);   /* whatever the umask: the console must be able to load it */
+  (void)fchmod(fd, exec ? 0755 : 0644);   /* whatever the umask: the console must be able to load it */
   int rc = e2a_write_all(fd, data, len);
   if (fsync(fd) != 0) rc = -1;
   if (close(fd) != 0) rc = -1;
   if (rc == 0 && rename(tmp, path) != 0) rc = -1;
+  if (rc == 0 && e2a_sync_parent(path) != 0) rc = -1;
   if (rc != 0) unlink(tmp);
   return rc;
 }
@@ -334,18 +394,26 @@ int e2a_write_file_atomic(const char *path, const void *data, size_t len) {
 /* Thread-safe (per-call buffer): called from the job thread and from the HTTP thread. */
 void (*e2a_copy_hook)(uint64_t bytes);
 
-int e2a_copy_file(const char *src, const char *dst, int64_t mtime) {
+int e2a_copy_file(const char *src, const char *dst, int64_t mtime) { return e2a_copy_file_sha(src, dst, mtime, NULL); }
+
+/* the copy, with the SHA-256 of the bytes it wrote when sha_hex is given: one pass instead of reading the
+ * source again to hash it */
+int e2a_copy_file_sha(const char *src, const char *dst, int64_t mtime, char sha_hex[65]) {
   const size_t BUF = 16u << 20;   /* read by four threads at once, written in one piece */
+  e2a_sha256 hc;
+  memset(&hc, 0, sizeof hc);
+  if (sha_hex) e2a_sha256_init(&hc);
   uint8_t *buf = malloc(BUF);
   if (!buf) return -1;
   int in = open(src, O_RDONLY);
   if (in < 0) { int e = errno; free(buf); errno = e; return -1; }
   char tmp[1100];
-  snprintf(tmp, sizeof tmp, "%s.e2a-tmp", dst);
+  int tn = snprintf(tmp, sizeof tmp, "%s.e2a-tmp-XXXXXX", dst);
+  if (tn < 0 || (size_t)tn >= sizeof tmp) { close(in); free(buf); errno = ENAMETOOLONG; return -1; }
   bool exec = e2a_is_executable_name(dst);
-  int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, exec ? 0755 : 0666);
+  int out = mkstemp(tmp);
   if (out < 0) { int e = errno; close(in); free(buf); errno = e; return -1; }
-  if (exec) (void)fchmod(out, 0755);   /* eboot.bin and modules copied onto UFS keep an execute bit */
+  (void)fchmod(out, exec ? 0755 : 0644);   /* eboot.bin and modules copied onto UFS keep an execute bit */
   int rc = 0, saved = 0;
   struct stat st;
   uint64_t size = fstat(in, &st) == 0 ? (uint64_t)st.st_size : 0, pos = 0;
@@ -353,6 +421,7 @@ int e2a_copy_file(const char *src, const char *dst, int64_t mtime) {
     size_t n = size - pos < BUF ? (size_t)(size - pos) : BUF;
     if (e2a_pread_parallel(in, buf, n, pos, E2A_READ_THREADS) != 0) { saved = errno; rc = -1; break; }
     if (e2a_write_all(out, buf, n) != 0) { saved = errno; rc = -1; break; }
+    if (sha_hex) e2a_sha256_update(&hc, buf, n);
     pos += n;
     if (e2a_copy_hook) e2a_copy_hook(n);
   }
@@ -362,6 +431,7 @@ int e2a_copy_file(const char *src, const char *dst, int64_t mtime) {
     if (r < 0) { if (errno == EINTR) continue; saved = errno; rc = -1; break; }
     if (r == 0) break;
     if (e2a_write_all(out, buf, (size_t)r) != 0) { saved = errno; rc = -1; break; }
+    if (sha_hex) e2a_sha256_update(&hc, buf, (size_t)r);
     if (e2a_copy_hook) e2a_copy_hook((uint64_t)r);
   }
   if (rc == 0 && fsync(out) != 0) { saved = errno; rc = -1; }   /* on the disk before it gets its final name */
@@ -370,10 +440,15 @@ int e2a_copy_file(const char *src, const char *dst, int64_t mtime) {
   if (rc == 0) {
     struct timeval tv[2] = {{(time_t)mtime, 0}, {(time_t)mtime, 0}};
     utimes(tmp, tv);
-    if (rename(tmp, dst) != 0) { saved = errno; rc = -1; }
+    if (rename(tmp, dst) != 0 || e2a_sync_parent(dst) != 0) { saved = errno; rc = -1; }
   }
   free(buf);
   if (rc != 0) { unlink(tmp); errno = saved; }
+  if (rc == 0 && sha_hex) {
+    uint8_t d[32];
+    e2a_sha256_final(&hc, d);
+    for (int i = 0; i < 32; i++) snprintf(sha_hex + i * 2, 3, "%02x", d[i]);
+  }
   return rc;
 }
 

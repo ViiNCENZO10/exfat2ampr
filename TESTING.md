@@ -93,3 +93,13 @@ dans `/data/exfat2ampr/exfat2ampr.log` (lisible par FTP).
 - Un profil de Lazy_AMPR (`toml_profiles/<jeu>.toml`) copié dans
   `USB:\homebrew\profiles\<TITLE_ID>.toml`, puis « Importer depuis USB ».
 - Destination SSD M.2 ou clé USB, pour vérifier la détection des supports.
+
+
+## Local hardening regression suite (modified version)
+
+Run `make check` on Linux with GCC, make, Python 3.9+ and the LZ4 sources (downloaded by make).
+This builds an inert host fixture, not a console payload, and never deploys anything.
+Tests cover strict JSON, existing unit/manifest/update integrity cases, changing compression worker
+counts, publication interruption at four stages, pause/resume, reconversion refusal, loose SHA-256
+corruption and damaged checkpoint/manifest rejection. Temporary fixtures and logs stay in `build/`.
+A successful host run is not a PS5/exFAT hardware or power-loss qualification.

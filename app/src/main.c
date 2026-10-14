@@ -26,15 +26,36 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ theme -- */
+/* colour themes (Settings › Theme): the accent and, for the two-tone ones, a second colour it fades into
+ * (focus, tab pill, progress bar, a light tint over the wallpaper). Appended only: the settings keep the index. */
+typedef struct {
+  int name;            /* str_id */
+  uint32_t a1, a2;     /* accent, and the colour it fades into (a1 again for a plain theme) */
+  uint32_t edge;       /* the focus frame, a lighter accent */
+  int tint;            /* alpha of the gradient laid over the wallpaper, 0 = none */
+} theme_t;
+static const theme_t THEMES[] = {
+  {S_TH_BLUE, RGB(64, 150, 255), RGB(64, 150, 255), RGB(110, 180, 255), 0},
+  {S_TH_RED_YELLOW, RGB(232, 52, 44), RGB(255, 196, 40), RGB(255, 150, 90), 34},
+  {S_TH_PURPLE_PINK, RGB(140, 92, 255), RGB(255, 84, 176), RGB(200, 150, 255), 30},
+  {S_TH_OCEAN, RGB(32, 200, 230), RGB(52, 104, 255), RGB(120, 220, 245), 28},
+  {S_TH_EMERALD, RGB(36, 196, 128), RGB(36, 196, 128), RGB(110, 225, 170), 0},
+  {S_TH_ORANGE, RGB(255, 132, 36), RGB(255, 132, 36), RGB(255, 180, 110), 0},
+};
+#define THEME_COUNT ((int)(sizeof THEMES / sizeof THEMES[0]))
+static int g_theme;
+#define TH (THEMES[g_theme])
+
 #define C_BG_BOT RGB(6, 8, 14)
 #define C_PANEL RGBA(10, 14, 26, 158)        /* dark glass over the wallpaper */
 #define C_PANEL_EDGE RGBA(255, 255, 255, 22)
 #define C_PANEL_HI RGBA(255, 255, 255, 30)
-#define C_SEL RGBA(48, 120, 255, 70)
-#define C_SEL_EDGE RGB(90, 160, 255)
+#define C_SEL WITH_ALPHA(TH.a1, 70)
+#define C_SEL_EDGE (TH.edge)
 #define C_TEXT RGB(236, 240, 248)
 #define C_DIM RGB(150, 160, 180)
-#define C_ACCENT RGB(64, 150, 255)
+#define C_ACCENT (TH.a1)
+#define C_ACCENT2 (TH.a2)
 #define C_OK RGB(80, 210, 140)
 #define C_WARN RGB(255, 190, 80)
 #define C_ERR RGB(255, 100, 100)
@@ -86,7 +107,7 @@ typedef struct {
 
 enum { TAB_GAMES, TAB_PROGRESS, TAB_RESUME, TAB_SETTINGS, TAB_COUNT };
 enum { SCR_BOOT, SCR_MAIN, SCR_OPTIONS, SCR_PAIR, SCR_DEST, SCR_CHECK, SCR_OPTIMIZE, SCR_LOG };
-enum { SET_LANG, SET_GAME_MODE, SET_SOUNDS, SET_ANIMS, SET_PAIR, SET_PLUGINS, SET_UPDATE, SET_LOG, SET_DIAG, SET_QUIT, SET_COUNT };
+enum { SET_LANG, SET_THEME, SET_GAME_MODE, SET_SOUNDS, SET_ANIMS, SET_PAIR, SET_PLUGINS, SET_UPDATE, SET_LOG, SET_DIAG, SET_QUIT, SET_COUNT };
 enum { TOAST_INFO, TOAST_OK, TOAST_ERR };
 
 static game_t g_games[MAX_GAMES];
@@ -133,10 +154,11 @@ static uint64_t g_boot_started;
 enum { ACT_NONE, ACT_CANCEL_JOB, ACT_DISCARD, ACT_START_REMOVE, ACT_PAIR_RESET, ACT_DELETE_SOURCE, ACT_UPDATE };
 static int g_confirm;
 static char g_confirm_text[300], g_confirm_detail[700];
+static char g_confirm_guard[800];   /* a deletion: the only copy, or the copy that stays */
 static char g_delete_path[600];     /* the copy the confirm dialog is about */
 
 /* OPTIONS on a game: a small menu, like on the PS5 home screen */
-enum { MENU_OPTIMIZE, MENU_PLUGINS, MENU_CONVERT_ALL, MENU_DELETE, MENU_SETTINGS, MENU_COUNT };
+enum { MENU_OPTIMIZE, MENU_PLUGINS, MENU_REPAIR, MENU_CONVERT_ALL, MENU_SET_ASIDE, MENU_DELETE, MENU_SETTINGS, MENU_COUNT };
 static bool g_menu;
 static int g_menu_sel;
 static uint64_t g_menu_at;
@@ -211,9 +233,9 @@ static const char *state_label(const char *s) {
 /* --------------------------------------------------------------- settings -- */
 static void settings_save(void) {
   char buf[700];
-  int n = snprintf(buf, sizeof buf, "lang=%d\nlevel=%d\ncache=%d\nverify=%d\ndedup=%d\nclean=%d\noverwrite=%d\nsound=%d\nanims=%d\ndest=%.300s\n",
+  int n = snprintf(buf, sizeof buf, "lang=%d\nlevel=%d\ncache=%d\nverify=%d\ndedup=%d\nclean=%d\noverwrite=%d\nsound=%d\nanims=%d\ntheme=%d\ndest=%.300s\n",
                    i18n_get(), g_opt.level, g_opt.cache, g_opt.verify, g_opt.dedup, g_opt.clean, g_opt.overwrite, snd_enabled(),
-                   g_anim_enabled, g_dest_path);
+                   g_anim_enabled, g_theme, g_dest_path);
   if (n > 0) plat_write_file(plat_settings_path(), buf, (size_t)n);
 }
 
@@ -240,6 +262,7 @@ static void settings_load(void) {
     else if (!strcmp(line, "overwrite")) g_opt.overwrite = v != 0;
     else if (!strcmp(line, "sound")) snd_set_enabled(v != 0);
     else if (!strcmp(line, "anims")) g_anim_enabled = v != 0;
+    else if (!strcmp(line, "theme") && v >= 0 && v < THEME_COUNT) g_theme = v;
   }
   free(s);
 }
@@ -268,7 +291,7 @@ static void load_games(void) {
     scopy(g->version, sizeof g->version, json_str(n, "version", ""));
     scopy(g->reason, sizeof g->reason, json_str(n, "reason", ""));
     g->image = !strcmp(json_str(n, "type", ""), "image") || json_get(n, "image") != NULL;   /* or a mounted image's folder */
-    g->selectable = json_bool(n, "selectable", true);
+    g->selectable = json_bool(n, "selectable", true) && !json_bool(n, "ampr", false);
     g->ampr = json_bool(n, "ampr", false);
     g->partial = json_bool(n, "partial", false);
     scopy(g->plugins, sizeof g->plugins, json_str(n, "plugins", ""));   /* ok, update, missing, unknown, none */
@@ -523,6 +546,60 @@ static void plugins_refresh_game(const game_t *g) {
   load_games();
 }
 
+/* What a deletion leaves: nothing (the only copy of the title), or the copy that stays, the converted one first
+ * when the original is the one going */
+static void delete_guard(const game_t *g) {
+  const game_t *other = NULL;
+  for (int i = 0; i < g_ngames; i++) {
+    const game_t *o = &g_games[i];
+    if (o == g || !g->title_id[0] || strcmp(o->title_id, g->title_id)) continue;
+    if (!other || (o->ampr && !other->ampr)) other = o;
+  }
+  if (!other) scopy(g_confirm_guard, sizeof g_confirm_guard, T(S_DEL_ONLY_COPY));
+  else snprintf(g_confirm_guard, sizeof g_confirm_guard, T(!g->ampr && other->ampr ? S_DEL_KEEPS_CONVERTED : S_DEL_OTHER_COPY), other->path);
+}
+
+/* OPTIONS › Repair: the engine's start-up repair, now, on one converted folder (its index rebuilt from the pack
+ * manifest when the emulator would reject it, the execute bit of its executables and modules) */
+static void repair_game(const game_t *g) {
+  if (g->image || !g->ampr) { toast(T(S_REPAIR_NA)); return; }
+  char form[700] = "", msg[300];
+  form_add(form, sizeof form, "path", g->path);
+  jdoc d;
+  int st = api_call("/api/repair", form, &d);
+  if (st == 200 && d.root) {
+    int n = (int)json_num(d.root, "fixes", 0);
+    if (n > 0) snprintf(msg, sizeof msg, T(S_REPAIR_DONE), n);
+    else scopy(msg, sizeof msg, T(S_REPAIR_NOTHING));
+    app_log("repair %s: %d fix(es), %s", g->path, n, json_str(d.root, "report", ""));
+    toast(msg);
+    snd_cue_frame(SND_SELECT);
+  } else {
+    snprintf(msg, sizeof msg, T(S_REPAIR_FAILED), st == 409 ? T(S_E_GAME_RUNNING) : d.root ? json_str(d.root, "report", json_str(d.root, "error", "?")) : "?");
+    toast_err(msg);
+  }
+  json_free(&d);
+}
+
+/* OPTIONS › Set aside: an image renamed <name>.off, which ShadowMountPlus no longer mounts (two copies of one title
+ * make it remount them in turn); undone by renaming it back */
+static void set_aside_game(const game_t *g) {
+  if (!g->image) { toast(T(S_ASIDE_NA)); return; }
+  char form[700] = "", msg[300];
+  form_add(form, sizeof form, "path", g->path);
+  jdoc d;
+  int st = api_call("/api/set-aside", form, &d);
+  if (st == 200) {
+    toast(T(S_ASIDE_DONE));
+    snd_cue_frame(SND_SELECT);
+  } else {
+    snprintf(msg, sizeof msg, T(S_ASIDE_FAILED), d.root ? json_str(d.root, "code", "?") : "?");
+    toast_err(msg);
+  }
+  json_free(&d);
+  load_games();
+}
+
 /* ------------------------------------------------------- covers, wallpaper -- */
 /* what identifies a game's pictures, and the engine queries for its cover and key art */
 static void game_queries(const game_t *g, char *key, size_t kcap, char *art, size_t acap, char *cov, size_t ccap) {
@@ -597,6 +674,7 @@ static int start_one(const game_t *g) {
   form_add_int(form, sizeof form, "dedup", g_opt.dedup);
   form_add_int(form, sizeof form, "cache", g_opt.cache);
   jdoc d;
+  if (g->ampr) { toast_err(T(S_ALREADY_AMPR)); return -1; }
   int st = api_call("/api/start", form, &d);
   if (st != 200) {
     char m[300];
@@ -628,7 +706,7 @@ static void start_conversions(void) {
 }
 
 static void confirm(int action, const char *text) {
-  if (action != ACT_DELETE_SOURCE) g_confirm_detail[0] = 0;
+  if (action != ACT_DELETE_SOURCE) g_confirm_detail[0] = g_confirm_guard[0] = 0;
   g_confirm = action;
   g_confirm_at = plat_ms();
   scopy(g_confirm_text, sizeof g_confirm_text, text);
@@ -674,17 +752,23 @@ static uint32_t mix_col(uint32_t a, uint32_t b, float t) {
 }
 
 /* dark glass with a thin light edge */
+/* two-tone themes: a light wash of their colours over the wallpaper, under the panels */
+static void theme_tint(void) {
+  if (TH.tint) gfx_gradient(0, 0, SCREEN_W, SCREEN_H, WITH_ALPHA(TH.a1, TH.tint), WITH_ALPHA(TH.a2, TH.tint));
+}
+
 static void panel(int x, int y, int w, int h) {
   gfx_round_rect(x, y, w, h, 28, C_PANEL);
   gfx_round_frame(x, y, w, h, 28, 1, C_PANEL_EDGE);
 }
 
-/* the highlighted row: blue glass, a glow that breathes slowly */
+/* the highlighted row: glass in the theme's colours (two-tone themes fade across it), a glow that breathes slowly */
 static void draw_focus(int x, int y, int w, int h, int r) {
   float p = anim_pulse(2400);
-  gfx_glow(x, y, w, h, r, RGBA(64, 150, 255, (int)(40 + 36 * p)), 12);
-  gfx_round_rect(x, y, w, h, r, C_SEL);
-  gfx_round_frame(x, y, w, h, r, 3, RGBA(110, 180, 255, (int)(165 + 90 * p)));
+  gfx_glow(x, y, w, h, r, WITH_ALPHA(C_ACCENT, (int)(40 + 36 * p)), 12);
+  if (C_ACCENT2 != C_ACCENT) gfx_round_gradient(x, y, w, h, r, WITH_ALPHA(C_ACCENT, 84), WITH_ALPHA(C_ACCENT2, 84));
+  else gfx_round_rect(x, y, w, h, r, C_SEL);
+  gfx_round_frame(x, y, w, h, r, 3, WITH_ALPHA(C_SEL_EDGE, (int)(165 + 90 * p)));
 }
 
 /* rows arrive one after the other when a screen or a tab opens */
@@ -862,8 +946,9 @@ static void draw_tabs(void) {
   }
   /* the blue pill slides to the new tab; the labels light up as it passes */
   float px = anim_track(&pill_x, (float)tx[g_tab], 18.0f, 0.5f), pw = anim_track(&pill_w, (float)tw[g_tab], 18.0f, 0.5f);
-  gfx_glow((int)px, y, (int)pw, 52, 26, RGBA(64, 150, 255, 64), 10);
-  gfx_round_rect((int)px, y, (int)pw, 52, 26, C_ACCENT);
+  gfx_glow((int)px, y, (int)pw, 52, 26, WITH_ALPHA(C_ACCENT, 64), 10);
+  if (C_ACCENT2 != C_ACCENT) gfx_round_gradient((int)px, y, (int)pw, 52, 26, C_ACCENT, C_ACCENT2);
+  else gfx_round_rect((int)px, y, (int)pw, 52, 26, C_ACCENT);
   for (int i = 0; i < TAB_COUNT; i++) {
     float d = (px - (float)tx[i]) / (float)tw[i];
     float lit = 1.0f - clampf(d < 0 ? -d : d, 0.0f, 1.0f);
@@ -913,7 +998,7 @@ static void draw_games(void) {
     int w = gfx_text(&FONT_SMALL, lx + 168 + fx, y + 50, sub, C_DIM, 0);
     bool playing = g->title_id[0] && !strcmp(g->title_id, g_st.game_running);
     const char *tag = playing ? T(S_RUNNING_NOW)
-                      : !g->selectable ? (!strcmp(g->reason, "smp_offline") ? T(S_SMP_OFFLINE) : T(S_NOT_MANAGED))
+                      : !g->selectable ? (g->ampr ? T(S_ALREADY_AMPR) : !strcmp(g->reason, "smp_offline") ? T(S_SMP_OFFLINE) : T(S_NOT_MANAGED))
                       : g->partial ? T(S_PARTIAL) : g->ampr ? T(S_ALREADY_AMPR) : g->dup ? T(S_DUPLICATE) : NULL;
     if (tag) gfx_text(&FONT_SMALL, lx + 168 + fx + w + 18, y + 50, tag, g->selectable && !playing ? C_WARN : C_ERR, lw - 230 - w - fx);
     gfx_pop();
@@ -1060,7 +1145,8 @@ static void draw_progress(void) {
   if (pv > 0.05f && fw < bh) fw = bh;
   if (fw > 0) {
     gfx_glow(bx, by, fw, bh, bh / 2, WITH_ALPHA(sc, 56), 12);
-    gfx_round_rect(bx, by, fw, bh, bh / 2, sc);
+    if (sc == C_ACCENT && C_ACCENT2 != C_ACCENT) gfx_round_gradient(bx, by, fw, bh, bh / 2, C_ACCENT, C_ACCENT2);
+    else gfx_round_rect(bx, by, fw, bh, bh / 2, sc);
     if (fw > 24) gfx_round_rect(bx + 8, by + 4, fw - 16, bh / 3, bh / 6, RGBA(255, 255, 255, 46));
     if (running && anim_ambient()) {
       int span = fw + 260, pos = (int)(g_now % 1700 * (uint64_t)span / 1700) - 130;
@@ -1150,12 +1236,12 @@ static void draw_resume(void) {
 static void draw_settings(void) {
   const int x = 80, y = 230, w = 1060, h = 730, pad = 24;
   panel(x, y, w, h);
-  const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_GAME_MODE), T(S_SOUNDS), T(S_ANIMS), T(S_PAIR), T(S_PLUGINS), T(S_UPDATES), T(S_LOG), T(S_DIAG), T(S_QUIT_APP)};
-  /* every row inside the panel: the rows share its height (88 px at most, 64 at least, so the last one,
+  const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_THEME), T(S_GAME_MODE), T(S_SOUNDS), T(S_ANIMS), T(S_PAIR), T(S_PLUGINS), T(S_UPDATES), T(S_LOG), T(S_DIAG), T(S_QUIT_APP)};
+  /* every row inside the panel: the rows share its height (88 px at most, 58 at least, so the last one,
    * Quit, is never pushed off the screen); past that the list scrolls and keeps the selection in view */
   int row = (h - 2 * pad) / SET_COUNT;
   if (row > 88) row = 88;
-  if (row < 64) row = 64;
+  if (row < 58) row = 58;
   const int rows = (h - 2 * pad) / row;
   static int scroll;
   if (g_set_sel < scroll) scroll = g_set_sel;
@@ -1170,7 +1256,7 @@ static void draw_settings(void) {
   for (int i = scroll; i < SET_COUNT && i < scroll + rows; i++) {
     int ry = y + pad + (i - scroll) * row;
     row_push(i - scroll);
-    gfx_text(&FONT_HEAD, x + 40, ry + head_y, labels[i], C_TEXT, i == SET_LANG ? 520 : w - 220);
+    gfx_text(&FONT_HEAD, x + 40, ry + head_y, labels[i], C_TEXT, i == SET_LANG || i == SET_THEME ? 520 : w - 220);
     if (i == SET_LANG) {   /* the language name slides in from the side it came from */
       float e = ease_out(anim_t(g_lang_at, 240));
       char v[64];
@@ -1178,6 +1264,12 @@ static void draw_settings(void) {
       gfx_push((int)((1.0f - e) * 28.0f * (float)g_lang_dir), 0, (int)(255.0f * (0.2f + 0.8f * e)));
       gfx_text_right(&FONT_HEAD, x + w - 40, ry + head_y, v, C_ACCENT);
       gfx_pop();
+    } else if (i == SET_THEME) {   /* its name between arrows, and a swatch of its colours */
+      char v[96];
+      snprintf(v, sizeof v, "‹  %s  ›", T((str_id)TH.name));
+      int tw = gfx_text_width(&FONT_HEAD, v), sw = 64, sh = 30;
+      gfx_text_right(&FONT_HEAD, x + w - 40, ry + head_y, v, C_TEXT);
+      gfx_round_gradient(x + w - 40 - tw - 24 - sw, ry + (row - sh) / 2, sw, sh, sh / 2, C_ACCENT, C_ACCENT2);
     } else if (i == SET_GAME_MODE) draw_toggle(x + w - 140, ry + tog_y, g_st.game_mode_enabled, C_ACCENT, &tog[0]);
     else if (i == SET_SOUNDS) draw_toggle(x + w - 140, ry + tog_y, snd_enabled(), C_ACCENT, &tog[1]);
     else if (i == SET_ANIMS) draw_toggle(x + w - 140, ry + tog_y, g_anim_enabled, C_ACCENT, &tog[2]);
@@ -1293,7 +1385,7 @@ static void draw_options(void) {
     row_push(i);
     if (i == OPT_START) {
       float f = anim_track(&start_v, sel ? 1.0f : 0.0f, 14.0f, 0.01f);
-      if (f > 0.01f) gfx_glow(x + 24, ry + 4, w - 48, row - 14, 24, RGBA(64, 150, 255, (int)(110.0f * f * (0.6f + 0.4f * anim_pulse(1600)))), 16);
+      if (f > 0.01f) gfx_glow(x + 24, ry + 4, w - 48, row - 14, 24, WITH_ALPHA(C_ACCENT, (int)(110.0f * f * (0.6f + 0.4f * anim_pulse(1600)))), 16);
       gfx_round_rect(x + 24, ry + 4, w - 48, row - 14, 24, mix_col(C_PANEL_HI, C_ACCENT, f));
       gfx_text_center(&FONT_HEAD, x + w / 2, ry + 4 + (row - 14) / 2 - FONT_HEAD.line / 2, T(S_START), RGB(255, 255, 255));
       gfx_pop();
@@ -1320,6 +1412,11 @@ static void draw_options(void) {
       bool on = i == OPT_VERIFY ? g_opt.verify : i == OPT_DEDUP ? g_opt.dedup : i == OPT_CLEAN ? g_opt.clean : i == OPT_OVERWRITE ? g_opt.overwrite : g_opt.remove;
       draw_toggle(x + w - 140, ry + 16, on, i == OPT_REMOVE ? C_WARN : C_ACCENT, &tog_v[i]);
     } else gfx_text_right(&FONT_BODY, x + w - 40, ry + 22, v, C_ACCENT);
+    if (i == OPT_DEST && g_ndests) {   /* where the converted games will be: the folder itself, not only the drive */
+      char where[400];
+      snprintf(where, sizeof where, "→ %s/", g_dests[g_opt.dest].path);
+      gfx_text_right(&FONT_SMALL, x + w - 40, ry + 54, where, C_DIM);
+    }
     {   /* the advice: a small green or amber word next to the value */
       str_id why;
       int r = opt_reco(i, &why);
@@ -1436,7 +1533,7 @@ static void draw_boot(void) {
   int ly = 230 + (int)((1.0f - e) * 40.0f);
   gfx_push(0, 0, (int)(255.0f * e));
   int lh = g_logo_tile ? s * g_logo.h / g_logo.w : s, lr = g_logo_tile ? s * 48 / g_logo.w : 0, lt = ly + (s - lh) / 2;
-  gfx_glow(cx - s / 2 + 24, ly + 24, s - 48, s - 48, 40, RGBA(70, 150, 255, (int)(46 + 56 * p)), 36);
+  gfx_glow(cx - s / 2 + 24, ly + 24, s - 48, s - 48, 40, WITH_ALPHA(C_ACCENT, (int)(46 + 56 * p)), 36);
   gfx_glow(cx - s / 2, lt + 10, s, lh, lr, RGBA(0, 0, 0, 120), 22);
   if (g_logo.px) gfx_image(&g_logo, cx - s / 2, lt, s, lh, lr);
   else gfx_round_rect(cx - s / 2, ly, s, s, 48, C_ACCENT);
@@ -1467,8 +1564,9 @@ static void draw_confirm(void) {
   float e = ease_out(anim_t(g_confirm_at, 220));
   bool detail = g_confirm_detail[0] != 0;   /* a deletion shows what is erased; a retry shows why it failed */
   bool del = g_confirm == ACT_DELETE_SOURCE;
-  int by = detail ? 330 : 380, bh = detail ? 420 : 300, ty = by + 50, hy = by + bh - 90;
-  uint32_t edge = g_confirm == ACT_DELETE_SOURCE ? RGBA(255, 120, 120, 190) : RGBA(110, 180, 255, 170);
+  bool guard = del && g_confirm_guard[0];
+  int by = guard ? 280 : detail ? 330 : 380, bh = guard ? 540 : detail ? 420 : 300, ty = by + 50, hy = by + bh - 90;
+  uint32_t edge = g_confirm == ACT_DELETE_SOURCE ? RGBA(255, 120, 120, 190) : WITH_ALPHA(C_SEL_EDGE, 170);
   gfx_rect(0, 0, SCREEN_W, SCREEN_H, RGBA(0, 0, 0, (int)(160.0f * e)));
   gfx_push(0, (int)((1.0f - e) * 28.0f), (int)(255.0f * e));
   gfx_glow(460, by, 1000, bh, 32, RGBA(0, 0, 0, 140), 26);
@@ -1479,7 +1577,13 @@ static void draw_confirm(void) {
     snprintf(q, sizeof q, T(S_DELETE_Q), g_confirm_text);
     gfx_text_wrap(&FONT_HEAD, 520, ty, q, C_TEXT, 880, 2);
     gfx_text_wrap(&FONT_BODY, 520, ty + 100, T(S_DELETE_NOTE), C_WARN, 880, 2);
-    gfx_text_wrap(&FONT_SMALL, 520, ty + 186, g_confirm_detail, C_DIM, 880, 3);
+    int gy = ty + 186;
+    if (guard) {   /* the only copy in red; the copy that stays, calmly */
+      bool only = !strcmp(g_confirm_guard, T(S_DEL_ONLY_COPY));
+      gfx_text_wrap(&FONT_SMALL, 520, gy, g_confirm_guard, only ? C_ERR : C_OK, 880, 2);
+      gy += 2 * FONT_SMALL.line + 16;
+    }
+    gfx_text_wrap(&FONT_SMALL, 520, gy, g_confirm_detail, C_DIM, 880, guard ? 2 : 3);
   } else if (detail) {
     gfx_text_wrap(&FONT_HEAD, 520, ty, g_confirm_text, C_TEXT, 880, 2);
     gfx_text_wrap(&FONT_SMALL, 520, ty + 120, g_confirm_detail, C_WARN, 880, 4);
@@ -1505,7 +1609,7 @@ static str_id plugins_label(const game_t *g) {
 
 /* the menu OPTIONS opens on a game: rises from the bottom right corner */
 static void draw_game_menu(void) {
-  static const str_id items[MENU_COUNT] = {S_OPTIMIZE, S_PLUG_OK, S_CONVERT_ALL, S_DELETE_COPY, S_SETTINGS};
+  static const str_id items[MENU_COUNT] = {S_OPTIMIZE, S_PLUG_OK, S_REPAIR, S_CONVERT_ALL, S_SET_ASIDE, S_DELETE_COPY, S_SETTINGS};
   static anim_val sel_v;
   float e = ease_out(anim_t(g_menu_at, 200));
   const int w = 560, row = 76, h = row * MENU_COUNT + 92, x = 1840 - w, y = 980 - h;
@@ -1521,6 +1625,7 @@ static void draw_game_menu(void) {
     str_id id = i == MENU_PLUGINS ? plugins_label(g) : items[i];
     uint32_t c = i == MENU_DELETE ? RGB(255, 170, 170) : C_TEXT;
     if (i == MENU_PLUGINS && (id == S_PLUG_SMP || id == S_PLUG_NONE || id == S_PLUG_OK)) c = C_DIM;   /* nothing to do */
+    if ((i == MENU_REPAIR && (g->image || !g->ampr)) || (i == MENU_SET_ASIDE && !g->image)) c = C_DIM;   /* not for this one */
     gfx_text(&FONT_HEAD, x + 40, y + 66 + i * row + (row - 10) / 2 - FONT_HEAD.line / 2, T(id), c, w - 80);
   }
   gfx_pop();
@@ -1559,6 +1664,7 @@ static void draw(void) {
     g_nav_dir = 1;
   }
   assets_draw_wallpaper();
+  theme_tint();
   float e = ease_out(anim_t(g_tr_start, 320));
   int dx = (int)((1.0f - e) * 70.0f * (float)g_tr_dir), op = (int)(255.0f * e);
   if (g_screen == SCR_BOOT) draw_boot();
@@ -1858,6 +1964,7 @@ static void handle_input(uint32_t p) {
           g_nchecks = 0;
           g_screen = SCR_CHECK;
           assets_draw_wallpaper();
+          theme_tint();
           gfx_text_center(&FONT_HEAD, SCREEN_W / 2, SCREEN_H / 2 - 20, T(S_CHECKING), C_ACCENT);
           gfx_present();
           load_dests(true);
@@ -1877,11 +1984,14 @@ static void handle_input(uint32_t p) {
       if (g_menu_sel == MENU_CONVERT_ALL) { convert_all(); return; }
       if (g_menu_sel == MENU_OPTIMIZE) { open_optimize(&g_games[g_sel]); return; }
       if (g_menu_sel == MENU_PLUGINS) { plugins_refresh_game(&g_games[g_sel]); return; }
+      if (g_menu_sel == MENU_REPAIR) { repair_game(&g_games[g_sel]); return; }
+      if (g_menu_sel == MENU_SET_ASIDE) { set_aside_game(&g_games[g_sel]); return; }
       const game_t *g = &g_games[g_sel];
       scopy(g_delete_path, sizeof g_delete_path, g->path);
       char size[32] = "";
       if (g->size > 0) fmt_bytes(size, sizeof size, (double)g->size);
       snprintf(g_confirm_detail, sizeof g_confirm_detail, "%s%s%s", g->path, size[0] ? "  ·  " : "", size);
+      delete_guard(g);
       confirm(ACT_DELETE_SOURCE, g->title[0] ? g->title : g->path);
       snd_cue_frame(SND_SELECT);
     }
@@ -1918,7 +2028,7 @@ static void handle_input(uint32_t p) {
         } else snd_cue_frame(SND_ERROR);
       }
       if (p & BTN_CROSS) {
-        if (!marked_count() && !g_games[g_sel].selectable) { toast_err(T(S_NOT_MANAGED)); break; }
+        if (!marked_count() && !g_games[g_sel].selectable) { toast_err(T(g_games[g_sel].ampr ? S_ALREADY_AMPR : S_NOT_MANAGED)); break; }
         load_dests(false);
         g_opt.remove = false;   /* never carried over from a previous conversion */
         g_opt_sel = OPT_START;
@@ -2000,6 +2110,12 @@ static void handle_input(uint32_t p) {
         i18n_set((i18n_get() + dir + LANG_COUNT) % LANG_COUNT);
         g_lang_at = plat_ms();
         g_lang_dir = dir;
+        settings_save();
+        snd_cue_frame(SND_MOVE);
+      }
+      if (g_set_sel == SET_THEME && (p & (BTN_LEFT | BTN_RIGHT | BTN_CROSS))) {   /* the whole app takes it at once */
+        int dir = (p & BTN_LEFT) ? -1 : 1;
+        g_theme = (g_theme + dir + THEME_COUNT) % THEME_COUNT;
         settings_save();
         snd_cue_frame(SND_MOVE);
       }

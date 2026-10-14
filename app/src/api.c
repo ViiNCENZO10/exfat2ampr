@@ -84,7 +84,7 @@ int api_post_bytes(const char *path, const void *data, size_t len, jdoc *doc) {
   doc->root = NULL; doc->mem = NULL;
   int st = http_body("POST", path, data, len, "application/octet-stream", &body, &blen);
   if (st < 0) return st;
-  if (json_parse((const char *)body, blen, doc) != 0) { doc->root = NULL; doc->mem = NULL; }
+  if (json_parse((const char *)body, blen, doc) != 0) { doc->root = NULL; doc->mem = NULL; st = -1; }
   free(body);
   return st;
 }
@@ -95,7 +95,7 @@ int api_call(const char *path, const char *form, jdoc *doc) {
   doc->root = NULL; doc->mem = NULL;
   int st = http(form ? "POST" : "GET", path, form ? form : NULL, &body, &len);
   if (st < 0) return st;
-  if (json_parse((const char *)body, len, doc) != 0) { doc->root = NULL; doc->mem = NULL; }
+  if (json_parse((const char *)body, len, doc) != 0) { doc->root = NULL; doc->mem = NULL; st = -1; }
   free(body);
   return st;
 }

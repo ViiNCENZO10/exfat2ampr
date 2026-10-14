@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #ifndef E2A_VERSION
 #define E2A_VERSION "dev"
@@ -53,8 +54,17 @@ static inline uint64_t e2a_align_up(uint64_t v, uint64_t a) { return (v + a - 1)
 void e2a_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void e2a_notify(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int  e2a_mkdir_p(const char *path);
+int  e2a_sync_parent(const char *path);
+#ifdef E2A_HOST
+void e2a_test_crash(const char *point);
+#else
+static inline void e2a_test_crash(const char *point) { (void)point; }
+#endif
+bool e2a_safe_relative(const char *path);
+bool e2a_path_inside(const char *root, const char *path);
 int  e2a_rm_rf(const char *path);
 int  e2a_copy_file(const char *src, const char *dst, int64_t mtime);
+int  e2a_copy_file_sha(const char *src, const char *dst, int64_t mtime, char sha_hex[65]);   /* sha of what was written */
 extern void (*e2a_copy_hook)(uint64_t bytes);   /* called per copied buffer (game mode pacing) */
 int  e2a_write_all(int fd, const void *buf, size_t len);
 int  e2a_pwrite_all(int fd, const void *buf, size_t len, uint64_t off);

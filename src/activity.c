@@ -73,7 +73,7 @@ static int scan_titles(char out[][16], int max) {
   int n = 0;
   char buf[256];
   snprintf(buf, sizeof buf, "%s", env ? env : "");
-  for (char *t = strtok(buf, ","); t; t = strtok(NULL, ",")) n = add_title(out, n, max, t);
+  for (char *save = NULL, *t = strtok_r(buf, ",", &save); t; t = strtok_r(NULL, ",", &save)) n = add_title(out, n, max, t);
   return n;
 }
 #else

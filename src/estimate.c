@@ -40,7 +40,7 @@ static int hist_load(hist_row *rows, int max) {
   char *txt = NULL;
   if (e2a_read_text(SIZES_FILE, &txt, NULL, 256 * 1024) != 0 || !txt) return 0;
   int n = 0;
-  for (char *line = strtok(txt, "\n"); line && n < max; line = strtok(NULL, "\n")) {
+  for (char *save = NULL, *line = strtok_r(txt, "\n", &save); line && n < max; line = strtok_r(NULL, "\n", &save)) {
     hist_row r;
     unsigned long long c, i, f;
     if (sscanf(line, "%15s %llu %llu %llu", r.tid, &c, &i, &f) == 4) { r.content = c; r.image = i; r.final = f; rows[n++] = r; }
@@ -92,9 +92,9 @@ static double average_ratio(void) {
   static hist_row rows[512];
   pthread_mutex_lock(&g_mx);
   int n = hist_load(rows, 512);
-  pthread_mutex_unlock(&g_mx);
   double c = 0, f = 0;
   for (int i = 0; i < n; i++) if (rows[i].final && rows[i].content) { c += (double)rows[i].content; f += (double)rows[i].final; }
+  pthread_mutex_unlock(&g_mx);
   double r = c > 0 ? f / c : 0.6;
   return r < 0.2 ? 0.2 : r > 1.05 ? 1.05 : r;
 }

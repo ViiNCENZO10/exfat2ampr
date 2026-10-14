@@ -120,7 +120,7 @@ static void api_state(int fd, const char *args) {
     qp += (size_t)w;
   }
   queue[qp++] = ']'; queue[qp] = 0;
-  const size_t cap = sizeof log + 8192;
+  const size_t cap = sizeof log + sizeof queue + sizeof msg + sizeof title + sizeof dest + sizeof prof + sizeof runtime + sizeof del + 4096;
   char *json = malloc(cap);
   if (!json) { send_json(fd, 500, "{}"); return; }
   snprintf(json, cap,
@@ -198,7 +198,7 @@ static void api_start(int fd, const char *body, bool queue_only) {
   if (strchr(r.name, '/') || strstr(r.name, "..")) { send_json(fd, 400, "{\"error\":\"bad name\",\"code\":\"bad_name\"}"); return; }
   (void)queue_only;
   int pos = job_enqueue(&r);
-  if (pos < 0) { send_json(fd, 409, "{\"error\":\"queue full\",\"code\":\"queue_full\"}"); return; }
+  if (pos < 0) { send_json(fd, 409, pos == -2 ? "{\"error\":\"path in use\",\"code\":\"in_use\"}" : "{\"error\":\"queue full or invalid request\",\"code\":\"queue_full\"}"); return; }
   char out[64];
   snprintf(out, sizeof out, "{\"ok\":true,\"position\":%d}", pos);
   send_json(fd, 200, out);
@@ -391,8 +391,9 @@ static void api_plugins_refresh(int fd, const char *body) {
   if (!plugins_path_allowed(path)) { send_json(fd, 400, "{\"error\":\"bad game folder\"}"); return; }
   e2a_game g;
   if (e2a_read_game(path, &g) == 0 && activity_title_running(g.title_id)) { send_json(fd, 409, "{\"error\":\"game_running\"}"); return; }
-  if (job_path_busy(path)) { send_json(fd, 409, "{\"error\":\"a conversion uses this game\"}"); return; }
+  if (!job_claim_path(path, true)) { send_json(fd, 409, "{\"error\":\"a conversion uses this game\"}"); return; }
   int n = plugins_apply(path, rep, sizeof rep);
+  job_release_path();
   e2a_json_escape(rep, er, sizeof er);
   snprintf(out, sizeof out, "{\"ok\":%s,\"written\":%d,\"report\":\"%s\"}", n >= 0 ? "true" : "false", n < 0 ? 0 : n, er);
   send_json(fd, n >= 0 ? 200 : 500, out);
@@ -649,6 +650,28 @@ static void handle(int fd) {
     else {
       snprintf(out, sizeof out, "{\"error\":\"refused\",\"code\":\"%s\"}", code);
       send_json(fd, 409, out);
+    }
+  } else if (strcmp(path, "/api/set-aside") == 0 && post) {   /* <image>.off: ShadowMountPlus leaves it alone */
+    char p[600], code[32] = "", out[96];
+    form_get(args, "path", p, sizeof p);
+    if (job_set_aside(p, code, sizeof code) == 0) send_json(fd, 200, "{\"ok\":true}");
+    else {
+      snprintf(out, sizeof out, "{\"error\":\"refused\",\"code\":\"%s\"}", code);
+      send_json(fd, 409, out);
+    }
+  } else if (strcmp(path, "/api/repair") == 0 && post) {   /* the start-up repair, now, on one converted folder */
+    char p[600], report[400], er[500], out[700];
+    form_get(args, "path", p, sizeof p);
+    e2a_game g;
+    if (!plugins_path_allowed(p) || e2a_read_game(p, &g) != 0) send_json(fd, 400, "{\"error\":\"bad game folder\"}");
+    else if (activity_title_running(g.title_id) || !job_claim_path(p, true)) send_json(fd, 409, "{\"error\":\"in use\",\"code\":\"in_use\"}");
+    else {
+      int rc = e2a_repair_converted(p, report, sizeof report);
+      job_release_path();
+      if (rc != 0) e2a_log("repair of %s: %s", p, report);
+      e2a_json_escape(report, er, sizeof er);
+      snprintf(out, sizeof out, "{\"ok\":%s,\"fixes\":%d,\"report\":\"%s\"}", rc < 0 ? "false" : "true", rc < 0 ? 0 : rc, er);
+      send_json(fd, rc < 0 ? 500 : 200, out);
     }
   } else if (strcmp(path, "/api/dismiss") == 0 && post) {
     if (job_dismiss() == 0) send_json(fd, 200, "{\"ok\":true}");

@@ -291,8 +291,8 @@ async function loadSources(){
     const prev = selectedSource();
     SOURCES = list;
     if (!list.length) { el.textContent = t('src_none'); updatePreview(); return; }
-    let firstSel = prev ? list.findIndex(s => s.path === prev.path && s.selectable !== false) : -1;
-    if (firstSel < 0) firstSel = list.findIndex(s => s.selectable !== false);
+    let firstSel = prev ? list.findIndex(s => s.path === prev.path && s.selectable !== false && !s.ampr) : -1;
+    if (firstSel < 0) firstSel = list.findIndex(s => s.selectable !== false && !s.ampr);
     const copies = {};
     list.forEach(s => { if (s.title_id) copies[s.title_id] = (copies[s.title_id] || 0) + 1; });
     const dup = s => (loc(s.path) ? '<span class="tag">' + esc(loc(s.path)) + '</span>' : '') +
@@ -302,7 +302,7 @@ async function loadSources(){
       <label class="src${s.selectable ? '' : ' dest ro'}"><input type="radio" name="src" value="${i}" ${i===firstSel?'checked':''} ${s.selectable?'':'disabled'}>
         <div class="t"><b><bdi>${esc(s.title || s.path.split('/').pop())}</bdi></b><small><bdi>${esc(s.path)}</bdi> · ${esc(s.title_id||'?')} · ${fmt(s.size)} · ${t('image')} ${esc(s.image_type||'')}${s.selectable ? '' : ' · ' + t(s.reason || 'not_managed')}</small></div>
         ${dup(s)}${s.mounted ? '<span class="tag done">'+t('mounted')+'</span>' : s.selectable ? '<span class="tag">'+t('auto_mount_short')+'</span>' : ''}${del(i)}</label>` : `
-      <label class="src"><input type="radio" name="src" value="${i}" ${i===firstSel?'checked':''}>
+      <label class="src"><input type="radio" name="src" value="${i}" ${i===firstSel?'checked':''} ${s.ampr?'disabled':''}>
         <div class="t"><b><bdi>${esc(s.title||s.title_id)}</bdi></b><small><bdi>${esc(s.path)}</bdi> · ${esc(s.title_id)} · v${esc(s.version)}</small></div>
         ${dup(s)}${s.partial?'<span class="tag warn">'+t('partial')+'</span>': s.ampr?'<span class="tag done">'+t('already')+'</span>':'<span class="tag">'+t('raw')+'</span>'}${del(i)}</label>`).join('');
     updatePreview();

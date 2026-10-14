@@ -170,3 +170,23 @@ test: $(ELF)
 	$(PS5_PAYLOAD_SDK)/bin/prospero-deploy -h $(PS5_HOST) -p $(PS5_PORT) $(ELF)
 
 .PHONY: all host clean distclean deps test version
+
+# Local regressions: no console deployment. The inert host uses no console modules.
+reliability-host: $(HOST_SRCS:src/%.c=build/host/%.o) $(LZ4_SRCS:$(LZ4_DIR)/%.c=build/host/lz4_%.o) tests/host_assets.c
+	$(HOSTCC) $(HOST_CFLAGS) -o $@ $^ -lm
+
+check: reliability-host
+	@mkdir -p build/check/update
+	$(HOSTCC) $(HOST_CFLAGS) src/util.c src/sha256.c src/scan.c src/storage.c src/bench.c tests/unit_test.c -lm -o build/check/unit_test
+	./build/check/unit_test
+	$(HOSTCC) $(HOST_CFLAGS) tests/manifest_test.c -o build/check/manifest_test
+	./build/check/manifest_test
+	$(HOSTCC) $(HOST_CFLAGS) -Iapp/src app/src/json.c tests/json_test.c -lm -o build/check/json_test
+	./build/check/json_test
+	$(HOSTCC) $(HOST_CFLAGS) src/util.c src/sha256.c src/selfupdate.c tests/update_test.c -lm -o build/check/update_test
+	cd build/check/update && ../update_test
+	$(HOSTCC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections tests/worker_test.c src/util.c src/sha256.c $(LZ4_SRCS) -lm -o build/check/worker_test
+	./build/check/worker_test
+	python3 tests/reliability_test.py ./reliability-host
+
+.PHONY: check

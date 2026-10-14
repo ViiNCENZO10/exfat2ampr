@@ -50,7 +50,7 @@ void pair_init(void) {
   pthread_mutex_unlock(&g_mx);
 }
 
-const char *pair_pin(void) { return g_pin; }
+const char *pair_pin(void) { static _Thread_local char pin[12]; pthread_mutex_lock(&g_mx); memcpy(pin, g_pin, sizeof pin); pthread_mutex_unlock(&g_mx); return pin; }
 
 static bool same(const char *a, const char *b, size_t n) {   /* constant time */
   unsigned char d = 0;
@@ -87,7 +87,7 @@ int pair_register(const char *pin, char token[65]) {
     rc = 0;
   }
   pthread_mutex_unlock(&g_mx);
-  if (rc == 0) e2a_log("pairing: new device paired (%d in total)", g_ntok);
+  if (rc == 0) e2a_log("pairing: new device paired (%d in total)", pair_devices());
   else e2a_log("pairing: wrong code%s", rc == -2 ? " (blocked for a minute)" : "");
   return rc;
 }
@@ -101,7 +101,7 @@ void pair_reset(void) {
   e2a_log("pairing: every device forgotten, new code");
 }
 
-int pair_devices(void) { return g_ntok; }
+int pair_devices(void) { pthread_mutex_lock(&g_mx); int n = g_ntok; pthread_mutex_unlock(&g_mx); return n; }
 
 /* LAN address of the console: connect a UDP socket (no packet is sent) and read its local name */
 void pair_local_ip(char *out, size_t cap) {

@@ -37,6 +37,8 @@ jobs:
           gcc -std=gnu11 -D_GNU_SOURCE -DE2A_HOST -O1 -Wall -Wextra -Werror -Isrc \
             src/util.c src/sha256.c src/scan.c src/storage.c src/bench.c tests/unit_test.c -lpthread -lm -o unit_test
           ./unit_test
+      - name: Reliability regressions (inert assets, no console)
+        run: make check
       - name: Generate a synthetic game
         run: python3 tests/make_game.py testgame
       - name: Manifest bounds regression tests (ASan/UBSan)
@@ -97,6 +99,52 @@ jobs:
           assert (dec, phys, workers, reserve) == (96 << 20, 16 << 20, 3, 1), "runtime record does not follow the profile"
           PY
           cat homebrew/PPSA00001.exfat2ampr.json
+      # what the emulator does at start: an index whose lookups miss is rebuilt from the folder and every packed
+      # fileId then points at the wrong file (the 1.85 bug); a module without an execute bit is refused on UFS
+      - name: AMPR index, fileIds and execute bits as the emulator reads them
+        run: |
+          python3 tests/check_ampr_index.py homebrew/PPSA00001 ampr_emu/tools
+          python3 tests/check_ampr_index.py homebrew/PPSA00002 ampr_emu/tools
+      - name: Repair of folders converted by earlier versions
+        run: |
+          # an index written with the standard FNV basis (exFAT2AMPR 1.85 and before), executables without +x
+          rm -rf repaired && cp -a homebrew/PPSA00001 repaired
+          python3 - repaired/ampr_emu.index ampr_emu/tools <<'PY'
+          import struct, sys
+          sys.path.insert(0, sys.argv[2])
+          import build_ampr_index as ref
+          def standard(path):
+              h = 0xCBF29CE484222325
+              for c in ref.key_for(path):
+                  h = ((h ^ c) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+              return h or 1
+          ref.fnv1a64_path_hash = standard
+          b = bytearray(open(sys.argv[1], "rb").read())
+          n, pb, hoff = struct.unpack_from("<QQQ", b, 16)
+          blob = 48 + n * 24
+          rows = []
+          for i in range(n):
+              at, pl, size, mt = struct.unpack_from("<IIQq", b, 48 + i * 24)
+              rows.append((size, mt, b[blob + at: blob + at + pl].decode()))
+          slots = ref.build_hash_slots(rows)
+          slots = slots[0] if isinstance(slots, tuple) else slots
+          for k, s in enumerate(slots):
+              struct.pack_into("<QII", b, hoff + k * 16, *s)
+          open(sys.argv[1], "wb").write(b)
+          PY
+          chmod a-x repaired/eboot.bin repaired/fakelib/*.sprx
+          if python3 tests/check_ampr_index.py repaired ampr_emu/tools; then echo "the broken copy should fail"; exit 1; fi
+          ./exfat2ampr-host --repair repaired
+          python3 tests/check_ampr_index.py repaired ampr_emu/tools
+          test -f repaired/ampr_emu.index.e2a-old
+          ./exfat2ampr-host --repair repaired | tee repair2.txt
+          grep -q '^repair: 0 ' repair2.txt   # a second pass finds nothing to do
+          # an index the emulator rebuilt from the folder (different files): repaired the same way
+          rm -rf repaired2 && cp -a homebrew/PPSA00001 repaired2
+          python3 ampr_emu/tools/build_ampr_index.py repaired2 --output repaired2/ampr_emu.index
+          if python3 tests/check_ampr_index.py repaired2 ampr_emu/tools; then echo "the rebuilt index should fail"; exit 1; fi
+          ./exfat2ampr-host --repair repaired2
+          python3 tests/check_ampr_index.py repaired2 ampr_emu/tools
       - name: Trace profile (synthetic AMPRCMD1 journal, cross-checked with ampr_pack_profile.py)
         run: |
           IDX=homebrew/PPSA00001/ampr_emu.index
@@ -166,6 +214,17 @@ jobs:
           test "$rc" = "1" || (echo "expected refusal (1), got $rc"; exit 1)
           ./exfat2ampr-host --workers 4 --level 3 --overwrite --no-dedup testgame homebrew PPSA00001
           python3 ampr_emu/tools/ampr_pack.py verify --index homebrew/PPSA00001/ampr_assets.index --root testgame
+      - name: Replace never erases a folder that is not a converted game (the original, another dump)
+        run: |
+          mkdir -p homebrew3
+          cp -r testgame homebrew3/PPSA00001
+          set +e
+          ./exfat2ampr-host --workers 4 --level 3 --overwrite testgame homebrew3 PPSA00001
+          rc=$?
+          set -e
+          test "$rc" = "1" || (echo "expected refusal (1), got $rc"; exit 1)
+          diff -r testgame homebrew3/PPSA00001
+          test ! -e homebrew3/PPSA00001/ampr_assets.index
 
   # 2. PS5 payload
   build:
@@ -276,7 +335,7 @@ jobs:
                 cross wait:600 shot:04_options down cross wait:800 shot:05_destinations options wait:500 shot:06_destination_info
                 options down cross wait:700 shot:07_options_usb0 up cross wait:1500 shot:08_check cross wait:1000 shot:09_progress
                 triangle wait:700 shot:10_paused r1 wait:700 shot:11_interrupted r1 wait:700 shot:12_settings
-                down down down down cross wait:900 shot:13_pair circle"
+                down cross wait:900 shot:12b_theme_red_yellow down down down down cross wait:900 shot:13_pair circle"
           run fr 2 18001 "$MAIN" MOCK_STORAGE=several
           # the app's own log reached the engine: its start, the engine's answer, the screens visited
           grep "\[applog\]" mock_fr.log | head -20
@@ -298,7 +357,7 @@ jobs:
           run motion 2 18010 "wait:600 shot:00_splash wait:2600 shot:01_wallpaper_key_art down wait:1800 shot:02_wallpaper_cover
                               down down wait:1800 shot:03_wallpaper_key_art_2 !down wait:60 shot:04_focus_gliding wait:400
                               !r1 wait:100 shot:05_tab_sliding wait:700 r1 r1 wait:800 shot:06_settings
-                              down down !cross wait:60 shot:07_toggle_moving wait:500 l1 l1 l1 wait:900 !cross wait:120 shot:08_screen_sliding
+                              down down down !cross wait:60 shot:07_toggle_moving wait:500 l1 l1 l1 wait:900 !cross wait:120 shot:08_screen_sliding
                               wait:800 shot:09_options circle wait:500 down wait:400 !cross wait:120 shot:10_toast_rising" MOCK_STORAGE=several
           run done 2 18011 "wait:3000 shot:01_running wait:4500 shot:02_finished_check_mark" MOCK_RUNNING=1 MOCK_RATE=25 MOCK_FINISH_AFTER=6
           # an image while the app is open: ShadowMountPlus refuses to mount it, the conversion waits (explained, never an error)
@@ -309,7 +368,7 @@ jobs:
           run failed_clear 2 18014 "wait:3000 r1 wait:1000 square wait:1200 shot:01_cleared" MOCK_START_ERROR=verify_failed
           run failed_en 1 18015 "wait:3000 r1 wait:1000 shot:01_error_explained_en" MOCK_START_ERROR=smp_unreachable
           # duplicates: OPTIONS on a copy, delete it (confirmed with its path), the list follows
-          run delete 2 18016 "wait:3000 down down down down down wait:500 shot:01_duplicates options wait:500 shot:02_game_menu
+          run delete 2 18016 "wait:3000 down down down down down wait:500 shot:01_duplicates options wait:500 up wait:300 up wait:500 shot:02_game_menu
                                cross wait:700 shot:03_delete_confirm cross wait:500 shot:04_deleting wait:2800 shot:05_deleted"
           # the other languages (system language ids): Chinese 11 (with game titles in Chinese, Japanese and Korean),
           # Thai 27, Vietnamese 28, Portuguese 17. Long explanations show the line breaks of each script
@@ -323,7 +382,7 @@ jobs:
           run tile 2 18022 "wait:3000 down down down wait:900 shot:01_generated_cover down wait:900 shot:02_location_usb"
           # the game menu: optimize a game (trace steps), convert everything
           run optimize 2 18023 "wait:3000 options wait:600 shot:01_game_menu cross wait:900 shot:02_optimize_steps
-                                 cross wait:900 shot:03_collected circle wait:600 options down cross wait:1200 shot:04_convert_all" \
+                                 cross wait:900 shot:03_collected circle wait:600 options down down down cross wait:1200 shot:04_convert_all" \
               MOCK_TRACE_STATE=trace_mode=1,pending=1
           # the speed of each storage: measured ones, the fastest recommended; a test run from the list
           run speed 2 18024 "wait:2600 cross wait:600 down cross wait:900 shot:01_destinations_speed down down square wait:2600 shot:02_tested" \
@@ -421,8 +480,10 @@ jobs:
             rm -f "$zlib"
           done
           mkdir -p bp/e2a/assets
-          # the app's updates: the manifest this repository publishes with each release (branch "updates")
-          echo "#define E2A_UPDATE_URL \"https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/updates/update.json\"" > app/src/update_config.h
+          # the app's updates: the manifest the public repository publishes with each release (branch "updates").
+          # Always the public one: a test build from the private repository would otherwise ask a private URL,
+          # get an error and say "update server unreachable" until it is replaced by hand.
+          echo "#define E2A_UPDATE_URL \"https://raw.githubusercontent.com/exFAT2AMPR/exfat2ampr/updates/update.json\"" > app/src/update_config.h
           cp -r app/src bp/e2a/src
           cp -r app/sce_sys bp/e2a/sce_sys
           cp engine/exfat2ampr.elf engine/engine_version.txt .deps/glyphs_cjk.bin bp/e2a/assets/
