@@ -4,13 +4,17 @@
 
 #include "anim.h"
 #include "api.h"
+#include "atrac9.h"
 #include "img.h"
+#include "log.h"
 #include "platform.h"
+#include "sound.h"
 
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mem.h"   /* last: the allocations go through the app's own memory */
 
 #define KEY_MAX 620
 #define QUERY_MAX 1400
@@ -44,7 +48,13 @@ static bool g_thread;
 
 /* ----------------------------------------------------------------- covers -- */
 /* the cache belongs to the main thread; the loader only hands finished pictures over */
-typedef struct { char key[KEY_MAX]; image_t img; bool loaded; uint64_t used, loaded_at, retry_at; } cover_slot;
+typedef struct {
+  char key[KEY_MAX], query[QUERY_MAX];   /* the query kept: a missing cover is asked again on its own */
+  image_t img;
+  bool loaded;
+  unsigned fails;                        /* in a row: the wait before the next try grows, up to 30 s */
+  uint64_t used, loaded_at, retry_at;
+} cover_slot;
 static cover_slot g_slots[COVER_SLOTS];
 static uint64_t g_tick;
 
@@ -59,16 +69,34 @@ static bool load_cover(const char *query, image_t *img) {
   snprintf(path, sizeof path, "/api/icon?%s", query);
   uint8_t *png;
   size_t len;
-  if (api_get_raw(path, &png, &len) != 0) return false;
+  int st = api_get_status(path, &png, &len);
+  if (st != 200) {   /* why a cover stays a tile: in the log the user can send (each one once a minute at most) */
+    static char last[QUERY_MAX];
+    static uint64_t last_at;
+    uint64_t now = plat_ms();
+    if (strcmp(last, query) != 0 || now - last_at > 60000) {
+      copy_str(last, sizeof last, query);
+      last_at = now;
+      app_log("cover: %.200s -> %s %d", query, st < 0 ? "no answer" : "HTTP", st);
+    }
+    return false;
+  }
   int rc = img_decode_png(png, len, COVER_SIDE, img);
   free(png);
+  if (rc != 0) {   /* the decoder's reason, and whether memory is short right now */
+    char ms[160];
+    mem_stats(ms, sizeof ms);
+    app_log("cover: %.200s -> %zu bytes not decoded: %s; memory: %s", query, len, img_last_error(), ms);
+  }
   return rc == 0;
 }
 
-static void queue_cover(const char *key, const char *query) {
+/* false: the queue is full, nothing was asked */
+static bool queue_cover(const char *key, const char *query) {
   pthread_mutex_lock(&g_mx);
   bool queued = false;
   for (int i = 0; i < g_njobs && !queued; i++) queued = !strcmp(g_jobs[i].key, key);
+  bool ok = queued || g_njobs < JOBS;
   if (!queued && g_njobs < JOBS) {
     copy_str(g_jobs[g_njobs].key, KEY_MAX, key);
     copy_str(g_jobs[g_njobs].query, QUERY_MAX, query);
@@ -76,6 +104,7 @@ static void queue_cover(const char *key, const char *query) {
     pthread_cond_signal(&g_cv);
   }
   pthread_mutex_unlock(&g_mx);
+  return ok;
 }
 
 const image_t *assets_cover(const char *key, const char *query, uint64_t *loaded_at) {
@@ -91,18 +120,19 @@ const image_t *assets_cover(const char *key, const char *query, uint64_t *loaded
     slot = lru;
     img_free(&slot->img);
     copy_str(slot->key, sizeof slot->key, key);
+    copy_str(slot->query, sizeof slot->query, query);
     slot->loaded = false;
     slot->retry_at = 0;
-    if (g_thread) queue_cover(key, query);
-    else {   /* no loader thread: load it here */
+    slot->fails = 0;
+    if (g_thread) {
+      if (!queue_cover(key, query)) { slot->loaded = true; slot->retry_at = now + COVER_RETRY_MS; }   /* queue full: later */
+    } else {   /* no loader thread: load it here */
       slot->loaded = true;
       slot->loaded_at = now;
       if (!load_cover(query, &slot->img)) slot->retry_at = now + COVER_RETRY_MS;
     }
-  } else if (slot->loaded && !slot->img.px && slot->retry_at && now >= slot->retry_at) {
-    slot->loaded = false;   /* the engine may have been busy: ask again */
-    slot->retry_at = 0;
-    if (g_thread) queue_cover(key, query);
+  } else if (strcmp(slot->query, query) != 0) {
+    copy_str(slot->query, sizeof slot->query, query);   /* the same game seen another way (an image now mounted) */
   }
   slot->used = ++g_tick;
   if (loaded_at) *loaded_at = slot->loaded_at;
@@ -120,6 +150,47 @@ static char g_wanted[KEY_MAX];   /* "" = the default wallpaper, composed at star
 static struct { char key[KEY_MAX], art[QUERY_MAX], cover[QUERY_MAX]; unsigned seq; } g_req;
 static unsigned g_built_seq;
 static bool g_ready;
+
+/* the music request: the loader fetches and decodes it, then hands it to the sound module */
+static struct { char key[KEY_MAX], query[QUERY_MAX]; unsigned seq; } g_mreq;
+static unsigned g_music_seq;
+static char g_music_wanted[KEY_MAX];
+#define NO_MUSIC_MAX 64
+static char g_no_music[NO_MUSIC_MAX][KEY_MAX];   /* games without a snd0: not asked again this session */
+static int g_nno_music;
+
+static bool no_music_known(const char *key) {
+  for (int i = 0; i < g_nno_music; i++)
+    if (!strcmp(g_no_music[i], key)) return true;
+  return false;
+}
+
+/* fetch, decode and play the music of one game (loader thread); the key is kept for the log */
+static void music_job(const char *key, const char *query, unsigned seq) {
+  if (!query[0]) { snd_music_stop(); return; }
+  char path[QUERY_MAX + 16];
+  snprintf(path, sizeof path, "/api/sound?%s", query);
+  uint8_t *at9 = NULL;
+  size_t len = 0;
+  int st = api_get_status(path, &at9, &len);
+  if (st == 404) {   /* no music for this game: silence, and no more asking */
+    pthread_mutex_lock(&g_mx);
+    if (g_nno_music < NO_MUSIC_MAX && !no_music_known(key)) copy_str(g_no_music[g_nno_music++], KEY_MAX, key);
+    pthread_mutex_unlock(&g_mx);
+    snd_music_stop();
+    return;
+  }
+  if (st != 200) return;   /* the engine is busy or away: the next focus asks again */
+  at9_track t;
+  int rc = at9_decode(at9, len, &t);
+  free(at9);
+  if (rc != 0) { app_log("music: %.160s -> %zu bytes that do not decode", key, len); snd_music_stop(); return; }
+  pthread_mutex_lock(&g_mx);
+  bool current = seq == g_mreq.seq;   /* a newer request meanwhile: this one is not played */
+  pthread_mutex_unlock(&g_mx);
+  if (current && snd_music_enabled()) snd_music_set(t.pcm, t.frames, t.channels, t.loop_start, t.loop_end);
+  else free(t.pcm);
+}
 
 /* sources the loader keeps (its own: no lock) */
 typedef struct { char key[KEY_MAX]; image_t img; unsigned base; uint64_t used, failed_at; } wp_source;
@@ -270,7 +341,7 @@ static void *loader(void *arg) {
   static cover_job job;
   for (;;) {
     pthread_mutex_lock(&g_mx);
-    while (!g_njobs && !(g_req.seq != g_built_seq && !g_ready)) pthread_cond_wait(&g_cv, &g_mx);
+    while (!g_njobs && !(g_req.seq != g_built_seq && !g_ready) && g_mreq.seq == g_music_seq) pthread_cond_wait(&g_cv, &g_mx);
     if (g_njobs) {   /* covers first: they are content, the wallpaper is ambience */
       job = g_jobs[0];
       g_njobs--;
@@ -287,6 +358,16 @@ static void *loader(void *arg) {
         g_ndone++;
       } else img_free(&img);
       pthread_mutex_unlock(&g_mx);
+      continue;
+    }
+    if (g_mreq.seq != g_music_seq) {   /* then the music: content too, before the wallpaper */
+      static char mkey[KEY_MAX], mquery[QUERY_MAX];
+      unsigned mseq = g_mreq.seq;
+      copy_str(mkey, sizeof mkey, g_mreq.key);
+      copy_str(mquery, sizeof mquery, g_mreq.query);
+      g_music_seq = mseq;
+      pthread_mutex_unlock(&g_mx);
+      music_job(mkey, mquery, mseq);
       continue;
     }
     unsigned seq = g_req.seq;
@@ -322,6 +403,22 @@ void assets_init(void) {
   pthread_attr_destroy(&at);
 }
 
+void assets_music(const char *key, const char *query) {
+  if (!g_thread) return;
+  if (!key) key = "";
+  if (!strcmp(key, g_music_wanted)) return;
+  copy_str(g_music_wanted, sizeof g_music_wanted, key);
+  pthread_mutex_lock(&g_mx);
+  bool silent = key[0] && no_music_known(key);
+  copy_str(g_mreq.key, sizeof g_mreq.key, key);
+  copy_str(g_mreq.query, sizeof g_mreq.query, key[0] && !silent && query ? query : "");   /* "": fade out */
+  g_mreq.seq++;
+  pthread_cond_signal(&g_cv);
+  pthread_mutex_unlock(&g_mx);
+}
+
+void assets_music_reset(void) { g_music_wanted[0] = 0; }
+
 void assets_wallpaper(const char *key, const char *art_query, const char *cover_query) {
   if (!g_wp_ok || !g_thread || !strcmp(key, g_wanted)) return;
   copy_str(g_wanted, sizeof g_wanted, key);
@@ -346,9 +443,30 @@ bool assets_update(uint64_t now) {
     slot->img = g_done[i].img;
     slot->loaded = true;
     slot->loaded_at = now;
-    slot->retry_at = g_done[i].ok ? 0 : now + COVER_RETRY_MS;
+    if (g_done[i].ok) slot->fails = 0, slot->retry_at = 0;
+    else {   /* 3, 6, 12, 24 then every 30 seconds: the engine's own search for it goes on meanwhile */
+      unsigned f = slot->fails < 4 ? slot->fails : 4;
+      uint64_t wait = (uint64_t)(COVER_RETRY_MS / 2) << f;
+      slot->retry_at = now + (wait > 30000 ? 30000 : wait);
+      slot->fails++;
+    }
   }
   g_ndone = 0;
+  /* a missing cover is asked again on its own, whether the screen is redrawn or not */
+  for (int k = 0; k < COVER_SLOTS; k++) {
+    cover_slot *s = &g_slots[k];
+    if (!s->key[0] || !s->loaded || s->img.px || !s->retry_at || now < s->retry_at) continue;
+    s->loaded = false;
+    s->retry_at = 0;
+    bool queued = false;
+    for (int j = 0; j < g_njobs && !queued; j++) queued = !strcmp(g_jobs[j].key, s->key);
+    if (!queued && g_njobs < JOBS) {
+      copy_str(g_jobs[g_njobs].key, KEY_MAX, s->key);
+      copy_str(g_jobs[g_njobs].query, QUERY_MAX, s->query);
+      g_njobs++;
+      pthread_cond_signal(&g_cv);
+    } else if (!queued) { s->loaded = true; s->retry_at = now + COVER_RETRY_MS; }   /* the queue is full: later */
+  }
   if (g_ready) {
     int old = g_prev;
     g_prev = g_cur;

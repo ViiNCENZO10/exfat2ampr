@@ -4,9 +4,30 @@
  * sources (pic0.png key art cropped to the screen's 16:9). */
 #include "img.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mem.h"   /* last: the allocations go through the app's own memory */
 
+/* the console's realloc() fails on some growing blocks while plenty of memory is free (seen on PS5: "outofmem"
+ * with 32 MB still available): stb_image grows its buffers with a fresh block and a copy instead */
+static size_t g_fail_size;
+static void *img_malloc(size_t n) {
+  void *p = malloc(n ? n : 1);
+  if (!p) g_fail_size = n;
+  return p;
+}
+static void *img_realloc_sized(void *p, size_t old, size_t n) {
+  if (!p) return img_malloc(n);
+  void *q = img_malloc(n);
+  if (!q) return NULL;   /* the old block stays valid, as with realloc() */
+  memcpy(q, p, old < n ? old : n);
+  free(p);
+  return q;
+}
+#define STBI_MALLOC(sz) img_malloc(sz)
+#define STBI_FREE(p) free(p)
+#define STBI_REALLOC_SIZED(p, oldsz, newsz) img_realloc_sized(p, oldsz, newsz)
 #define STBI_ONLY_PNG
 #define STBI_NO_STDIO
 #define STBI_NO_HDR
@@ -73,11 +94,23 @@ static uint32_t *box_resize(const unsigned char *rgba, int w, int sx, int sy, in
   return px;
 }
 
+static const char *g_err = "";
+const char *img_last_error(void) { return g_err; }
+
 static unsigned char *decode(const uint8_t *data, size_t len, int *w, int *h) {
   int n;
-  if (!stbi_info_from_memory(data, (int)len, w, h, &n) || *w <= 0 || *h <= 0 || *w > MAX_SOURCE_SIDE || *h > MAX_SOURCE_SIDE) return NULL;
+  if (!stbi_info_from_memory(data, (int)len, w, h, &n)) { g_err = stbi_failure_reason() ? stbi_failure_reason() : "info"; return NULL; }
+  if (*w <= 0 || *h <= 0 || *w > MAX_SOURCE_SIDE || *h > MAX_SOURCE_SIDE) { g_err = "size"; return NULL; }
   /* RGBA bytes read as a little-endian uint32 are 0xAABBGGRR: the frame's format */
-  return stbi_load_from_memory(data, (int)len, w, h, &n, 4);
+  g_fail_size = 0;
+  unsigned char *px = stbi_load_from_memory(data, (int)len, w, h, &n, 4);
+  g_err = px ? "" : stbi_failure_reason() ? stbi_failure_reason() : "load";
+  if (!px && g_fail_size) {   /* which block the allocator refused */
+    static char why[64];
+    snprintf(why, sizeof why, "%s (a block of %zu bytes refused)", g_err, g_fail_size);
+    g_err = why;
+  }
+  return px;
 }
 
 /* half-size levels down to 32 pixels, each one the 2x2 average of the previous */
@@ -117,7 +150,7 @@ int img_decode_png(const uint8_t *data, size_t len, int max_side, image_t *out) 
   }
   uint32_t *px = box_resize(rgba, w, 0, 0, w, h, tw, th);
   stbi_image_free(rgba);
-  if (!px) return -1;
+  if (!px) { g_err = "resize: out of memory"; return -1; }
   out->w = tw; out->h = th; out->px = px;
   build_levels(out);
   return 0;
@@ -135,7 +168,7 @@ int img_decode_fill(const uint8_t *data, size_t len, int tw, int th, image_t *ou
   if (sh < 1) sh = 1;
   uint32_t *px = box_resize(rgba, w, (w - sw) / 2, (h - sh) / 2, sw, sh, tw, th);
   stbi_image_free(rgba);
-  if (!px) return -1;
+  if (!px) { g_err = "resize: out of memory"; return -1; }
   out->w = tw; out->h = th; out->px = px;
   return 0;
 }

@@ -229,6 +229,7 @@ typedef struct {
   char errors[6][24], warnings[6][24], compat[12];
   int nerr, nwarn;
   double source_bytes, need_typ, need_max, dest_free, dest_total, image_bytes;
+  double dur[13], verify_s;   /* seconds expected at each LZ4 level (packing), and for the verification; < 0 unknown */
 } check_t;
 static check_t g_checks[MAX_CHECKS];
 static int g_nchecks, g_check_scroll;
@@ -258,6 +259,10 @@ static const char *code_text(const char *c) {
     {"done_fakelib", S_X_DONE_FAKELIB}, {"queue_full", S_X_QUEUE_FULL}, {"already_running", S_X_ALREADY_RUNNING}, {"bad_path", S_X_BAD_PATH}, {"bad_name", S_X_BAD_PATH},
     /* checks before a conversion */
     {"smp_wait_app", S_W_SMP_WAIT_APP}, {"smp_wait_game", S_W_SMP_WAIT_GAME}, {"fakelib_disabled", S_W_FAKELIB_DISABLED}, {"backport_ampr", S_W_BACKPORT_AMPR},
+    /* the start-up check of a converted game (after a conversion, and on Repair) */
+    {"repair_failed", S_L_REPAIR_FAILED}, {"eboot_exec", S_L_EBOOT_EXEC}, {"no_emulator", S_L_NO_EMULATOR},
+    {"fakelib2_no_ampr", S_L_FAKELIB2}, {"emulator_other", S_L_EMULATOR_OTHER}, {"emus_ampr_other", S_L_EMUS_OTHER},
+    {"repaired", S_L_REPAIRED},
     /* deleting a copy from the list */
     {"in_use", S_X_IN_USE}, {"source_mounted", S_X_SOURCE_MOUNTED}, {"not_deletable", S_X_NOT_DELETABLE},
     {"delete_failed", S_X_DELETE_FAILED}, {"delete_busy", S_X_DELETE_BUSY}, {"app_in_use", S_X_APP_IN_USE}};
@@ -290,6 +295,11 @@ static void run_checks(void) {
       c->need_max = json_num(d.root, "need_max", 0);
       c->dest_free = json_num(d.root, "dest_free", 0);
       c->dest_total = json_num(d.root, "dest_total", 0);
+      for (int lv = 0; lv < 13; lv++) c->dur[lv] = -1;
+      const jnode *du = json_get(d.root, "duration_by_level");
+      int lv = 1;
+      for (const jnode *x = du ? du->child : NULL; x && lv <= 12; x = x->next) c->dur[lv++] = x->type == J_NUM ? x->num : -1;
+      c->verify_s = json_num(d.root, "verify_seconds", -1);
       scopy(c->compat, sizeof c->compat, json_str(d.root, "compatible", "later"));
       const jnode *e = json_get(d.root, "errors"), *w = json_get(d.root, "warnings");
       for (const jnode *x = e ? e->child : NULL; x && c->nerr < 6; x = x->next)
@@ -304,6 +314,12 @@ static void run_checks(void) {
     c->ok = c->nerr == 0 && !c->overwrite_needed;
   }
   g_dirty = true;
+}
+
+/* seconds a conversion should take at a level, verification included when it is on; < 0 unknown */
+static double check_duration(const check_t *c, int level) {
+  if (level < 1 || level > 12 || c->dur[level] <= 0) return -1;
+  return c->dur[level] + (g_opt.verify && c->verify_s > 0 ? c->verify_s : 0);
 }
 
 static int checks_ok(void) {
@@ -343,7 +359,19 @@ static void draw_checks(void) {
     const char *compat = !strcmp(c->compat, "yes") ? T(S_COMPAT_YES) : !strcmp(c->compat, "no") ? T(S_COMPAT_NO)
                          : !strcmp(c->compat, "unknown") ? T(S_COMPAT_UNKNOWN) : T(S_COMPAT_LATER);
     uint32_t cc = !strcmp(c->compat, "yes") ? C_OK : !strcmp(c->compat, "no") ? C_ERR : C_WARN;
-    gfx_text(&FONT_SMALL, tx, ry + 90, compat, cc, tw);
+    gfx_text(&FONT_SMALL, tx, ry + 90, compat, cc, tw - 620);
+    double dd = check_duration(c, g_opt.level), d9 = check_duration(c, 9);
+    if (dd > 0) {   /* how long, and at level 10 to 12 what level 9 would take */
+      char t[32], t9[32], s[200];
+      fmt_dur(t, sizeof t, (long long)dd);
+      snprintf(s, sizeof s, T(S_DURATION), t);
+      if (g_opt.level >= 10 && d9 > 0) {
+        size_t n = strlen(s);
+        fmt_dur(t9, sizeof t9, (long long)d9);
+        snprintf(s + n, sizeof s - n, T(S_DURATION_AT9), t9);
+      }
+      gfx_text_right(&FONT_SMALL, x + w - 32, ry + 90, s, g_opt.level >= 10 ? C_WARN : C_DIM);
+    }
     /* the most important message: first error, else the overwrite note, else the first warning */
     const char *msg = NULL;
     uint32_t mc = C_WARN;
@@ -393,7 +421,20 @@ static void draw_checks(void) {
   cy += 190;
   snprintf(line, sizeof line, "LZ4 %d · %s · %s", g_opt.level, g_opt.cache ? T(S_CACHE_LARGE) : T(S_CACHE_STD),
            g_opt.verify ? T(S_VERIFY) : "—");
-  gfx_text_wrap(&FONT_SMALL, dx + 32, cy, line, C_DIM, dw - 64, 2);
+  gfx_text_wrap(&FONT_SMALL, dx + 32, cy, line, C_DIM, dw - 64, 1);
+  {   /* the whole batch, at this level */
+    double all = 0;
+    for (int i = 0; i < g_nchecks; i++) {
+      double dd = check_duration(&g_checks[i], g_opt.level);
+      if (g_checks[i].ok && dd > 0) all += dd;
+    }
+    if (all > 0) {
+      char t[32];
+      fmt_dur(t, sizeof t, (long long)all);
+      snprintf(line, sizeof line, T(S_DURATION), t);
+      gfx_text(&FONT_SMALL, dx + 32, cy + 36, line, g_opt.level >= 10 ? C_WARN : C_TEXT, dw - 64);
+    }
+  }
   cy += 80;
   gfx_text_wrap(&FONT_SMALL, dx + 32, cy, g_opt.remove ? T(S_REMOVE_NOTE) : T(S_ORIGINALS_KEPT), g_opt.remove ? C_WARN : C_OK, dw - 64, 3);
   cy += 110;
@@ -403,7 +444,14 @@ static void draw_checks(void) {
   gfx_pop();
 }
 
-static void start_checked(void) {
+/* an image ShadowMountPlus will only mount once this app is closed (it refuses while any title runs) */
+static bool checks_need_close(void) {
+  for (int i = 0; i < g_nchecks; i++)
+    if (g_checks[i].ok && has_warning(&g_checks[i], "smp_wait_app")) return true;
+  return false;
+}
+
+static int start_checked(void) {
   int ok = 0;
   g_app_started_at = plat_ms();
   for (int i = 0; i < g_nchecks; i++)
@@ -418,4 +466,5 @@ static void start_checked(void) {
     g_tab = TAB_PROGRESS;
   }
   poll_status();
+  return ok;
 }

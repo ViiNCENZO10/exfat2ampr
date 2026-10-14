@@ -56,6 +56,9 @@ typedef struct {
   uint64_t started, finished;         /* unix seconds */
   int queue_len;
   char queue[E2A_QUEUE_MAX][96];
+  /* the check run once the game is converted: what would stop it from starting (JSON string lists) */
+  bool launch_checked;
+  char launch_errors[160], launch_warnings[160];
 } job_status;
 
 int  job_init(void);
@@ -73,6 +76,9 @@ void job_pause_because(const char *why);    /* same, with the reason shown to th
 void job_watch_storage(void);               /* pauses the job when its source or destination drive is gone */
 /* checks before converting (JSON with error / warning codes) */
 int job_preflight(const char *path, const char *smp, const char *dest_base, char *json, size_t cap);
+/* a converted folder, before its first start: fixes what it can (index, execute bits), then lists as JSON
+ * string lists what would still stop the game from starting (errors) or might (warnings); 0 = ready */
+int job_launch_check(const char *game_dir, char *errors, size_t ecap, char *warnings, size_t wcap);
 void job_get_status(job_status *out);
 bool job_running(void);
 bool job_busy(void);                        /* running or queue not empty */

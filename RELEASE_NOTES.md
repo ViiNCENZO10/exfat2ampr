@@ -9,13 +9,23 @@ or USB drive). Smaller games, every block checked, interrupted conversions resum
 
 ### New in this version
 
-- **Safer conversions**: an already converted game cannot be converted again; a source with links or unreadable files is refused instead of giving an incomplete game; each file left uncompressed gets a SHA-256 checked at the end; a conversion interrupted while it was being finalised resumes without starting over; damaged resume data is refused. Details in `docs/HARDENING.md`.
-- **Repair** (game menu, OPTIONS): fixes a game converted by an older version, in one press.
-- **Set aside** (game menu): hides a duplicate image from ShadowMountPlus (renamed `.off`; rename it back to undo).
-- **The original game is protected**: "Overwrite" never erases a folder that is not a converted game, and deleting
-  a copy tells you first if it is the only one on the console.
-- **The destination folder is shown in full** before you start.
-- **Colour themes** (Settings › Theme), including a red-to-yellow gradient.
+- **Start-up check**: once a game is converted, the app checks what would stop it from starting (AMPR emulator
+  missing or overridden, fakelib2, backport, fakelib disabled, eboot.bin not executable), fixes what it can and
+  tells you the rest on the Progress screen. Repair (game menu, OPTIONS) runs the same check.
+- **Time estimate per LZ4 level**: the check screen shows how long the conversion should take, and at level 10 to
+  12 how long level 9 would take. The speed is learned on your console after each conversion. Level 10 to 12 kept
+  from an older version is set back to 9 once (you can choose it again).
+- **Start and close the app** (△ on the check screen): for an image, ShadowMountPlus only mounts it once no app
+  is open; this starts the conversion and closes the app, which finds it again when reopened.
+- **Every cover shows**: the console refused the app medium memory blocks and most covers stayed blank; the app
+  now keeps its own memory, taken from the console's direct memory.
+- **Each game's own music**: rest on a game and its home-screen music plays (the `snd0.at9` the game or the
+  console keeps), cross-fading from one game to the next; silent for games without one. Settings › Game music.
+
+### Earlier
+
+- **Safer conversions** (1.95): an already converted game cannot be converted again; a source with links or unreadable files is refused; each uncompressed file gets a SHA-256 checked at the end; damaged resume data is refused. Details in `docs/HARDENING.md`.
+- **Repair**, **Set aside**, original game protected, full destination shown, colour themes.
 
 ### Install
 
@@ -40,14 +50,22 @@ disque USB). Jeux plus légers, chaque bloc vérifié, conversions interrompues 
 
 **Nouveautés**
 
-- **Conversions plus sûres** : un jeu déjà converti ne peut plus être reconverti ; une source avec des liens ou des fichiers illisibles est refusée au lieu de donner un jeu incomplet ; chaque fichier non compressé reçoit une empreinte SHA-256 vérifiée à la fin ; une conversion interrompue pendant sa finalisation reprend sans tout refaire ; des données de reprise abîmées sont refusées.
-- **Réparer** (menu du jeu, OPTIONS) : corrige en un clic un jeu converti par une ancienne version.
-- **Mettre de côté** (menu du jeu) : cache une image en double à ShadowMountPlus (renommée `.off` ; renommez-la pour
-  annuler).
-- **Le jeu d'origine est protégé** : « Écraser » ne supprime jamais un dossier qui n'est pas un jeu converti, et la
-  suppression d'une copie prévient si c'est la seule sur la console.
-- **Le dossier de destination est affiché en entier** avant le lancement.
-- **Thèmes de couleurs** (Réglages › Thème), dont un dégradé rouge et jaune.
+- **Test de démarrage** : une fois le jeu converti, l'app vérifie ce qui l'empêcherait de démarrer (émulateur AMPR
+  absent ou remplacé, fakelib2, backport, fakelib désactivé, eboot.bin non exécutable), corrige ce qu'elle peut et
+  vous dit le reste sur l'écran Progression. Réparer (menu du jeu, OPTIONS) fait le même test.
+- **Durée estimée par niveau LZ4** : l'écran de vérification indique la durée prévue et, aux niveaux 10 à 12, celle
+  du niveau 9. La vitesse est apprise sur votre console après chaque conversion. Un niveau 10 à 12 gardé d'une
+  ancienne version est ramené une fois à 9 (vous pouvez le remettre).
+- **Lancer et quitter l'app** (△ sur l'écran de vérification) : ShadowMountPlus ne monte une image que lorsqu'aucune
+  app n'est ouverte ; la conversion démarre et l'app se ferme, puis la retrouve à sa réouverture.
+- **Toutes les jaquettes s'affichent** : la console refusait à l'app des blocs mémoire moyens et la plupart des
+  jaquettes restaient vides ; l'app gère maintenant sa propre mémoire, prise dans la mémoire directe de la console.
+- **La musique de chaque jeu** : arrêtez-vous sur un jeu et sa musique d'accueil joue (le `snd0.at9` que le jeu
+  ou la console garde), en fondu d'un jeu à l'autre ; silence pour les jeux qui n'en ont pas. Réglages › Musique
+  des jeux.
+
+**Avant** : conversions plus sûres (1.95), Réparer, Mettre de côté, jeu d'origine protégé, dossier de destination
+affiché, thèmes de couleurs.
 
 **Installation** : PS5 jailbreakée avec kstuff, chargeur d'ELF sur le port 9021, ShadowMountPlus 1.7 ou plus.
 

@@ -181,7 +181,7 @@ check: reliability-host
 	./build/check/unit_test
 	$(HOSTCC) $(HOST_CFLAGS) tests/manifest_test.c -o build/check/manifest_test
 	./build/check/manifest_test
-	$(HOSTCC) $(HOST_CFLAGS) -Iapp/src app/src/json.c tests/json_test.c -lm -o build/check/json_test
+	$(HOSTCC) $(HOST_CFLAGS) -Iapp/src app/src/json.c app/src/mem.c tests/json_test.c -pthread -lm -o build/check/json_test
 	./build/check/json_test
 	$(HOSTCC) $(HOST_CFLAGS) src/util.c src/sha256.c src/selfupdate.c tests/update_test.c -lm -o build/check/update_test
 	cd build/check/update && ../update_test

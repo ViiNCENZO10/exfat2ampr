@@ -130,7 +130,7 @@ static void api_state(int fd, const char *args) {
            "\"title_id\":\"%s\",\"title\":\"%s\",\"dest\":\"%s\",\"profile\":\"%s\",\"source_bytes\":%llu,\"packed_bytes\":%llu,"
            "\"shared_bytes\":%llu,\"started\":%llu,\"finished\":%llu,\"queue\":%s,\"runtime\":%s,"
            "\"rates\":{\"read\":%.1f,\"compress\":%.1f,\"write\":%.1f,\"read_threads\":%d,\"workers\":%d},"
-           "\"image_bytes\":%llu,\"estimated_bytes\":%llu,\"estimate\":\"%s\","
+           "\"image_bytes\":%llu,\"estimated_bytes\":%llu,\"estimate\":\"%s\",\"launch\":{\"checked\":%s,\"errors\":[%s],\"warnings\":[%s]},"
            "\"storage_rev\":%llu,\"game_running\":\"%s\",\"game_mode\":%s,\"game_mode_enabled\":%s,\"log\":\"%s\"}",
            E2A_VERSION, names[s.state], s.phase, msg, s.code, s.reason, s.waiting ? "true" : "false",
            job_can_retry() ? "true" : "false", resumable ? "true" : "false", del, s.percent,
@@ -140,6 +140,7 @@ static void api_state(int fd, const char *args) {
            (unsigned long long)s.started, (unsigned long long)s.finished, queue, runtime,
            rt.read_mbps, rt.compress_mbps, rt.write_mbps, rt.read_threads, rt.workers,
            (unsigned long long)s.image_bytes, (unsigned long long)s.estimated_bytes, s.est_method,
+           s.launch_checked ? "true" : "false", s.launch_errors, s.launch_warnings,
            (unsigned long long)activity_storage_rev(), game, activity_game_mode() ? "true" : "false",
            activity_game_mode_enabled() ? "true" : "false", log);
   send_json(fd, 200, json);
@@ -317,6 +318,49 @@ static void api_icon(int fd, const char *args) {
   if (!bg && (folder || mp[0]) && send_from(fd, folder ? root : mp, wide, max)) return;
   if (tid[0] && !bg) covers_want(tid);   /* slow or missing now: the background pass keeps trying, patiently */
   send_json(fd, 404, "{\"error\":\"no icon\"}");
+}
+
+/* the title's home-screen music (sce_sys/snd0.at9): the folder itself, the console's copy for a registered
+ * title, an image ShadowMountPlus keeps mounted; kept with the covers once found; 404 when the game has none
+ * (ShadowMountPlus serves icons, not sounds: an image it has not mounted stays silent) */
+static void api_sound(int fd, const char *args) {
+  char root[600] = "", path[800], tid[16] = "", mp[600] = "";
+  form_get(args, "path", root, sizeof root);
+  if (root[0] && !SAFE_PATH(root)) root[0] = 0;
+  if (form_get(args, "title_id", tid, sizeof tid) >= 0 && !title_id_ok(tid)) tid[0] = 0;
+  if (!root[0] && !tid[0]) { send_json(fd, 400, "{\"error\":\"bad path\"}"); return; }
+  bool folder = root[0] && e2a_is_dir(root), image = !folder && root[0] && e2a_is_file(root);
+  e2a_game g;
+  if (folder && !tid[0] && e2a_read_game(root, &g) == 0) snprintf(tid, sizeof tid, "%s", g.title_id);
+  if (!tid[0] && root[0]) { const char *base = strrchr(root, '/'); e2a_title_from_name(base ? base + 1 : root, tid); }
+  if (!title_id_ok(tid)) tid[0] = 0;
+  uint8_t *at9 = NULL;
+  size_t n = 0;
+  if (tid[0] && covers_get_sound(tid, &at9, &n)) {
+    send_response(fd, 200, "audio/x-atrac9", (const char *)at9, n);
+    free(at9);
+    return;
+  }
+  char cand[6][800];
+  int nc = 0;
+  if (folder) snprintf(cand[nc++], sizeof cand[0], "%s/sce_sys/snd0.at9", root);
+  for (int m = 0; tid[0] && APPMETA_DIRS[m] && nc < 5; m++) snprintf(cand[nc++], sizeof cand[0], "%s/%s/snd0.at9", APPMETA_DIRS[m], tid);
+  if (image && smp_image_mount_point_cached(root, mp, sizeof mp)) snprintf(cand[nc++], sizeof cand[0], "%s/sce_sys/snd0.at9", mp);
+  for (int i = 0; i < nc; i++) {
+    int64_t size = e2a_file_size(cand[i]);
+    if (size < 64 || size > (32 << 20)) continue;
+    char *data = NULL;
+    if (e2a_read_text(cand[i], &data, &n, (size_t)size) != 0) continue;
+    bool ok = covers_sound_ok(data, n);
+    if (ok) {
+      if (tid[0]) covers_put_sound(tid, data, n);
+      send_response(fd, 200, "audio/x-atrac9", data, n);
+    }
+    free(data);
+    if (ok) return;
+  }
+  snprintf(path, sizeof path, "{\"error\":\"no sound\"}");
+  send_json(fd, 404, path);
 }
 
 /* trace mode: enable / disable / collect on a game folder, generate a profile for a title */
@@ -600,7 +644,7 @@ static void handle(int fd) {
     }
   }
   else if (strcmp(path, "/api/check") == 0) {
-    char p[600], smp[16], dst[300], out[1400];
+    char p[600], smp[16], dst[300], out[2000];
     form_get(args, "path", p, sizeof p);
     form_get(args, "smp", smp, sizeof smp);
     form_get(args, "dest", dst, sizeof dst);
@@ -617,6 +661,7 @@ static void handle(int fd) {
   else if (strcmp(path, "/api/resumable") == 0) api_list(fd, job_list_resumable);
   else if (strcmp(path, "/api/profiles") == 0) api_list(fd, job_list_profiles);
   else if (strcmp(path, "/api/icon") == 0) api_icon(fd, args);
+  else if (strcmp(path, "/api/sound") == 0) api_sound(fd, args);
   else if (strcmp(path, "/api/traces") == 0) api_list(fd, trace_list_json);
   else if (strcmp(path, "/api/plugins") == 0) api_plugins(fd, args);
   else if (strcmp(path, "/api/plugins/refresh") == 0 && post) api_plugins_refresh(fd, args);
@@ -660,17 +705,20 @@ static void handle(int fd) {
       send_json(fd, 409, out);
     }
   } else if (strcmp(path, "/api/repair") == 0 && post) {   /* the start-up repair, now, on one converted folder */
-    char p[600], report[400], er[500], out[700];
+    char p[600], report[400], er[500], out[1100];
     form_get(args, "path", p, sizeof p);
     e2a_game g;
     if (!plugins_path_allowed(p) || e2a_read_game(p, &g) != 0) send_json(fd, 400, "{\"error\":\"bad game folder\"}");
     else if (activity_title_running(g.title_id) || !job_claim_path(p, true)) send_json(fd, 409, "{\"error\":\"in use\",\"code\":\"in_use\"}");
     else {
       int rc = e2a_repair_converted(p, report, sizeof report);
+      char le[160] = "", lw[160] = "";
+      if (rc >= 0) job_launch_check(p, le, sizeof le, lw, sizeof lw);   /* then what would still stop it */
       job_release_path();
       if (rc != 0) e2a_log("repair of %s: %s", p, report);
       e2a_json_escape(report, er, sizeof er);
-      snprintf(out, sizeof out, "{\"ok\":%s,\"fixes\":%d,\"report\":\"%s\"}", rc < 0 ? "false" : "true", rc < 0 ? 0 : rc, er);
+      snprintf(out, sizeof out, "{\"ok\":%s,\"fixes\":%d,\"report\":\"%s\",\"errors\":[%s],\"warnings\":[%s]}",
+               rc < 0 ? "false" : "true", rc < 0 ? 0 : rc, er, le, lw);
       send_json(fd, rc < 0 ? 500 : 200, out);
     }
   } else if (strcmp(path, "/api/dismiss") == 0 && post) {

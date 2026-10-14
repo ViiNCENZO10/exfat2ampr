@@ -30,3 +30,8 @@ bool est_known_content(const char *title_id, uint64_t *content, uint64_t *final_
 /* the last measured verification speed (bytes/s), 0 when never measured */
 double est_verify_rate(void);
 void est_set_verify_rate(double bps);
+/* the packing speed at an LZ4 level (bytes of game per second): measured on this console, else a guess */
+double est_pack_rate(int level);
+void est_set_pack_rate(int level, double bps);
+/* how long a conversion of <content> bytes should take (seconds), verification included or not; -1 unknown */
+int64_t est_duration(uint64_t content, int level, bool verify);

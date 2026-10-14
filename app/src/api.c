@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mem.h"   /* last: the allocations go through the app's own memory */
 
 /* the engine not answering is noted once in a while; never for the log shipping itself (it would feed itself) */
 static bool g_quiet;   /* while the app starts the engine, its silence is expected */
@@ -51,8 +52,10 @@ static int http_body(const char *method, const char *path, const void *data, siz
   while (buf) {
     if (n == cap) {
       if (cap >= (32u << 20)) break;
-      uint8_t *nb = realloc(buf, cap * 2 + 1);
+      uint8_t *nb = malloc(cap * 2 + 1);   /* not realloc(): it fails on the console with memory to spare */
       if (!nb) { free(buf); buf = NULL; break; }
+      memcpy(nb, buf, n);
+      free(buf);
       buf = nb; cap *= 2;
     }
     int r = plat_tcp_recv(s, buf + n, cap - n);
@@ -100,11 +103,13 @@ int api_call(const char *path, const char *form, jdoc *doc) {
   return st;
 }
 
-int api_get_raw(const char *path, uint8_t **data, size_t *len) {
+int api_get_status(const char *path, uint8_t **data, size_t *len) {
   int st = http("GET", path, NULL, data, len);
-  if (st != 200) { free(*data); *data = NULL; *len = 0; return -1; }
-  return 0;
+  if (st != 200) { free(*data); *data = NULL; *len = 0; }
+  return st;
 }
+
+int api_get_raw(const char *path, uint8_t **data, size_t *len) { return api_get_status(path, data, len) == 200 ? 0 : -1; }
 
 void form_add(char *buf, size_t cap, const char *key, const char *value) {
   size_t n = strlen(buf);

@@ -15,6 +15,7 @@
 
 #define SIZES_FILE E2A_STATE_DIR "/sizes.txt"
 #define VRATE_FILE E2A_STATE_DIR "/verify_rate.txt"
+#define PRATE_FILE E2A_STATE_DIR "/pack_rate.txt"
 #define SAMPLES 96
 #define SBLOCK 65536u
 
@@ -195,4 +196,62 @@ void est_set_verify_rate(double bps) {
   char b[48];
   int n = snprintf(b, sizeof b, "%.0f\n", bps);
   e2a_write_file_atomic(VRATE_FILE, b, (size_t)n);
+}
+
+/* -------------------------------------------------------------- pack speed -- */
+/* bytes of game per second through the packing phase, per LZ4 level: what this console measured (one line
+ * "<level> <bytes/s>" each), else a first guess. Levels 10 to 12 switch LZ4HC to its optimal parser, several
+ * times slower for less than 1 % of space. */
+static const double PACK_GUESS[13] = {0, 220e6, 220e6, 220e6, 190e6, 180e6, 170e6, 150e6, 130e6, 110e6, 35e6, 30e6, 25e6};
+
+static void prate_load(double rates[13]) {
+  memset(rates, 0, 13 * sizeof *rates);
+  char *txt = NULL;
+  if (e2a_read_text(PRATE_FILE, &txt, NULL, 4096) != 0 || !txt) return;
+  for (char *save = NULL, *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    int lv = 0;
+    double v = 0;
+    if (sscanf(line, "%d %lf", &lv, &v) == 2 && lv >= 1 && lv <= 12 && v > 0) rates[lv] = v;
+  }
+  free(txt);
+}
+
+double est_pack_rate(int level) {
+  if (level < 1 || level > 12) level = 9;
+  double rates[13];
+  pthread_mutex_lock(&g_mx);
+  prate_load(rates);
+  pthread_mutex_unlock(&g_mx);
+  if (rates[level] > 0) return rates[level];
+  /* another level measured here: scaled by the guesses' ratio (this console's disks, not the guess's) */
+  for (int d = 1; d <= 11; d++)
+    for (int s = -1; s <= 1; s += 2) {
+      int o = level + s * d;
+      if (o >= 1 && o <= 12 && rates[o] > 0) return rates[o] * PACK_GUESS[level] / PACK_GUESS[o];
+    }
+  return PACK_GUESS[level];
+}
+
+void est_set_pack_rate(int level, double bps) {
+  if (level < 1 || level > 12 || bps <= 0) return;
+  double rates[13];
+  pthread_mutex_lock(&g_mx);
+  prate_load(rates);
+  rates[level] = rates[level] > 0 ? (rates[level] + bps) / 2 : bps;   /* smoothed: one odd run moves it halfway */
+  char b[400];
+  size_t at = 0;
+  for (int i = 1; i <= 12; i++)
+    if (rates[i] > 0) at += (size_t)snprintf(b + at, sizeof b - at, "%d %.0f\n", i, rates[i]);
+  e2a_write_file_atomic(PRATE_FILE, b, at);
+  pthread_mutex_unlock(&g_mx);
+}
+
+int64_t est_duration(uint64_t content, int level, bool verify) {
+  if (!content) return -1;
+  double s = (double)content / est_pack_rate(level);
+  if (verify) {
+    double vr = est_verify_rate();
+    s += (double)content / (vr > 0 ? vr : 400e6);
+  }
+  return (int64_t)(s + 0.5);
 }

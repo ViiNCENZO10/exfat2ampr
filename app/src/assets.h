@@ -21,6 +21,10 @@ const image_t *assets_cover(const char *key, const char *query, uint64_t *loaded
 /* the wallpaper to show: key "" = the default one. art_query: /api/icon query for the key art
  * ("" = none), cover_query: for the cover. Asking again for the shown key costs nothing. */
 void assets_wallpaper(const char *key, const char *art_query, const char *cover_query);
+/* the focused game's own music: fetched (/api/sound) and decoded on the loader thread, then handed to the
+ * sound module; an empty key fades it out; games without one are remembered and not asked again */
+void assets_music(const char *key, const char *query);
+void assets_music_reset(void);   /* the next assets_music() asks again (music switched back on) */
 
 /* once per loop, before drawing: takes in what the thread finished; true = something new to show */
 bool assets_update(uint64_t now);

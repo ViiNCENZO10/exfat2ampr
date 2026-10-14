@@ -74,12 +74,62 @@ static bool put_file(const char *tid, bool bg, const char *path) {
   return ok;
 }
 
+/* ------------------------------------------------------------------ music -- */
+static void sound_path(const char *tid, char *out, size_t cap) { snprintf(out, cap, "%s/%.9s.at9", COVERS_DIR, tid); }
+
+/* a RIFF/WAVE whose "fmt " chunk is WAVE_FORMAT_EXTENSIBLE with the ATRAC9 sub-format */
+bool covers_sound_ok(const void *data, size_t len) {
+  static const uint8_t guid[16] = {0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36, 0x8d, 0x4d, 0x88, 0xfc, 0x61, 0x65, 0x4f, 0x8c, 0x83, 0x6c};
+  const uint8_t *p = data;
+  if (!p || len < 64 || len > (32u << 20) || memcmp(p, "RIFF", 4) != 0 || memcmp(p + 8, "WAVE", 4) != 0) return false;
+  for (size_t at = 12; at + 8 <= len;) {
+    size_t clen = (size_t)p[at + 4] | (size_t)p[at + 5] << 8 | (size_t)p[at + 6] << 16 | (size_t)p[at + 7] << 24;
+    if (memcmp(p + at, "fmt ", 4) == 0)
+      return clen >= 52 && at + 8 + 52 <= len && p[at + 8] == 0xFE && p[at + 9] == 0xFF && memcmp(p + at + 8 + 24, guid, 16) == 0;
+    if (clen > len - at - 8) return false;
+    at += 8 + clen + (clen & 1);
+  }
+  return false;
+}
+
+bool covers_get_sound(const char *title_id, uint8_t **at9, size_t *len) {
+  if (!tid_ok(title_id)) return false;
+  char path[300];
+  sound_path(title_id, path, sizeof path);
+  char *data = NULL;
+  size_t n = 0;
+  if (e2a_read_text(path, &data, &n, 32u << 20) != 0) return false;
+  if (!covers_sound_ok(data, n)) { free(data); return false; }
+  *at9 = (uint8_t *)data;
+  *len = n;
+  return true;
+}
+
+void covers_put_sound(const char *title_id, const void *at9, size_t len) {
+  if (!tid_ok(title_id) || !covers_sound_ok(at9, len)) return;
+  char path[300];
+  sound_path(title_id, path, sizeof path);
+  if (e2a_file_size(path) == (int64_t)len) return;
+  e2a_mkdir_p(COVERS_DIR);
+  e2a_write_file_atomic(path, at9, len);
+}
+
+static void put_sound_file(const char *tid, const char *path) {
+  char *data = NULL;
+  size_t n = 0;
+  if (e2a_read_text(path, &data, &n, 32u << 20) != 0) return;
+  covers_put_sound(tid, data, n);
+  free(data);
+}
+
 void covers_put_from_dir(const char *title_id, const char *root) {
   static const char *const icons[] = {"sce_sys/icon0.png", "sce_sys/icon0_00.png", NULL};
   static const char *const art[] = {"sce_sys/pic0.png", "sce_sys/pic1.png", NULL};
   char path[900];
   for (int i = 0; icons[i]; i++) { snprintf(path, sizeof path, "%s/%s", root, icons[i]); if (put_file(title_id, false, path)) break; }
   for (int i = 0; art[i]; i++) { snprintf(path, sizeof path, "%s/%s", root, art[i]); if (put_file(title_id, true, path)) break; }
+  snprintf(path, sizeof path, "%s/sce_sys/snd0.at9", root);
+  if (e2a_is_file(path)) put_sound_file(title_id, path);
 }
 
 void covers_want(const char *title_id) {

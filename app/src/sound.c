@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mem.h"   /* last: the allocations go through the app's own memory */
 
 #define SR 48000
 #define VOICES 8
@@ -21,6 +22,13 @@ static voice_t g_voice[VOICES];
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static bool g_on = true, g_ready;
 static snd_cue g_pending;
+
+/* the game's music: [0] plays, [1] fades out (the previous game's); gains move towards their targets */
+typedef struct { int16_t *pcm; int frames, channels, loop_start, loop_end, pos; float gain, target; } music_t;
+static music_t g_music[2];
+static bool g_music_on = true;
+#define MUSIC_LEVEL 0.42f
+#define MUSIC_FADE_FRAMES (SR * 2 / 5)   /* 0.4 s */
 
 /* one bell-like note: sine with a touch of 2nd/3rd harmonic, short attack, exponential decay
  * (tau seconds); the frequency can glide from f0 to f1 */
@@ -156,12 +164,67 @@ void snd_mix(int16_t *lr, int frames) {
     int32_t s = 0;
     for (int v = 0; v < VOICES; v++)
       if (g_voice[v].pos < g_voice[v].len) s += g_voice[v].pcm[g_voice[v].pos++];
-    if (s > 32767) s = 32767;
-    if (s < -32768) s = -32768;
-    lr[2 * i] = lr[2 * i + 1] = (int16_t)s;
+    float l = (float)s, r = (float)s;
+    for (int m = 0; m < 2; m++) {   /* the music under the cues, each track at its own fading gain */
+      music_t *t = &g_music[m];
+      if (!t->pcm) continue;
+      if (t->gain < t->target) { t->gain += 1.0f / MUSIC_FADE_FRAMES; if (t->gain > t->target) t->gain = t->target; }
+      else if (t->gain > t->target) { t->gain -= 1.0f / MUSIC_FADE_FRAMES; if (t->gain < t->target) t->gain = t->target; }
+      const int16_t *p = t->pcm + (size_t)t->pos * (size_t)t->channels;
+      float g = t->gain * MUSIC_LEVEL;
+      l += (float)p[0] * g;
+      r += (float)p[t->channels > 1 ? 1 : 0] * g;
+      int end = t->loop_end > 0 && t->loop_end <= t->frames ? t->loop_end : t->frames;
+      if (++t->pos >= end) t->pos = t->loop_end > 0 && t->loop_start < end ? t->loop_start : 0;
+      if (t->gain <= 0.0f && t->target <= 0.0f) { free(t->pcm); t->pcm = NULL; }   /* faded out: gone */
+    }
+    if (l > 32767.0f) l = 32767.0f;
+    if (l < -32768.0f) l = -32768.0f;
+    if (r > 32767.0f) r = 32767.0f;
+    if (r < -32768.0f) r = -32768.0f;
+    lr[2 * i] = (int16_t)l;
+    lr[2 * i + 1] = (int16_t)r;
   }
   pthread_mutex_unlock(&g_mx);
 }
+
+/* the track playing goes to the fading slot (whatever was still fading there is dropped) */
+static void music_retire_locked(void) {
+  if (g_music[1].pcm) free(g_music[1].pcm);
+  g_music[1] = g_music[0];
+  g_music[1].target = 0.0f;
+  memset(&g_music[0], 0, sizeof g_music[0]);
+}
+
+void snd_music_set(int16_t *pcm, int frames, int channels, int loop_start, int loop_end) {
+  if (!pcm || frames <= 0 || channels < 1 || channels > 2 || !g_music_on || !__atomic_load_n(&g_ready, __ATOMIC_ACQUIRE)) {
+    free(pcm);
+    return;
+  }
+  pthread_mutex_lock(&g_mx);
+  music_retire_locked();
+  g_music[0].pcm = pcm;
+  g_music[0].frames = frames;
+  g_music[0].channels = channels;
+  g_music[0].loop_start = loop_start > 0 && loop_start < frames ? loop_start : 0;
+  g_music[0].loop_end = loop_end > 0 && loop_end <= frames ? loop_end : 0;
+  g_music[0].pos = 0;
+  g_music[0].gain = 0.0f;
+  g_music[0].target = 1.0f;
+  pthread_mutex_unlock(&g_mx);
+}
+
+void snd_music_stop(void) {
+  pthread_mutex_lock(&g_mx);
+  if (g_music[0].pcm) music_retire_locked();
+  pthread_mutex_unlock(&g_mx);
+}
+
+void snd_music_set_enabled(bool on) {
+  g_music_on = on;
+  if (!on) snd_music_stop();
+}
+bool snd_music_enabled(void) { return g_music_on; }
 
 static void play(snd_cue c) {
   if (!__atomic_load_n(&g_ready, __ATOMIC_ACQUIRE) || !g_on || c <= SND_NONE || c >= SND_COUNT || !g_pcm[c].pcm) return;

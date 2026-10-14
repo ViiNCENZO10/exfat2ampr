@@ -7,6 +7,8 @@
 
 /* whole picture, at most max_side pixels wide or high, with its half-size levels */
 int img_decode_png(const uint8_t *data, size_t len, int max_side, image_t *out);
+/* why the last decode failed (stb_image's reason, or the step after it), for the log */
+const char *img_last_error(void);
 /* exactly tw x th: the centred part with those proportions, scaled (no levels) */
 int img_decode_fill(const uint8_t *data, size_t len, int tw, int th, image_t *out);
 /* a part of src (with its half-size levels) */

@@ -63,6 +63,7 @@ Détails techniques (format, pause et reprise, profils, compilation) : [docs/TEC
 - **DLPSGAME** : le format LZ4 des jeux PS5.
 - **drakmor** : l'émulateur AMPR (ampr_emu), ShadowMountPlus, pgo_stub et dlc_emu.
 - **Yann Collet** : l'algorithme LZ4.
+- **Alex Barney** : LibAtrac9, qui décode la musique d'accueil des jeux dans l'app.
 
 ## Licence
 
@@ -75,5 +76,5 @@ conditions supplémentaires (`NOTICE`) :
   autre icône.
 
 Retirer le nom de l'auteur ou diffuser le programme sous un autre nom d'auteur met fin aux droits accordés par la
-licence (article 8). Composants tiers : drakmor/ampr_emu (GPL-3.0), LZ4 (BSD-2), ps5-payload-sdk (GPL-3.0), polices
-DejaVu Sans, Noto Sans Thai et Noto Sans CJK (SIL OFL 1.1).
+licence (article 8). Composants tiers : drakmor/ampr_emu (GPL-3.0), LZ4 (BSD-2), ps5-payload-sdk (GPL-3.0), LibAtrac9
+(MIT), polices DejaVu Sans, Noto Sans Thai et Noto Sans CJK (SIL OFL 1.1).

@@ -664,6 +664,7 @@ static void run_job(job_request req) {
       snprintf(stage, sizeof stage, "copy");
     }
   }
+  double pack_secs = 0;   /* a full packing run, timed: the next forecasts learn this level's speed */
   if (strcmp(stage, "pack") == 0) {
     resumable_error = true;
     o.resume = req.resume && e2a_pack_has_checkpoint(state_dir);
@@ -672,9 +673,11 @@ static void run_job(job_request req) {
     if (req.resume && e2a_is_file(cp) && !o.resume) FAIL("state_invalid", "checkpoint damaged; source kept");
     begin_phase("pack", "compressing (LZ4)", 0);
     o.ctx = (void *)"pack";
+    double pt0 = e2a_now();
     int r = e2a_pack(&entries, &o, &st);
     if (r == E2A_PACK_PAUSED) { paused = true; goto done; }
     if (r != E2A_PACK_OK) FAIL(g_cancel ? "cancelled" : "pack_failed", g_cancel ? "cancelled" : "pack failed (see log)");
+    if (!o.resume) pack_secs = e2a_now() - pt0;
     if (stage_set(state_dir, "copy") != 0) FAIL("state_write", "cannot persist copy stage; resume to recover");
     e2a_test_crash("copy_committed");
     e2a_pack_clear_checkpoint(state_dir);
@@ -688,6 +691,10 @@ static void run_job(job_request req) {
   for (size_t i = 0; i < entries.n; i++) {
     if (entries.v[i].synthetic) continue;
     if (entries.v[i].action != E2A_LOOSE) packed_total += entries.v[i].size; else loose_total += entries.v[i].size;
+  }
+  if (pack_secs > 60.0 && packed_total > (1ull << 30)) {
+    est_set_pack_rate(req.level, (double)packed_total / pack_secs);
+    e2a_log("pack speed at LZ4 %d: %.0f MB/s (remembered for the next forecasts)", req.level, packed_total / pack_secs / 1e6);
   }
 
   if (req.resume && !strcmp(stage, "verify")) {
@@ -763,6 +770,16 @@ static void run_job(job_request req) {
     if (smp_game_info(game.title_id, &sg) == 0 && strcmp(sg.fakelib_mode, "disabled") == 0 &&
         smp_set_fakelib(game.title_id, "emulators") == 0)
       fakelib_fixed = true;
+  }
+  {   /* before its first start: anything that would stop the game, said now rather than on the home screen */
+    char le[160], lw[160];
+    set_phase("launch_check", 100, "checking the game can start");
+    job_launch_check(dest, le, sizeof le, lw, sizeof lw);
+    pthread_mutex_lock(&g_mx);
+    g_status.launch_checked = true;
+    snprintf(g_status.launch_errors, sizeof g_status.launch_errors, "%s", le);
+    snprintf(g_status.launch_warnings, sizeof g_status.launch_warnings, "%s", lw);
+    pthread_mutex_unlock(&g_mx);
   }
   if (req.remove_source) {
     set_phase("remove", 100, "removing source");
@@ -1504,14 +1521,73 @@ int job_preflight(const char *path, const char *smp, const char *dest_base, char
       else add_code(errors, sizeof errors, "dest_not_converted");   /* the original, another dump: never replaced */
     }
   }
+  /* how long it should take at each LZ4 level (packing only; the verification is the same at every level) */
+  char durations[200] = "";
+  for (int lv = 1, at = 0; lv <= 12 && at >= 0 && (size_t)at < sizeof durations; lv++)
+    at += snprintf(durations + at, sizeof durations - (size_t)at, "%s%lld", lv > 1 ? "," : "",
+                   (long long)est_duration(source_bytes, lv, false));
+  int64_t verify_s = est_duration(source_bytes, 9, true) - est_duration(source_bytes, 9, false);
   int w = snprintf(json, cap,
                    "{\"title_id\":\"%s\",\"title\":\"%s\",\"source_bytes\":%llu,\"image_bytes\":%llu,\"estimate\":\"%s\","
-                   "\"need_typical\":%llu,\"need_max\":%llu,"
+                   "\"need_typical\":%llu,\"need_max\":%llu,\"duration_by_level\":[%s],\"verify_seconds\":%lld,"
                    "\"dest_free\":%llu,\"dest_total\":%llu,\"compatible\":\"%s\",\"errors\":[%s],\"warnings\":[%s]}",
                    tid, title, (unsigned long long)source_bytes, (unsigned long long)image_bytes, est.method ? est.method : "",
-                   (unsigned long long)need_typ, (unsigned long long)need_max,
+                   (unsigned long long)need_typ, (unsigned long long)need_max, durations, (long long)(source_bytes ? verify_s : -1),
                    (unsigned long long)(d ? d->avail : 0), (unsigned long long)(d ? d->total : 0), compat, errors, warnings);
   return w > 0 && (size_t)w < cap ? 0 : -1;
+}
+
+/* ---------------------------------------------------------- launch check -- */
+static bool file_sha_is(const char *path, const char *sha) {
+  char hex[65];
+  return sha[0] && e2a_sha256_file(path, hex) == 0 && strcmp(hex, sha) == 0;
+}
+
+int job_launch_check(const char *game_dir, char *errors, size_t ecap, char *warnings, size_t wcap) {
+  if (ecap) errors[0] = 0;
+  if (wcap) warnings[0] = 0;
+  e2a_game g;
+  memset(&g, 0, sizeof g);
+  if (e2a_read_game(game_dir, &g) != 0) { add_code(errors, ecap, "not_game"); return 1; }
+  /* what can be fixed is fixed first: the index rebuilt from the manifest, the execute bits put back */
+  char report[400], p[1300];
+  int fixes = e2a_repair_converted(game_dir, report, sizeof report);
+  if (fixes < 0) add_code(errors, ecap, "repair_failed");
+  else if (fixes > 0) add_code(warnings, wcap, "repaired");
+  if (fixes != 0) e2a_log("launch check %s: %s", game_dir, report);
+  struct stat st;
+  snprintf(p, sizeof p, "%s/eboot.bin", game_dir);
+  if (stat(p, &st) != 0 || !(st.st_mode & 0111)) add_code(errors, ecap, "eboot_exec");
+  /* the AMPR emulator the game carries (fakelib), and the one ShadowMountPlus puts in its place at launch */
+  char mine[65];
+  {
+    e2a_sha256 c;
+    uint8_t d[32];
+    e2a_sha256_init(&c);
+    e2a_sha256_update(&c, libSceAmpr_sprx, libSceAmpr_sprx_len);
+    e2a_sha256_final(&c, d);
+    for (int i = 0; i < 32; i++) snprintf(mine + i * 2, 3, "%02x", d[i]);
+  }
+  snprintf(p, sizeof p, "%s/fakelib/libSceAmpr.sprx", game_dir);
+  if (!e2a_is_file(p)) add_code(errors, ecap, "no_emulator");
+  else if (!file_sha_is(p, mine) && !file_sha_is(p, g_runtime_sha)) add_code(warnings, wcap, "emulator_other");
+  /* fakelib2 replaces fakelib as a whole: without the emulator in it, the game starts without one */
+  snprintf(p, sizeof p, "%s/fakelib2", game_dir);
+  if (e2a_is_dir(p)) {
+    snprintf(p, sizeof p, "%s/fakelib2/libSceAmpr.sprx", game_dir);
+    if (!e2a_is_file(p)) add_code(errors, ecap, "fakelib2_no_ampr");
+  }
+  char bp[400];
+  if (backport_ampr_conflict(g.title_id, bp, sizeof bp)) {
+    add_code(errors, ecap, "backport_ampr");
+    e2a_log("launch check %s: the backport brings its own AMPR library: %s", game_dir, bp);
+  }
+  smp_game sg;
+  if (smp_game_info(g.title_id, &sg) == 0 && strcmp(sg.fakelib_mode, "disabled") == 0) add_code(errors, ecap, "fakelib_disabled");
+  if (e2a_is_file(E2A_SPRX_SMP) && !file_sha_is(E2A_SPRX_SMP, mine)) add_code(warnings, wcap, "emus_ampr_other");
+  e2a_log("launch check %s: %s%s%s%s", game_dir, errors[0] ? "would not start: " : "ready to start", errors,
+          warnings[0] ? "; notes: " : "", warnings);
+  return errors[0] ? 1 : 0;
 }
 
 static bool active_path_busy(const char *path) {

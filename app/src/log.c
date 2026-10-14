@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "mem.h"   /* last: the allocations go through the app's own memory */
 
 #define L_LINES 256
 

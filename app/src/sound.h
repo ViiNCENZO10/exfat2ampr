@@ -22,4 +22,11 @@ void snd_flush(void);
 /* fills frames x 2 (left, right) samples; called by the platform's audio thread */
 void snd_mix(int16_t *lr, int frames);
 
+/* a game's own music (its snd0.at9 decoded): the PCM is handed over (the sound module frees it) and
+ * cross-faded with the track playing; loop_end 0 loops the whole track */
+void snd_music_set(int16_t *pcm, int frames, int channels, int loop_start, int loop_end);
+void snd_music_stop(void);   /* fades out */
+void snd_music_set_enabled(bool on);
+bool snd_music_enabled(void);
+
 #endif

@@ -18,6 +18,7 @@
 #if defined(__has_include)
 #if __has_include("update_config.h")
 #include "update_config.h"   /* written by the CI: the manifest of the repository that publishes the releases */
+#include "mem.h"   /* last: the allocations go through the app's own memory */
 #endif
 #endif
 #ifndef E2A_UPDATE_URL

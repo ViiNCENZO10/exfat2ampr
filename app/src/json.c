@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "mem.h"   /* last: the allocations go through the app's own memory */
 
 typedef struct {
   const char *p, *end;

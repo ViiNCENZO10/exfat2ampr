@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mem.h"   /* last: the allocations go through the app's own memory */
 
 /* ------------------------------------------------------------------ theme -- */
 /* colour themes (Settings › Theme): the accent and, for the two-tone ones, a second colour it fades into
@@ -98,6 +99,8 @@ typedef struct {
   bool deleting, delete_ok;           /* deleting a copy from the list, and how the last one ended */
   double delete_seq;
   char delete_code[32], delete_title[128];
+  bool launch_checked;               /* the start-up check of the converted game: its first problem, else its first note */
+  char launch_err[24], launch_warn[24];
 } status_t;
 
 typedef struct {
@@ -107,7 +110,7 @@ typedef struct {
 
 enum { TAB_GAMES, TAB_PROGRESS, TAB_RESUME, TAB_SETTINGS, TAB_COUNT };
 enum { SCR_BOOT, SCR_MAIN, SCR_OPTIONS, SCR_PAIR, SCR_DEST, SCR_CHECK, SCR_OPTIMIZE, SCR_LOG };
-enum { SET_LANG, SET_THEME, SET_GAME_MODE, SET_SOUNDS, SET_ANIMS, SET_PAIR, SET_PLUGINS, SET_UPDATE, SET_LOG, SET_DIAG, SET_QUIT, SET_COUNT };
+enum { SET_LANG, SET_THEME, SET_GAME_MODE, SET_SOUNDS, SET_MUSIC, SET_ANIMS, SET_PAIR, SET_PLUGINS, SET_UPDATE, SET_LOG, SET_DIAG, SET_QUIT, SET_COUNT };
 enum { TOAST_INFO, TOAST_OK, TOAST_ERR };
 
 static game_t g_games[MAX_GAMES];
@@ -128,6 +131,7 @@ static char g_toast[300];
 static uint64_t g_toast_at, g_toast_until;
 static int g_toast_kind;
 static bool g_dirty = true;
+static bool g_level_reset;   /* level 10 to 12 kept from before 1.96: set back to 9 once, and said so */
 static char g_pin[16], g_ip[64];
 static int g_pair_devices;
 /* the game plugins (pgo_stub, dlc_emu) the engine keeps up to date: /api/plugins */
@@ -233,9 +237,9 @@ static const char *state_label(const char *s) {
 /* --------------------------------------------------------------- settings -- */
 static void settings_save(void) {
   char buf[700];
-  int n = snprintf(buf, sizeof buf, "lang=%d\nlevel=%d\ncache=%d\nverify=%d\ndedup=%d\nclean=%d\noverwrite=%d\nsound=%d\nanims=%d\ntheme=%d\ndest=%.300s\n",
+  int n = snprintf(buf, sizeof buf, "lang=%d\nlevel=%d\nlevel9=1\ncache=%d\nverify=%d\ndedup=%d\nclean=%d\noverwrite=%d\nsound=%d\nmusic=%d\nanims=%d\ntheme=%d\ndest=%.300s\n",
                    i18n_get(), g_opt.level, g_opt.cache, g_opt.verify, g_opt.dedup, g_opt.clean, g_opt.overwrite, snd_enabled(),
-                   g_anim_enabled, g_theme, g_dest_path);
+                   snd_music_enabled(), g_anim_enabled, g_theme, g_dest_path);
   if (n > 0) plat_write_file(plat_settings_path(), buf, (size_t)n);
 }
 
@@ -244,9 +248,12 @@ static void settings_load(void) {
   uint8_t *d;
   size_t len;
   if (plat_read_file(plat_settings_path(), &d, &len) != 0) return;
-  char *s = realloc(d, len + 1);
+  char *s = malloc(len + 1);   /* not realloc(): it fails on the console with memory to spare */
   if (!s) { free(d); return; }
+  memcpy(s, d, len);
+  free(d);
   s[len] = 0;
+  bool level9_seen = false;
   for (char *line = strtok(s, "\n"); line; line = strtok(NULL, "\n")) {
     char *eq = strchr(line, '=');
     if (!eq) continue;
@@ -255,16 +262,20 @@ static void settings_load(void) {
     if (!strcmp(line, "dest")) scopy(g_dest_path, sizeof g_dest_path, eq + 1);
     else if (!strcmp(line, "lang")) i18n_set(v);
     else if (!strcmp(line, "level") && v >= 1 && v <= 12) g_opt.level = v;
+    else if (!strcmp(line, "level9")) level9_seen = true;
     else if (!strcmp(line, "cache")) g_opt.cache = v ? 1 : 0;
     else if (!strcmp(line, "verify")) g_opt.verify = v != 0;
     else if (!strcmp(line, "dedup")) g_opt.dedup = v != 0;
     else if (!strcmp(line, "clean")) g_opt.clean = v != 0;
     else if (!strcmp(line, "overwrite")) g_opt.overwrite = v != 0;
     else if (!strcmp(line, "sound")) snd_set_enabled(v != 0);
+    else if (!strcmp(line, "music")) snd_music_set_enabled(v != 0);
     else if (!strcmp(line, "anims")) g_anim_enabled = v != 0;
     else if (!strcmp(line, "theme") && v >= 0 && v < THEME_COUNT) g_theme = v;
   }
   free(s);
+  /* settings from before 1.96 with level 10 to 12: back to 9 once (a choice made after this is kept) */
+  if (!level9_seen && g_opt.level >= 10) { g_opt.level = 9; g_level_reset = true; }
 }
 
 /* -------------------------------------------------------------- API calls -- */
@@ -433,6 +444,13 @@ static void poll_status(void) {
     s.waiting = json_bool(r, "waiting", false);
     s.can_retry = json_bool(r, "can_retry", false);
     s.resumable = json_bool(r, "resumable", false);
+    const jnode *lc = json_get(r, "launch");
+    if (lc) {
+      s.launch_checked = json_bool(lc, "checked", false);
+      const jnode *le = json_get(lc, "errors"), *lw = json_get(lc, "warnings");
+      if (le && le->child && le->child->type == J_STR) scopy(s.launch_err, sizeof s.launch_err, le->child->str);
+      if (lw && lw->child && lw->child->type == J_STR) scopy(s.launch_warn, sizeof s.launch_warn, lw->child->str);
+    }
     s.deleting = json_bool(r, "deleting", false);
     s.delete_ok = json_bool(r, "delete_ok", false);
     s.delete_seq = json_num(r, "delete_seq", 0);
@@ -572,8 +590,15 @@ static void repair_game(const game_t *g) {
     if (n > 0) snprintf(msg, sizeof msg, T(S_REPAIR_DONE), n);
     else scopy(msg, sizeof msg, T(S_REPAIR_NOTHING));
     app_log("repair %s: %d fix(es), %s", g->path, n, json_str(d.root, "report", ""));
-    toast(msg);
-    snd_cue_frame(SND_SELECT);
+    /* then the start-up check: what would still stop the game, which a repair cannot fix */
+    const jnode *le = json_get(d.root, "errors");
+    if (le && le->child && le->child->type == J_STR) {
+      snprintf(msg, sizeof msg, T(S_LAUNCH_BAD), code_text(le->child->str));
+      toast_err(msg);
+    } else {
+      toast(msg);
+      snd_cue_frame(SND_SELECT);
+    }
   } else {
     snprintf(msg, sizeof msg, T(S_REPAIR_FAILED), st == 409 ? T(S_E_GAME_RUNNING) : d.root ? json_str(d.root, "report", json_str(d.root, "error", "?")) : "?");
     toast_err(msg);
@@ -657,6 +682,8 @@ static void choose_wallpaper(uint64_t now) {
     since = now;
   }
   if (now - since >= 160) assets_wallpaper(want, art, cov);
+  /* its music a little later: a game passed over while scrolling is not fetched, the one rested on is */
+  if (now - since >= 450) assets_music(snd_music_enabled() ? want : "", cov);
 }
 
 /* ------------------------------------------------------------- actions -- */
@@ -1096,9 +1123,18 @@ static void draw_progress(void) {
   gfx_text(&FONT_HEAD, tx, y + 116, line, sc, tw);
   /* why, and what to do: in the chosen language, never the engine's English */
   const char *msg = engine_text();
+  bool launch_line = done && g_st.launch_checked;
   if (error || cancelled || paused || waiting || done)
-    gfx_text_wrap(&FONT_BODY, tx, y + 166, msg, error ? RGB(255, 178, 178) : paused || waiting ? RGB(255, 214, 150) : done ? C_OK : C_DIM, tw, 3);
+    gfx_text_wrap(&FONT_BODY, tx, y + 166, msg, error ? RGB(255, 178, 178) : paused || waiting ? RGB(255, 214, 150) : done ? C_OK : C_DIM, tw,
+                  launch_line ? 2 : 3);
   else gfx_text_wrap(&FONT_SMALL, tx, y + 170, msg, C_DIM, w - 340, 2);   /* the file being packed */
+  if (launch_line) {   /* the start-up check: what would stop the game, before the user finds out on the home screen */
+    if (g_st.launch_err[0]) snprintf(line, sizeof line, T(S_LAUNCH_BAD), code_text(g_st.launch_err));
+    else if (g_st.launch_warn[0] && strcmp(g_st.launch_warn, "repaired")) scopy(line, sizeof line, code_text(g_st.launch_warn));
+    else scopy(line, sizeof line, T(S_LAUNCH_READY));
+    gfx_text_wrap(&FONT_SMALL, tx, y + 236, line, g_st.launch_err[0] ? C_ERR : g_st.launch_warn[0] && strcmp(g_st.launch_warn, "repaired") ? C_WARN : C_OK,
+                  w - 340, 2);
+  }
   if (running && !waiting && !strcmp(g_st.phase, "pack") && g_st.rate_read > 0) {   /* what each stage sustains */
     snprintf(line, sizeof line, T(S_RATES), (int)(g_st.rate_read + 0.5), (int)(g_st.rate_comp + 0.5), (int)(g_st.rate_write + 0.5));
     gfx_text(&FONT_SMALL, tx, y + 238, line, C_DIM, w - 340);
@@ -1236,7 +1272,7 @@ static void draw_resume(void) {
 static void draw_settings(void) {
   const int x = 80, y = 230, w = 1060, h = 730, pad = 24;
   panel(x, y, w, h);
-  const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_THEME), T(S_GAME_MODE), T(S_SOUNDS), T(S_ANIMS), T(S_PAIR), T(S_PLUGINS), T(S_UPDATES), T(S_LOG), T(S_DIAG), T(S_QUIT_APP)};
+  const char *labels[SET_COUNT] = {T(S_LANGUAGE), T(S_THEME), T(S_GAME_MODE), T(S_SOUNDS), T(S_MUSIC), T(S_ANIMS), T(S_PAIR), T(S_PLUGINS), T(S_UPDATES), T(S_LOG), T(S_DIAG), T(S_QUIT_APP)};
   /* every row inside the panel: the rows share its height (88 px at most, 58 at least, so the last one,
    * Quit, is never pushed off the screen); past that the list scrolls and keeps the selection in view */
   int row = (h - 2 * pad) / SET_COUNT;
@@ -1248,7 +1284,7 @@ static void draw_settings(void) {
   if (g_set_sel >= scroll + rows) scroll = g_set_sel - rows + 1;
   if (scroll > SET_COUNT - rows) scroll = SET_COUNT - rows > 0 ? SET_COUNT - rows : 0;
   const int head_y = (row - FONT_HEAD.line) / 2, body_y = (row - FONT_BODY.line) / 2, tog_y = (row - 46) / 2;
-  static anim_val sel_v, tog[3];
+  static anim_val sel_v, tog[4];
   float sv = anim_track(&sel_v, (float)(g_set_sel - scroll), 22.0f, 0.002f);
   row_push(g_set_sel - scroll);
   draw_focus(x + 12, y + pad + (int)(sv * (float)row) + 4, w - 24, row - 8, 20);
@@ -1272,7 +1308,8 @@ static void draw_settings(void) {
       gfx_round_gradient(x + w - 40 - tw - 24 - sw, ry + (row - sh) / 2, sw, sh, sh / 2, C_ACCENT, C_ACCENT2);
     } else if (i == SET_GAME_MODE) draw_toggle(x + w - 140, ry + tog_y, g_st.game_mode_enabled, C_ACCENT, &tog[0]);
     else if (i == SET_SOUNDS) draw_toggle(x + w - 140, ry + tog_y, snd_enabled(), C_ACCENT, &tog[1]);
-    else if (i == SET_ANIMS) draw_toggle(x + w - 140, ry + tog_y, g_anim_enabled, C_ACCENT, &tog[2]);
+    else if (i == SET_MUSIC) draw_toggle(x + w - 140, ry + tog_y, snd_music_enabled(), C_ACCENT, &tog[2]);
+    else if (i == SET_ANIMS) draw_toggle(x + w - 140, ry + tog_y, g_anim_enabled, C_ACCENT, &tog[3]);
     else if (i == SET_PAIR) gfx_text_right(&FONT_HEAD, x + w - 44, ry + head_y, "›", C_DIM);
     else if (i == SET_LOG) {   /* how many lines the app has noted so far */
       char n[32];
@@ -1734,11 +1771,15 @@ static void draw(void) {
       draw_hints(icons, labels, 3);
     } else if (g_screen == SCR_CHECK) {
       draw_checks();
-      int icons[] = {ICON_CROSS, ICON_CIRCLE, ICON_DPAD};
-      str_id labels[] = {S_START, S_BACK, S_LIST};
-      /* without anything to convert, no "start" hint */
-      if (checks_ok()) draw_hints(icons, labels, 3);
-      else draw_hints(icons + 1, labels + 1, 2);
+      int icons[] = {ICON_CROSS, ICON_TRIANGLE, ICON_CIRCLE, ICON_DPAD};
+      str_id labels[] = {S_START, S_START_QUIT, S_BACK, S_LIST};
+      /* without anything to convert, no "start" hint; "start and close" only when an image waits for it */
+      if (checks_ok() && checks_need_close()) draw_hints(icons, labels, 4);
+      else if (checks_ok()) {
+        int i3[] = {ICON_CROSS, ICON_CIRCLE, ICON_DPAD};
+        str_id l3[] = {S_START, S_BACK, S_LIST};
+        draw_hints(i3, l3, 3);
+      } else draw_hints(icons + 2, labels + 2, 2);
     } else {
       draw_options();
       int icons[] = {ICON_CROSS, ICON_CIRCLE};
@@ -1834,9 +1875,20 @@ static void boot_finish(void) {
   if (g_boot_failed) {
     g_boot_failed_at = plat_ms();
     snd_cue_frame(SND_ERROR);
+    /* no engine to ship the log to: it goes to a file, readable from a PC (FTP, the app's download0) */
+    static char lines[64][APP_LOG_LEN];
+    int n = app_log_copy(lines, 64, 0);
+    char *txt = malloc((size_t)n * (APP_LOG_LEN + 1) + 1);
+    if (txt) {
+      size_t at = 0;
+      for (int i = 0; i < n; i++) at += (size_t)snprintf(txt + at, APP_LOG_LEN + 2, "%s\n", lines[i]);
+      plat_write_file("/download0/boot.log", txt, at);
+      free(txt);
+    }
     return;
   }
   g_screen = SCR_MAIN;
+  if (g_level_reset) { g_level_reset = false; settings_save(); toast(T(S_LEVEL_RESET)); }
   poll_status();
   /* a conversion already running: show it first (the game list gives its cover) */
   bool busy = !strcmp(g_st.state, "running") || !strcmp(g_st.state, "paused");
@@ -1927,6 +1979,12 @@ static void handle_input(uint32_t p) {
     if (p & BTN_CROSS) {
       if (checks_ok()) start_checked();
       else toast_err(T(S_NOTHING_TO_START));
+    }
+    /* start, then close this app: ShadowMountPlus mounts the image as soon as no title runs, the engine
+     * converts on its own and the app finds it again when reopened */
+    if ((p & BTN_TRIANGLE) && checks_ok() && checks_need_close() && start_checked() > 0) {
+      app_log("started, closing the app so that ShadowMountPlus can mount the image");
+      plat_exit();
     }
     return;
   }
@@ -2130,6 +2188,13 @@ static void handle_input(uint32_t p) {
         bool on = (p & BTN_LEFT) ? false : (p & BTN_RIGHT) ? true : !snd_enabled();
         snd_set_enabled(on);
         toggle_sound(on);   /* heard only when switching them on */
+        settings_save();
+      }
+      if (g_set_sel == SET_MUSIC && (p & (BTN_LEFT | BTN_RIGHT | BTN_CROSS))) {
+        bool on = (p & BTN_LEFT) ? false : (p & BTN_RIGHT) ? true : !snd_music_enabled();
+        snd_music_set_enabled(on);
+        if (on) assets_music_reset();   /* the focused game's music is asked again */
+        toggle_sound(on);
         settings_save();
       }
       if (g_set_sel == SET_ANIMS && (p & (BTN_LEFT | BTN_RIGHT | BTN_CROSS))) {

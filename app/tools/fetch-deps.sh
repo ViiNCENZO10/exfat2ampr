@@ -17,6 +17,16 @@ curl -fsSL -o app/src/third_party/stb_image.h "https://raw.githubusercontent.com
 QR_COMMIT=3c6d0b3cefb4e049dc337e82237c9644399716a8
 curl -fsSL -o app/src/third_party/qrcodegen.h "https://raw.githubusercontent.com/nayuki/QR-Code-generator/$QR_COMMIT/c/qrcodegen.h"
 curl -fsSL -o app/src/third_party/qrcodegen.inc "https://raw.githubusercontent.com/nayuki/QR-Code-generator/$QR_COMMIT/c/qrcodegen.c"
+# LibAtrac9 (Alex Barney, MIT): the games' home-screen music (sce_sys/snd0.at9). Its .c files are stored as
+# .inc and compiled as one unit by atrac9.c (same reason as above)
+AT9_COMMIT=efca2e3af35562a09a9bb6deed90e45b4b824dc4
+mkdir -p app/src/third_party/atrac9
+curl -fsSL -o app/src/third_party/atrac9/LICENSE "https://raw.githubusercontent.com/Thealexbarney/LibAtrac9/$AT9_COMMIT/LICENSE"
+for f in band_extension bit_allocation bit_reader decinit decoder error_codes huffCodes imdct libatrac9 quantization scale_factors structures tables unpack utility; do
+  [ "$f" = error_codes ] || [ "$f" = structures ] || \
+    curl -fsSL -o "app/src/third_party/atrac9/$f.inc" "https://raw.githubusercontent.com/Thealexbarney/LibAtrac9/$AT9_COMMIT/C/src/$f.c"
+  curl -fsSL -o "app/src/third_party/atrac9/$f.h" "https://raw.githubusercontent.com/Thealexbarney/LibAtrac9/$AT9_COMMIT/C/src/$f.h"
+done
 if [ ! -f .deps/dejavu/ttf/DejaVuSans.ttf ]; then
   curl -fsSL -o .deps/dejavu.zip https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.zip
   rm -rf .deps/dejavu && mkdir -p .deps/dejavu

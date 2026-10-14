@@ -20,6 +20,8 @@ void api_set_quiet(bool quiet);
 int api_post_bytes(const char *path, const void *data, size_t len, jdoc *doc);
 /* raw GET (icons); *data malloc'd */
 int api_get_raw(const char *path, uint8_t **data, size_t *len);
+/* the same, returning the HTTP status (-1: no answer); *data only on 200 */
+int api_get_status(const char *path, uint8_t **data, size_t *len);
 
 /* form builder: appends key=value (URL-encoded) to buf */
 void form_add(char *buf, size_t cap, const char *key, const char *value);

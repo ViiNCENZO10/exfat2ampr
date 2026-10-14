@@ -42,6 +42,8 @@ int plat_tcp_recv(int s, void *buf, size_t len);         /* bytes, 0 at end, < 0
 void plat_tcp_close(int s);
 
 /* files: whole-file read (malloc'd), atomic small writes for the settings */
+/* a large block for the app's memory arenas (never given back), NULL when none */
+void *plat_big_alloc(size_t len);
 int plat_read_file(const char *path, uint8_t **data, size_t *len);
 int plat_write_file(const char *path, const void *data, size_t len);
 const char *plat_asset_dir(void);             /* packaged read-only files (engine payload, version) */

@@ -11,6 +11,7 @@
 #include "platform.h"
 #include "log.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include "mem.h"   /* last: the allocations go through the app's own memory */
 
 size_t sceKernelGetDirectMemorySize(void);
 int sceKernelAllocateDirectMemory(int64_t start, int64_t end, size_t len, size_t align, int type, int64_t *phys);
@@ -120,6 +122,19 @@ static void build_tiling(void) {
   for (uint32_t y = 0; y < SCREEN_H; y++)
     g_yo[y] = (((y << 4) & 0x70u) ^ ((y << 5) & 0xf00u) ^ ((y << 9) & 0x1000u) ^ ((y << 8) & 0x4000u));
   for (uint32_t y = 0; y < SCREEN_H; y++) g_yb[y] = ((y >> 7) * blocks_per_row) << 16;
+}
+
+/* the app's arenas (mem.c): the console's direct memory, a budget apart from the small system heap, which
+ * the app had filled from its first second (blocks of 1 MB, then 4 and 32 MB, refused) */
+void *plat_big_alloc(size_t len) {
+  len = (len + MEM_ALIGN - 1) & ~(size_t)(MEM_ALIGN - 1);
+  int64_t phys = 0;
+  /* type 0 (write-back, cached) and CPU-only protection: the video buffers' type 3 is write-combined GPU
+   * memory, where every CPU read goes uncached (the whole app crawled when the covers lived there) */
+  if (sceKernelAllocateDirectMemory(0, (int64_t)sceKernelGetDirectMemorySize(), len, MEM_ALIGN, 0, &phys) < 0) return NULL;
+  void *p = NULL;
+  if (sceKernelMapDirectMemory(&p, len, 0x3, 0, phys, MEM_ALIGN) < 0) return NULL;
+  return p;
 }
 
 int plat_init(void) {
@@ -235,20 +250,29 @@ int plat_tcp_send(int s, const void *buf, size_t len) { return sceNetSend(s, buf
 int plat_tcp_recv(int s, void *buf, size_t len) { return sceNetRecv(s, buf, len, 0); }
 void plat_tcp_close(int s) { sceNetSocketClose(s); }
 
+/* why a file could not be read, with the memory state: in the log (and the boot log file) */
+static void read_failed(const char *path, const char *step, size_t size, int err) {
+  char ms[160];
+  mem_stats(ms, sizeof ms);
+  app_log("read %s: %s failed at %zu bytes (errno %d); memory: %s", path, step, size, err, ms);
+}
+
 int plat_read_file(const char *path, uint8_t **data, size_t *len) {
   int fd = open(path, O_RDONLY);
-  if (fd < 0) return -1;
+  if (fd < 0) { read_failed(path, "open", 0, errno); return -1; }
   size_t cap = 1 << 16, n = 0;
   uint8_t *buf = malloc(cap);
   for (;;) {
-    if (!buf) { close(fd); return -1; }
+    if (!buf) { read_failed(path, "first block", cap, errno); close(fd); return -1; }
     if (n == cap) {
-      uint8_t *nb = realloc(buf, cap * 2);
-      if (!nb) { free(buf); close(fd); return -1; }
+      uint8_t *nb = malloc(cap * 2);   /* not realloc(): it fails on the console with memory to spare */
+      if (!nb) { read_failed(path, "growing", cap * 2, errno); free(buf); close(fd); return -1; }
+      memcpy(nb, buf, n);
+      free(buf);
       buf = nb; cap *= 2;
     }
     ssize_t r = read(fd, buf + n, cap - n);
-    if (r < 0) { free(buf); close(fd); return -1; }
+    if (r < 0) { read_failed(path, "read", n, errno); free(buf); close(fd); return -1; }
     if (r == 0) break;
     n += (size_t)r;
   }
